@@ -1,0 +1,8 @@
+.env
+.env.save
+logs/
+bot.log
+__pycache__/
+*.pyc
+bot.lock
+bot.pid
