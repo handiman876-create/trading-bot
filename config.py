@@ -25,6 +25,14 @@ TS_SCOPE         = "openid profile offline_access MarketData ReadAccount Trade"
 # Must be registered as an allowed redirect URL for your API key.
 TS_REDIRECT_URI  = os.environ.get("TS_REDIRECT_URI", "http://localhost:3000/")
 
+# ── Tradier Credentials (legacy client) ───────────────────────────────────────
+# tradestation_client is the drop-in replacement for tradier_client; these are
+# retained so the legacy module still imports. Falls back to the sandbox host.
+TRADIER_API_TOKEN = os.environ.get("TRADIER_API_TOKEN", "")
+TRADIER_BASE_URL  = os.environ.get(
+    "TRADIER_BASE_URL", "https://sandbox.tradier.com/v1"
+)
+
 # ── Market Hours (NYSE, Eastern Time) ────────────────────────────────────────
 MARKET_OPEN_HOUR   = 9
 MARKET_OPEN_MIN    = 30
@@ -40,8 +48,8 @@ STOCK_WATCHLIST = ["SPY", "AAPL", "TSLA", "NVDA", "AMD", "MSFT", "GOOGL",
 # The expiration is no longer hardcoded — it is computed at runtime to the next
 # valid monthly expiration (3rd Friday) via market_hours.next_monthly_expiration().
 OPTIONS_WATCHLIST = [
-    ("SPY",  540.0, "call"),
-    ("AAPL", 200.0, "put"),
+    ("SPY",  745.0, "call"),  # ATM: SPY ~$744 (2026-07-08)
+    ("AAPL", 315.0, "put"),   # ATM: AAPL ~$313 (2026-07-08)
 ]
 
 # ── Strategy Parameters ───────────────────────────────────────────────────────
