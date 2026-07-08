@@ -2,17 +2,25 @@
 #
 # Safely restart the trading bot.
 #
-# Kills the previous instance by the PID recorded in bot.pid (never `pkill -f
-# main.py` — that pattern also matches the calling shell's own command line and
-# kills the restart itself). Then launches a fresh instance under nohup and
-# records its PID.
+#   ./restart.sh            # equities mode (default)
+#   ./restart.sh futures    # futures mode
+#
+# Each mode has its own pidfile/logfile and its own singleton lock, so the two
+# can run side by side. Kills the previous instance by the PID recorded in its
+# pidfile (never `pkill -f main.py` — that pattern also matches the calling
+# shell's own command line and kills the restart itself). Then launches a fresh
+# instance under nohup and records its PID.
 #
 set -euo pipefail
 
 cd "$(dirname "$0")"
 
-PID_FILE="bot.pid"
-LOG_FILE="bot.log"
+MODE="${1:-equities}"
+case "$MODE" in
+    equities) PID_FILE="bot.pid";         LOG_FILE="bot.log" ;;
+    futures)  PID_FILE="bot.futures.pid"; LOG_FILE="bot.futures.log" ;;
+    *) echo "Usage: $0 [equities|futures]" >&2; exit 1 ;;
+esac
 
 # ── 1 & 2. Read the old PID and kill it safely ───────────────────────────────
 if [[ -f "$PID_FILE" ]]; then
@@ -50,8 +58,8 @@ else
 fi
 
 # ── 4 & 5. Start a fresh instance and record its PID ─────────────────────────
-echo "Starting bot..."
-nohup python3 main.py > "$LOG_FILE" 2>&1 &
+echo "Starting bot ($MODE)..."
+nohup python3 main.py --mode "$MODE" > "$LOG_FILE" 2>&1 &
 NEW_PID=$!
 echo "$NEW_PID" > "$PID_FILE"
 

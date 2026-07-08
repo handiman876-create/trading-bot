@@ -18,6 +18,7 @@ from typing import Optional
 
 import config
 import tradestation_client as tc
+import futures_market_hours as fmh
 import indicators as ind
 from trade_logger import log_trade
 
@@ -159,6 +160,93 @@ def evaluate_option(
         elif not is_call and sig["bullish_cross"]:
             _close_option(account_id, occ_symbol, held, opt_price,
                           symbol, expiration, strike, opt_type, sig)
+
+
+# ── Futures Strategy ──────────────────────────────────────────────────────────
+# Long-only, mirroring evaluate_stock: BUY the front-month on a bullish cross,
+# SELL to flatten on a bearish cross. Signals are computed on the CONTINUOUS
+# symbol (@ES) for a clean bar history; orders go to the DATED front month
+# (ESU26). We do NOT roll while holding — an open position in a rolled-past
+# contract is flattened first, and the new front month is picked up next cycle.
+
+def _stale_futures_position(positions: list[dict], root: str, current_symbol: str) -> Optional[dict]:
+    """An open position in a different-dated contract of the same root (i.e. one
+    we've rolled past), or None."""
+    for p in positions:
+        sym = p.get("symbol") or ""
+        if sym.startswith(root) and sym != current_symbol and int(p.get("quantity", 0)) != 0:
+            return p
+    return None
+
+
+def evaluate_future(root: str, account_id: str, positions: list[dict]) -> None:
+    trade_symbol = fmh.front_month_contract(root, roll_days=config.FUTURES_ROLL_DAYS)
+    sig_symbol   = fmh.signal_symbol(root)
+
+    history = tc.get_historical(sig_symbol, days=90)
+    if not history:
+        logger.warning("%s: no bar history for %s", root, sig_symbol)
+        return
+
+    sig = ind.compute_indicators(
+        history,
+        config.MA_SHORT_PERIOD,
+        config.MA_LONG_PERIOD,
+        config.RSI_PERIOD,
+    )
+    if not sig:
+        logger.warning("%s: not enough history for indicators", root)
+        return
+
+    held  = _current_position(positions, trade_symbol)
+    price = sig["close"]
+
+    logger.info(
+        "FUT %s | signal=%s trade=%s  close=%.2f  EMA%d=%.2f  EMA%d=%.2f  RSI=%.1f  held=%d",
+        root, sig_symbol, trade_symbol, price,
+        config.MA_SHORT_PERIOD, sig["ema_short"],
+        config.MA_LONG_PERIOD,  sig["ema_long"],
+        sig["rsi"], held,
+    )
+
+    # Roll guard: flatten any position in a rolled-past contract before trading
+    # the new front month. Skip the rest of this cycle for this root.
+    stale = _stale_futures_position(positions, root, trade_symbol)
+    if stale:
+        qty = abs(int(stale.get("quantity", 0)))
+        logger.info("ROLL: flattening expiring %s x%d before trading %s",
+                    stale.get("symbol"), qty, trade_symbol)
+        result = tc.place_futures_order(account_id, stale.get("symbol"), "sell", qty)
+        if result:
+            order_id = result.get("order", {}).get("id")
+            log_trade("SELL", stale.get("symbol"), qty, price, "market", order_id,
+                      f"{root} roll: flatten expiring contract")
+        return
+
+    if _already_signaled_today(trade_symbol):
+        return
+
+    qty = config.FUTURES_CONTRACTS
+
+    # BUY signal — open long front month
+    if sig["bullish_cross"] and sig["rsi"] < config.RSI_OVERBOUGHT and held == 0:
+        logger.info("SIGNAL BUY %s x%d", trade_symbol, qty)
+        result = tc.place_futures_order(account_id, trade_symbol, "buy", qty)
+        if result:
+            _mark_signaled(trade_symbol)
+            order_id = result.get("order", {}).get("id")
+            log_trade("BUY", trade_symbol, qty, price, "market", order_id,
+                      f"{root} EMA cross up, RSI={sig['rsi']:.1f}")
+
+    # SELL signal — flatten long front month
+    elif sig["bearish_cross"] and sig["rsi"] > config.RSI_OVERSOLD and held > 0:
+        logger.info("SIGNAL SELL %s x%d", trade_symbol, held)
+        result = tc.place_futures_order(account_id, trade_symbol, "sell", held)
+        if result:
+            _mark_signaled(trade_symbol)
+            order_id = result.get("order", {}).get("id")
+            log_trade("SELL", trade_symbol, held, price, "market", order_id,
+                      f"{root} EMA cross down, RSI={sig['rsi']:.1f}")
 
 
 def _open_option(account_id, occ_symbol, side, price, symbol, exp, strike, opt_type, sig):

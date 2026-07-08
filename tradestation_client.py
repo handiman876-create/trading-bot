@@ -197,20 +197,31 @@ def find_option_symbol(symbol: str, expiration: str, strike: float, option_type:
 
 # ── Account ───────────────────────────────────────────────────────────────────
 
-def get_account_id() -> Optional[str]:
-    """Return the first non-futures brokerage account id."""
+def _is_futures(acct: dict) -> bool:
+    return str(acct.get("AccountType", "")).lower() == "futures"
+
+
+def _find_account_id(match) -> Optional[str]:
+    """AccountID of the first account for which match(account) is truthy, else None."""
     try:
-        data = _get("brokerage/accounts")
-        accounts = data.get("Accounts", [])
-        if not accounts:
-            return None
-        for acct in accounts:
-            if str(acct.get("AccountType", "")).lower() != "futures":
-                return acct.get("AccountID")
-        return accounts[0].get("AccountID")
+        accounts = _get("brokerage/accounts").get("Accounts", [])
     except Exception as exc:
-        logger.error("Account ID fetch failed: %s", exc)
+        logger.error("Account lookup failed: %s", exc)
         return None
+    for acct in accounts:
+        if match(acct):
+            return acct.get("AccountID")
+    return None
+
+
+def get_account_id() -> Optional[str]:
+    """First non-futures brokerage account id (falls back to first account of any type)."""
+    return _find_account_id(lambda a: not _is_futures(a)) or _find_account_id(lambda a: True)
+
+
+def get_futures_account_id() -> Optional[str]:
+    """First futures brokerage account id, or None if this login has none."""
+    return _find_account_id(_is_futures)
 
 
 def get_positions(account_id: str) -> list[dict]:
@@ -263,21 +274,22 @@ _OPTION_ACTIONS = {
     "sell_to_open":  "SELLTOOPEN",
 }
 _ORDER_TYPES = {"market": "Market", "limit": "Limit", "stop": "StopMarket"}
+# Futures use plain BUY/SELL to open long/short — no BUYTOCOVER/SELLSHORT.
+_FUTURES_ACTIONS = {"buy": "BUY", "sell": "SELL"}
 
 
-def _place_order(
+def _build_order_body(
     account_id:  str,
     symbol:      str,
-    trade_action: str,         # TradeStation enum, e.g. "BUY" / "BUYTOOPEN"
+    trade_action: str,
     quantity:    int,
     order_type:  str,
     duration:    str,
     limit_price: Optional[float],
-) -> Optional[dict]:
-    """Single dispatch point for equity and option orders.
-
-    Returns a Tradier-shaped {"order": {"id": <OrderID>}} on success, or None.
-    """
+) -> dict:
+    """Assemble the request body shared by place (orders) and confirm
+    (orderconfirm) so the two paths can never diverge. Route "Intelligent" is
+    accepted (and is the default) for equities, options AND futures."""
     body = {
         "AccountID":   account_id,
         "Symbol":      symbol,
@@ -289,6 +301,24 @@ def _place_order(
     }
     if order_type.lower() == "limit" and limit_price is not None:
         body["LimitPrice"] = str(limit_price)
+    return body
+
+
+def _place_order(
+    account_id:  str,
+    symbol:      str,
+    trade_action: str,         # TradeStation enum, e.g. "BUY" / "BUYTOOPEN"
+    quantity:    int,
+    order_type:  str,
+    duration:    str,
+    limit_price: Optional[float],
+) -> Optional[dict]:
+    """Single dispatch point for equity, option and futures orders.
+
+    Returns a Tradier-shaped {"order": {"id": <OrderID>}} on success, or None.
+    """
+    body = _build_order_body(account_id, symbol, trade_action, quantity,
+                             order_type, duration, limit_price)
 
     data = _post("orderexecution/orders", body)
     orders = data.get("Orders", [])
@@ -340,3 +370,55 @@ def place_option_order(
     except Exception as exc:
         logger.error("Option order failed %s %s %s: %s", side, quantity, option_symbol, exc)
         return None
+
+
+def place_futures_order(
+    account_id:  str,
+    symbol:      str,       # dated futures contract, e.g. "ESU26"
+    side:        str,       # "buy" | "sell"
+    quantity:    int,
+    order_type:  str = "market",
+    duration:    str = "day",
+    limit_price: Optional[float] = None,
+) -> Optional[dict]:
+    action = _FUTURES_ACTIONS.get(side.lower())
+    if action is None:
+        logger.error("Unknown futures side: %s", side)
+        return None
+    try:
+        return _place_order(account_id, symbol, action, quantity,
+                            order_type, duration, limit_price)
+    except Exception as exc:
+        logger.error("Futures order failed %s %s %s: %s", side, quantity, symbol, exc)
+        return None
+
+
+def confirm_order(
+    account_id:   str,
+    symbol:       str,
+    trade_action: str,       # TradeStation enum, e.g. "BUY" / "SELL"
+    quantity:     int,
+    order_type:   str = "market",
+    duration:     str = "day",
+    limit_price:  Optional[float] = None,
+) -> Optional[dict]:
+    """Validate an order WITHOUT placing it, via orderexecution/orderconfirm.
+
+    Returns the first Confirmation dict (for futures this includes
+    InitialMarginDisplay / EstimatedCost / EstimatedPrice), or None on error.
+    Useful as a pre-trade margin check and in the read-only smoke test.
+    """
+    body = _build_order_body(account_id, symbol, trade_action, quantity,
+                             order_type, duration, limit_price)
+    try:
+        data = _post("orderexecution/orderconfirm", body)
+    except Exception as exc:
+        logger.error("Order confirm failed %s %s x%d: %s",
+                     trade_action, symbol, quantity, exc)
+        return None
+    confirmations = data.get("Confirmations", [])
+    if not confirmations:
+        logger.error("Order confirm returned nothing for %s %s: %s",
+                     trade_action, symbol, data.get("Errors") or data)
+        return None
+    return confirmations[0]

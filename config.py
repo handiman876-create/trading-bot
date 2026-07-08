@@ -3,6 +3,16 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# ── Run mode ──────────────────────────────────────────────────────────────────
+# "equities" (stocks + options) or "futures". Set by main.py's --mode flag (which
+# exports BOT_MODE before importing this module) or directly via the environment.
+# Drives the singleton lock file and log filenames below so an equities instance
+# and a futures instance can run side by side without colliding.
+BOT_MODE    = os.environ.get("BOT_MODE", "equities").lower()
+_IS_FUTURES = BOT_MODE == "futures"
+_LOG_PREFIX = "futures_" if _IS_FUTURES else ""
+_PROC_SUFFIX = ".futures" if _IS_FUTURES else ""
+
 # ── TradeStation OAuth Credentials ────────────────────────────────────────────
 TS_CLIENT_ID     = os.environ.get("TS_CLIENT_ID", "")
 TS_CLIENT_SECRET = os.environ.get("TS_CLIENT_SECRET", "")
@@ -66,7 +76,29 @@ OPTIONS_CONTRACTS  = 1        # contracts per options trade
 # ── Poll interval while market is open (seconds) ─────────────────────────────
 POLL_INTERVAL = 60
 
+# ── Futures (mode="futures") ──────────────────────────────────────────────────
+# Roots only; the dated front-month contract is resolved at runtime with a
+# 5-day-before-expiry quarterly roll (futures_market_hours.front_month_contract).
+# YM is excluded for now: the sandbox account is NOT ENTITLED to Dow data.
+FUTURES_WATCHLIST = ["ES", "NQ", "RTY"]
+FUTURES_CONTRACTS = 1      # contracts per futures trade (fixed size for MVP)
+FUTURES_ROLL_DAYS = 5      # roll to the next quarterly this many days before expiry
+# Contract specs (multiplier / tick / $-per-tick) — for logging now, margin-based
+# sizing later. Read live initial margin from tradestation_client.confirm_order().
+FUTURES_SPECS = {
+    "ES":  {"multiplier": 50, "tick": 0.25, "tick_value": 12.50},
+    "NQ":  {"multiplier": 20, "tick": 0.25, "tick_value": 5.00},
+    "YM":  {"multiplier": 5,  "tick": 1.0,  "tick_value": 5.00},
+    "RTY": {"multiplier": 50, "tick": 0.10, "tick_value": 5.00},
+}
+
+# ── Process files (per-mode singleton lock + pidfile) ─────────────────────────
+LOCK_FILE = f"bot{_PROC_SUFFIX}.lock"
+PID_FILE  = f"bot{_PROC_SUFFIX}.pid"
+
 # ── Logging ───────────────────────────────────────────────────────────────────
+# Filenames are mode-prefixed so the two processes never interleave their logs.
 LOG_DIR        = "logs"
-TRADE_LOG_FILE = "logs/trades.log"
-PERF_LOG_FILE  = "logs/performance.log"
+APP_LOG_FILE   = f"logs/{_LOG_PREFIX}bot.log"
+TRADE_LOG_FILE = f"logs/{_LOG_PREFIX}trades.log"
+PERF_LOG_FILE  = f"logs/{_LOG_PREFIX}performance.log"

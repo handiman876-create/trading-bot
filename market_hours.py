@@ -141,6 +141,17 @@ def seconds_until_open() -> float:
     return max(0.0, delta)
 
 
+def describe_next_open(now: datetime = None) -> str:
+    """Human-readable next-open timestamp, e.g. '2026-07-13 09:30 ET'.
+
+    Mirrors futures_market_hours.describe_next_open so main.py can treat either
+    module as an interchangeable clock.
+    """
+    base = now or now_et()
+    nxt = base + timedelta(seconds=seconds_until_open())
+    return nxt.strftime("%Y-%m-%d %H:%M ET")
+
+
 def seconds_until_close() -> float:
     """Seconds until today's close (assumes market is currently open)."""
     now = now_et()

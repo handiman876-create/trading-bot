@@ -12,7 +12,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     handlers=[
-        logging.FileHandler("logs/bot.log"),
+        logging.FileHandler(config.APP_LOG_FILE),
         logging.StreamHandler(),
     ],
 )

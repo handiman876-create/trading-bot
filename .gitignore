@@ -6,3 +6,6 @@ __pycache__/
 *.pyc
 bot.lock
 bot.pid
+bot.futures.log
+bot.futures.lock
+bot.futures.pid
