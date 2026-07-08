@@ -19,7 +19,7 @@ import logging
 import os
 import signal
 import sys
-import time
+import threading
 from datetime import timedelta
 
 import trade_logger  # noqa: F401 – configures logging as side-effect
@@ -31,7 +31,7 @@ from trade_logger import log_performance
 
 logger = logging.getLogger("bot")
 
-_running = True
+_shutdown = threading.Event()
 
 _LOCK_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot.lock")
 _lock_fh = None  # module-global so the fd isn't GC'd (that would release the lock)
@@ -62,9 +62,8 @@ def _acquire_singleton_lock() -> None:
 
 
 def _handle_signal(signum, frame):
-    global _running
     logger.info("Shutdown signal received (%s).", signum)
-    _running = False
+    _shutdown.set()
 
 
 def _run_cycle(account_id: str) -> None:
@@ -98,10 +97,12 @@ def _wait_for_market_open() -> None:
         open_str = (next_open.strftime("%Y-%m-%d")
                     + f" {config.MARKET_OPEN_HOUR:02d}:{config.MARKET_OPEN_MIN:02d} ET")
         logger.info("Market closed. Sleeping %.0f s until next open (%s).", secs, open_str)
-        # Sleep in chunks so we can respond to SIGTERM
-        while secs > 0 and _running:
+        # Wait on the shutdown Event so SIGTERM wakes us instantly, while the
+        # timeout still lets us re-check the market-open time periodically.
+        while secs > 0 and not _shutdown.is_set():
             chunk = min(secs, 30)
-            time.sleep(chunk)
+            if _shutdown.wait(chunk):
+                return
             secs -= chunk
             if mh.is_market_open():
                 break
@@ -147,32 +148,33 @@ def main() -> None:
     else:
         logger.warning("Could not retrieve account balance at startup.")
 
-    while _running:
+    while not _shutdown.is_set():
         if not mh.is_market_open():
             _wait_for_market_open()
-            if not _running:
+            if _shutdown.is_set():
                 break
             continue
 
         logger.info("Market is OPEN. Starting trading session.")
 
         # Trading loop: run until close or shutdown signal
-        while _running and mh.is_market_open():
+        while not _shutdown.is_set() and mh.is_market_open():
             try:
                 _run_cycle(account_id)
             except Exception as exc:
                 logger.exception("Unexpected error in run cycle: %s", exc)
 
-            # Sleep for POLL_INTERVAL, waking early on shutdown
+            # Wait for POLL_INTERVAL, waking early on shutdown
             remaining = config.POLL_INTERVAL
-            while remaining > 0 and _running:
+            while remaining > 0 and not _shutdown.is_set():
                 chunk = min(remaining, 5)
-                time.sleep(chunk)
+                if _shutdown.wait(chunk):
+                    break
                 remaining -= chunk
                 if not mh.is_market_open():
                     break
 
-        if _running:
+        if not _shutdown.is_set():
             logger.info("Market CLOSED for the day. Bot going to sleep.")
 
     logger.info("Bot shut down cleanly.")
