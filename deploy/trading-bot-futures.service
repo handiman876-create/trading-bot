@@ -1,0 +1,27 @@
+[Unit]
+Description=TradeStation Trading Bot (futures: ES/NQ/RTY)
+Documentation=file:/root/trading-bot/restart.sh
+After=network-online.target
+Wants=network-online.target
+# Crash-loop guard: if it fails 5 times within 5 min, stop trying and stay failed
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/trading-bot
+# main.py runs in the foreground; config.py's load_dotenv() reads .env from WorkingDirectory.
+ExecStart=/usr/bin/python3 /root/trading-bot/main.py --mode futures
+# Bot handles SIGTERM for a clean shutdown; give it time before SIGKILL.
+KillSignal=SIGTERM
+TimeoutStopSec=20
+# Restart on crash (non-zero exit); a clean SIGTERM stop (exit 0) does NOT restart.
+Restart=on-failure
+RestartSec=10
+# Match restart.sh's log target: stdout+stderr -> bot.futures.log (append, preserving history)
+StandardOutput=append:/root/trading-bot/bot.futures.log
+StandardError=append:/root/trading-bot/bot.futures.log
+
+[Install]
+WantedBy=multi-user.target

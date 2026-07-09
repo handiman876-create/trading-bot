@@ -1,0 +1,37 @@
+# logrotate config for the TradeStation trading bots.
+# Install to /etc/logrotate.d/trading-bot (see deploy/install.sh).
+# Runs under the system's daily logrotate.timer.
+#
+# Covers the structured logs in logs/ (app / trades / performance, both modes)
+# AND the systemd stdout captures at the repo root (bot.log, bot.futures.log).
+#
+# NOTE: logrotate does not support trailing/inline comments on directive lines,
+# so every directive below stands alone.
+#
+# copytruncate is REQUIRED: the bot's Python logging.FileHandler and systemd's
+# append: redirect both hold these files open by fd. A plain rename-based
+# rotation would leave the process writing to the old (now-unlinked) inode, so
+# the new file would stay empty. copytruncate copies the file then truncates it
+# in place, so the open fd keeps writing to the same, now-rotated file.
+
+/root/trading-bot/logs/*.log
+/root/trading-bot/bot.log
+/root/trading-bot/bot.futures.log
+{
+    # Considered once per day by logrotate.timer,
+    daily
+    # but rotate immediately if the file has already reached 10MB.
+    maxsize 10M
+    # Keep 7 rotations (~7 days of history).
+    rotate 7
+    # Don't error if a log doesn't exist yet.
+    missingok
+    # Skip rotation when the file is empty.
+    notifempty
+    # gzip rotated logs.
+    compress
+    # Compress on the next cycle, avoiding a copytruncate race.
+    delaycompress
+    # Rotate in place without needing the bot to reopen its fd.
+    copytruncate
+}
