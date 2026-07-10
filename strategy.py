@@ -43,6 +43,12 @@ def _shares_to_buy(price: float) -> int:
     return max(1, math.floor(config.MAX_POSITION_VALUE / price))
 
 
+def _atm_strike(price: float) -> float:
+    """ATM strike chosen at signal time: the nearest listed $5 strike increment
+    to the underlying price (same rule for calls and puts)."""
+    return round(price / 5.0) * 5.0
+
+
 def _current_position(positions: list[dict], symbol: str) -> int:
     """Return net quantity held for symbol (0 if none)."""
     for p in positions:
@@ -109,7 +115,6 @@ def evaluate_stock(symbol: str, account_id: str, positions: list[dict]) -> None:
 def evaluate_option(
     symbol:     str,
     expiration: str,
-    strike:     float,
     opt_type:   str,
     account_id: str,
     positions:  list[dict],
@@ -127,6 +132,10 @@ def evaluate_option(
     if not sig:
         return
 
+    # ATM strike is chosen at signal time from the underlying price (nearest $5),
+    # so it tracks the market instead of drifting from a hardcoded config value.
+    strike = _atm_strike(sig["close"])
+
     occ_symbol = tc.find_option_symbol(symbol, expiration, strike, opt_type)
     if not occ_symbol:
         return
@@ -141,25 +150,32 @@ def evaluate_option(
         sig["close"], sig["rsi"], opt_price, held,
     )
 
+    if _already_signaled_today(occ_symbol):
+        return
+
     is_call = opt_type.lower() == "call"
 
     # Open new position
     if held == 0:
         if is_call and sig["bullish_cross"] and sig["rsi"] < config.RSI_OVERBOUGHT:
-            _open_option(account_id, occ_symbol, "buy_to_open", opt_price,
-                         symbol, expiration, strike, opt_type, sig)
+            if _open_option(account_id, occ_symbol, "buy_to_open", opt_price,
+                            symbol, expiration, strike, opt_type, sig):
+                _mark_signaled(occ_symbol)
         elif not is_call and sig["bearish_cross"] and sig["rsi"] > config.RSI_OVERSOLD:
-            _open_option(account_id, occ_symbol, "buy_to_open", opt_price,
-                         symbol, expiration, strike, opt_type, sig)
+            if _open_option(account_id, occ_symbol, "buy_to_open", opt_price,
+                            symbol, expiration, strike, opt_type, sig):
+                _mark_signaled(occ_symbol)
 
     # Close existing position on opposite cross
     elif held > 0:
         if is_call and sig["bearish_cross"]:
-            _close_option(account_id, occ_symbol, held, opt_price,
-                          symbol, expiration, strike, opt_type, sig)
+            if _close_option(account_id, occ_symbol, held, opt_price,
+                             symbol, expiration, strike, opt_type, sig):
+                _mark_signaled(occ_symbol)
         elif not is_call and sig["bullish_cross"]:
-            _close_option(account_id, occ_symbol, held, opt_price,
-                          symbol, expiration, strike, opt_type, sig)
+            if _close_option(account_id, occ_symbol, held, opt_price,
+                             symbol, expiration, strike, opt_type, sig):
+                _mark_signaled(occ_symbol)
 
 
 # ── Futures Strategy ──────────────────────────────────────────────────────────
@@ -257,6 +273,7 @@ def _open_option(account_id, occ_symbol, side, price, symbol, exp, strike, opt_t
         order_id = result.get("order", {}).get("id")
         log_trade(side.upper(), occ_symbol, qty, price, "market", order_id,
                   f"{symbol} EMA cross, RSI={sig['rsi']:.1f}, strike={strike} {opt_type} exp={exp}")
+    return result
 
 
 def _close_option(account_id, occ_symbol, held, price, symbol, exp, strike, opt_type, sig):
@@ -266,3 +283,4 @@ def _close_option(account_id, occ_symbol, held, price, symbol, exp, strike, opt_
         order_id = result.get("order", {}).get("id")
         log_trade("SELL_TO_CLOSE", occ_symbol, held, price, "market", order_id,
                   f"{symbol} reversal, RSI={sig['rsi']:.1f}, strike={strike} {opt_type} exp={exp}")
+    return result

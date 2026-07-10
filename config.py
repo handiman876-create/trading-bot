@@ -54,12 +54,13 @@ MARKET_TZ          = "America/New_York"
 STOCK_WATCHLIST = ["SPY", "AAPL", "TSLA", "NVDA", "AMD", "MSFT", "GOOGL",
                    "META", "ARM", "CRWV", "AVGO", "AMZN"]
 
-# Options watchlist: list of (symbol, strike, option_type).
-# The expiration is no longer hardcoded — it is computed at runtime to the next
-# valid monthly expiration (3rd Friday) via market_hours.next_monthly_expiration().
+# Options watchlist: list of (symbol, option_type).
+# Neither strike nor expiration is hardcoded — both are computed at runtime:
+#   strike     → nearest $5 to the underlying at signal time (strategy._atm_strike)
+#   expiration → next monthly 3rd Friday (market_hours.next_monthly_expiration)
 OPTIONS_WATCHLIST = [
-    ("SPY",  745.0, "call"),  # ATM: SPY ~$744 (2026-07-08)
-    ("AAPL", 315.0, "put"),   # ATM: AAPL ~$313 (2026-07-08)
+    ("SPY",  "call"),
+    ("AAPL", "put"),
 ]
 
 # ── Strategy Parameters ───────────────────────────────────────────────────────

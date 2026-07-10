@@ -108,9 +108,9 @@ def _run_cycle(account_id: str) -> None:
             logger.error("Error evaluating stock %s: %s", symbol, exc)
 
     expiration = mh.next_monthly_expiration()
-    for (symbol, strike, opt_type) in config.OPTIONS_WATCHLIST:
+    for (symbol, opt_type) in config.OPTIONS_WATCHLIST:
         try:
-            strategy.evaluate_option(symbol, expiration, strike, opt_type,
+            strategy.evaluate_option(symbol, expiration, opt_type,
                                      account_id, positions)
         except Exception as exc:
             logger.error("Error evaluating option %s %s: %s", symbol, expiration, exc)
