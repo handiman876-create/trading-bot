@@ -158,6 +158,12 @@ def main() -> None:
         logger.info("Core stocks : %s (%d)", config.CORE_WATCHLIST, len(config.CORE_WATCHLIST))
         logger.info("Momentum    : %s (dynamic, %s)",
                     watchlist._load_momentum_symbols(), config.MOMENTUM_WATCHLIST_FILE)
+        # Exercise the same union the trading loop uses so startup logging proves
+        # effective_stock_watchlist() is wired. Held names aren't known until the
+        # account is fetched (below), so they're shown as folding in live.
+        active = watchlist.effective_stock_watchlist([])
+        logger.info("Active list : %s (%d; core ∪ momentum, held names fold in live)",
+                    active, len(active))
         logger.info("Options     : %s", config.OPTIONS_WATCHLIST)
         logger.info("Next option exp.: %s", mh.next_monthly_expiration())
     logger.info("=" * 60)
