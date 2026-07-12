@@ -9,3 +9,5 @@ bot.pid
 bot.futures.log
 bot.futures.lock
 bot.futures.pid
+momentum.lock
+data/momentum_watchlist.json

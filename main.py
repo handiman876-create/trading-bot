@@ -2,10 +2,10 @@
 """
 TradeStation Paper-Trading Bot
 ==============================
-Starts automatically at NYSE open (9:30 AM ET), evaluates each symbol on
-STOCK_WATCHLIST and OPTIONS_WATCHLIST every POLL_INTERVAL seconds using
-EMA-crossover + RSI signals, logs all trades and performance, then shuts
-down cleanly at market close (4:00 PM ET).
+Starts automatically at NYSE open (9:30 AM ET), evaluates each symbol on the
+effective stock watchlist (core + momentum slot + held; see watchlist.py) and
+OPTIONS_WATCHLIST every POLL_INTERVAL seconds using EMA-crossover + RSI signals,
+logs all trades and performance, then shuts down cleanly at market close.
 
 Usage:
     # One-time: authorize and save your refresh token
@@ -43,6 +43,7 @@ import tradestation_client as tc
 import market_hours as mh
 import futures_market_hours as fmh
 import strategy
+import watchlist
 from trade_logger import log_performance
 
 logger = logging.getLogger("bot")
@@ -102,7 +103,7 @@ def _run_cycle(account_id: str) -> None:
                 logger.error("Error evaluating future %s: %s", root, exc)
         return
 
-    for symbol in config.STOCK_WATCHLIST:
+    for symbol in watchlist.effective_stock_watchlist(positions):
         try:
             strategy.evaluate_stock(symbol, account_id, positions, equity)
         except Exception as exc:
@@ -154,7 +155,9 @@ def main() -> None:
         logger.info("Futures     : %s", config.FUTURES_WATCHLIST)
         logger.info("Front months: %s", contracts)
     else:
-        logger.info("Stocks      : %s", config.STOCK_WATCHLIST)
+        logger.info("Core stocks : %s (%d)", config.CORE_WATCHLIST, len(config.CORE_WATCHLIST))
+        logger.info("Momentum    : %s (dynamic, %s)",
+                    watchlist._load_momentum_symbols(), config.MOMENTUM_WATCHLIST_FILE)
         logger.info("Options     : %s", config.OPTIONS_WATCHLIST)
         logger.info("Next option exp.: %s", mh.next_monthly_expiration())
     logger.info("=" * 60)

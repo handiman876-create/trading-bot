@@ -1,0 +1,20 @@
+[Unit]
+Description=S&P 500 momentum screen — twice-monthly watchlist rotation
+Documentation=file:/root/trading-bot/deploy/run-momentum-screen.sh
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# oneshot: run to completion, then exit (the .timer schedules it; not a daemon).
+Type=oneshot
+User=root
+WorkingDirectory=/root/trading-bot
+ExecStart=/root/trading-bot/deploy/run-momentum-screen.sh
+# Free-tier rate-limiting makes a full universe pull ~10 min; cap well above it
+# so a Polygon slowdown can't wedge the run.
+TimeoutStartSec=1800
+StandardOutput=append:/root/trading-bot/logs/momentum.log
+StandardError=append:/root/trading-bot/logs/momentum.log
+
+# No [Install] section: a timer-activated oneshot is pulled in by its .timer,
+# not enabled directly.

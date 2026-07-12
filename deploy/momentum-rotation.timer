@@ -1,0 +1,16 @@
+[Unit]
+Description=Run the momentum screen on the 1st and 15th at 06:00 America/New_York
+
+[Timer]
+# 1st and 15th of each month, 06:00 Eastern (pre-market, ~biweekly). The
+# America/New_York suffix tracks EST/EDT automatically. Running pre-market means
+# the fresh list is ready before the open and the swap never lands mid-session.
+OnCalendar=*-*-01,15 06:00:00 America/New_York
+# If the machine was off at the scheduled time, run once at next boot instead of
+# skipping the rotation entirely.
+Persistent=true
+# Small jitter so it isn't hitting Polygon at exactly :00.
+RandomizedDelaySec=120
+
+[Install]
+WantedBy=timers.target

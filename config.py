@@ -50,9 +50,15 @@ MARKET_CLOSE_HOUR  = 16
 MARKET_CLOSE_MIN   = 0
 MARKET_TZ          = "America/New_York"
 
-# ── Watchlist ─────────────────────────────────────────────────────────────────
-STOCK_WATCHLIST = ["SPY", "AAPL", "TSLA", "NVDA", "AMD", "MSFT", "GOOGL",
-                   "META", "ARM", "CRWV", "AVGO", "AMZN"]
+# ── Watchlist (fixed core) ────────────────────────────────────────────────────
+# The live stock list is assembled every cycle by
+# watchlist.effective_stock_watchlist() as:  CORE_WATCHLIST ∪ momentum slot ∪
+# currently-held symbols. Edit the two core buckets here; the momentum slot is
+# generated twice-monthly into data/momentum_watchlist.json, not hand-edited.
+CORE_MEGA = ["SPY", "QQQ", "AAPL", "MSFT", "GOOGL",
+             "META", "NVDA", "AMZN", "TSLA", "AMD"]
+CORE_GROWTH = ["AVGO", "ARM", "CRWV", "JPM", "PLTR"]
+CORE_WATCHLIST = CORE_MEGA + CORE_GROWTH
 
 # Options watchlist: list of (symbol, option_type).
 # Neither strike nor expiration is hardcoded — both are computed at runtime:
@@ -75,6 +81,27 @@ EQUITY_PER_TRADE_PCT = 0.05   # fraction of account equity deployed per stock tr
 MAX_POSITIONS        = 20     # skip new stock entries once this many positions are
                               # open (0.05 × 20 = 100% fully deployed)
 OPTIONS_CONTRACTS    = 1      # contracts per options trade
+
+# ── Momentum Rotation (dynamic watchlist slot) ────────────────────────────────
+# Twice a month (1st & 15th, pre-market) momentum_screen.py screens the S&P 500
+# for momentum leaders and writes MOMENTUM_WATCHLIST_FILE; the bot folds up to
+# MOMENTUM_SLOT_SIZE of them into the live list. The screen criteria below are
+# shared with momentum_screen.py — one source of truth for both.
+MOMENTUM_SLOT_SIZE      = 5
+MOMENTUM_WATCHLIST_FILE = "data/momentum_watchlist.json"   # generated (gitignored)
+MOMENTUM_UNIVERSE_FILE  = "data/sp500.json"                # vendored S&P 500 list
+MOMENTUM_MAX_AGE_DAYS   = 21     # warn if the generated list is older than this
+
+# Screen criteria (20-day momentum leaders)
+MOM_LOOKBACK   = 20      # trading-day lookback for return & average volume
+MOM_RETURN_MIN = 0.05    # 20-day price return must exceed +5%
+MOM_RSI_MIN    = 50      # RSI(14) lower bound (uptrend, not yet overbought)
+MOM_RSI_MAX    = 70      # RSI(14) upper bound
+
+# ── Polygon.io (momentum-screen data source; free tier) ───────────────────────
+POLYGON_API_KEY  = os.environ.get("POLYGON_API_KEY", "")
+POLYGON_BASE_URL = "https://api.polygon.io"
+POLYGON_MAX_CALLS_PER_MIN = 5    # free-tier rate limit; the screen self-throttles
 
 # ── Poll interval while market is open (seconds) ─────────────────────────────
 POLL_INTERVAL = 60
