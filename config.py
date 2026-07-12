@@ -71,8 +71,10 @@ RSI_OVERSOLD     = 30
 RSI_OVERBOUGHT   = 70
 
 # ── Position Sizing ───────────────────────────────────────────────────────────
-MAX_POSITION_VALUE = 1000.0   # max dollars per stock position
-OPTIONS_CONTRACTS  = 1        # contracts per options trade
+EQUITY_PER_TRADE_PCT = 0.05   # fraction of account equity deployed per stock trade
+MAX_POSITIONS        = 20     # skip new stock entries once this many positions are
+                              # open (0.05 × 20 = 100% fully deployed)
+OPTIONS_CONTRACTS    = 1      # contracts per options trade
 
 # ── Poll interval while market is open (seconds) ─────────────────────────────
 POLL_INTERVAL = 60

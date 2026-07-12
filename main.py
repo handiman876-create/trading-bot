@@ -91,6 +91,7 @@ def _run_cycle(account_id: str) -> None:
     """One evaluation pass over the active watchlist."""
     positions = tc.get_positions(account_id)
     balance   = tc.get_account_balance(account_id)
+    equity    = balance.get("total_equity") if balance else None
     log_performance(account_id, balance, positions)
 
     if MODE == "futures":
@@ -103,7 +104,7 @@ def _run_cycle(account_id: str) -> None:
 
     for symbol in config.STOCK_WATCHLIST:
         try:
-            strategy.evaluate_stock(symbol, account_id, positions)
+            strategy.evaluate_stock(symbol, account_id, positions, equity)
         except Exception as exc:
             logger.error("Error evaluating stock %s: %s", symbol, exc)
 

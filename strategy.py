@@ -37,10 +37,26 @@ def _mark_signaled(symbol: str) -> None:
     _last_signal_date[symbol] = date.today().isoformat()
 
 
-def _shares_to_buy(price: float) -> int:
-    if price <= 0:
+def _shares_to_buy(price: float, equity: Optional[float]) -> int:
+    """Size a stock entry at EQUITY_PER_TRADE_PCT of current account equity.
+    Returns 0 (caller skips the trade) when price or equity is unusable, so a
+    failed balance read can never place a mis-sized order — safety over blind
+    sizing."""
+    if price <= 0 or not equity or equity <= 0:
         return 0
-    return max(1, math.floor(config.MAX_POSITION_VALUE / price))
+    position_size = equity * config.EQUITY_PER_TRADE_PCT
+    return max(1, math.floor(position_size / price))
+
+
+def _open_position_count(positions: list[dict]) -> int:
+    """Number of positions currently held (non-zero qty).
+
+    KNOWN LIMITATION: `positions` is fetched once per cycle (main._run_cycle) and
+    is not refreshed after an order fills mid-cycle. If several symbols cross in
+    the same cycle, this count won't reflect fills placed earlier in that cycle,
+    so the MAX_POSITIONS cap can be momentarily exceeded by the number of
+    same-cycle entries. Accepted for now; the skip log below makes it visible."""
+    return sum(1 for p in positions if int(p.get("quantity", 0)) != 0)
 
 
 def _atm_strike(price: float) -> float:
@@ -59,7 +75,8 @@ def _current_position(positions: list[dict], symbol: str) -> int:
 
 # ── Stock Strategy ────────────────────────────────────────────────────────────
 
-def evaluate_stock(symbol: str, account_id: str, positions: list[dict]) -> None:
+def evaluate_stock(symbol: str, account_id: str, positions: list[dict],
+                   equity: Optional[float]) -> None:
     history = tc.get_historical(symbol, days=90)
     if not history:
         return
@@ -90,8 +107,20 @@ def evaluate_stock(symbol: str, account_id: str, positions: list[dict]) -> None:
 
     # BUY signal
     if sig["bullish_cross"] and sig["rsi"] < config.RSI_OVERBOUGHT and held == 0:
-        qty = _shares_to_buy(price)
-        logger.info("SIGNAL BUY %s x%d", symbol, qty)
+        open_count = _open_position_count(positions)
+        if open_count >= config.MAX_POSITIONS:
+            logger.info("Skip BUY %s: %d/%d positions open (max reached)",
+                        symbol, open_count, config.MAX_POSITIONS)
+            return
+        qty = _shares_to_buy(price, equity)
+        if qty < 1:
+            logger.warning("Skip BUY %s: could not size order (equity=%s price=%.2f)",
+                           symbol, equity, price)
+            return
+        logger.info("SIGNAL BUY %s x%d (~$%.0f, %.0f%% of $%.0f equity, %d/%d open)",
+                    symbol, qty, qty * price,
+                    config.EQUITY_PER_TRADE_PCT * 100, equity or 0.0,
+                    open_count, config.MAX_POSITIONS)
         result = tc.place_equity_order(account_id, symbol, "buy", qty)
         if result:
             _mark_signaled(symbol)
