@@ -83,38 +83,49 @@ def _current_position(positions: list[dict], symbol: str) -> int:
 
 _STOPS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                            config.STOP_PRICE_FILE)
+_MOM_ENTRIES_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                 config.MOMENTUM_ENTRY_FILE)
 
-# Observability: stop-triggered exits this process lifetime. Every safety net
-# gets a counter so we can tell whether it's still earning its keep.
+# Observability: safety-net / signal counters this process lifetime. Every safety
+# net gets a counter so we can tell whether it's still earning its keep.
 _stop_exits = 0
+_momentum_align_entries = 0
 
 
-def _load_stops() -> dict:
-    """Read persisted stop records. Returns {} on any problem (missing file,
-    malformed JSON) so a corrupt/absent file degrades to 'no stored stops'
-    (bootstrap re-arms held positions) rather than crashing the cycle."""
+def _load_json(path: str) -> dict:
+    """Read a persisted JSON dict. Returns {} on any problem (missing file,
+    malformed JSON, non-dict) so a corrupt/absent file degrades gracefully rather
+    than crashing the cycle."""
     try:
-        with open(_STOPS_PATH) as f:
+        with open(path) as f:
             data = json.load(f)
         return data if isinstance(data, dict) else {}
     except FileNotFoundError:
         return {}
     except (OSError, json.JSONDecodeError) as exc:
-        logger.warning("Stop file unreadable (%s) — treating as empty.", exc)
+        logger.warning("State file %s unreadable (%s) — treating as empty.", path, exc)
         return {}
 
 
-def _save_stops(stops: dict) -> None:
-    """Atomically persist stop records (temp file + os.replace) so a crash
+def _save_json(path: str, data: dict) -> None:
+    """Atomically persist a JSON dict (temp file + os.replace) so a crash
     mid-write can never leave a half-written, unparseable file."""
-    tmp = f"{_STOPS_PATH}.tmp"
+    tmp = f"{path}.tmp"
     try:
-        os.makedirs(os.path.dirname(_STOPS_PATH), exist_ok=True)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(tmp, "w") as f:
-            json.dump(stops, f, indent=2, sort_keys=True)
-        os.replace(tmp, _STOPS_PATH)
+            json.dump(data, f, indent=2, sort_keys=True)
+        os.replace(tmp, path)
     except OSError as exc:
-        logger.error("Could not write stop file %s: %s", _STOPS_PATH, exc)
+        logger.error("Could not write state file %s: %s", path, exc)
+
+
+def _load_stops() -> dict:
+    return _load_json(_STOPS_PATH)
+
+
+def _save_stops(stops: dict) -> None:
+    _save_json(_STOPS_PATH, stops)
 
 
 def _live_price(symbol: str) -> Optional[float]:
@@ -262,10 +273,79 @@ def _check_and_trail_stop(symbol: str, held: int, sig: dict,
     return False
 
 
+# ── Momentum alignment latch (one-shot entry per rotation) ────────────────────
+# Momentum-slot names are already trending when added, so they never fire a fresh
+# EMA cross. We give them one "enter on alignment" shot per rotation; the latch
+# below (a separate file — it must survive stop-out exits, unlike a stop record)
+# records which rotation we entered on so a stop-out can't trigger an immediate
+# re-buy. Re-arms automatically when the rotation's `generation` id changes.
+
+def _momentum_entry_taken(symbol: str, generation: str) -> bool:
+    """True if we've already taken our one alignment entry for `symbol` in the
+    current rotation. A changed `generation` (new twice-monthly screen) re-arms."""
+    rec = _load_json(_MOM_ENTRIES_PATH).get(symbol)
+    return bool(rec and rec.get("generation") == generation)
+
+
+def _record_momentum_entry(symbol: str, generation: str) -> None:
+    entries = _load_json(_MOM_ENTRIES_PATH)
+    entries[symbol] = {"generation": generation, "entered": date.today().isoformat()}
+    _save_json(_MOM_ENTRIES_PATH, entries)
+
+
+def reconcile_momentum_entries(momentum_symbols) -> None:
+    """Prune latch records for names no longer in the momentum slot. Once per
+    cycle. Guarded on an empty slot (screen failure returns []) so a blip can't
+    wipe latches — mirrors reconcile_stops."""
+    if not momentum_symbols:
+        return
+    current = set(momentum_symbols)
+    entries = _load_json(_MOM_ENTRIES_PATH)
+    stale = [s for s in entries if s not in current]
+    for s in stale:
+        del entries[s]
+        logger.info("MOMENTUM LATCH PRUNE %s: no longer in slot — dropping latch", s)
+    if stale:
+        _save_json(_MOM_ENTRIES_PATH, entries)
+
+
 # ── Stock Strategy ────────────────────────────────────────────────────────────
 
+
+def _enter_long(symbol: str, sig: dict, price: float, account_id: str,
+                positions: list[dict], equity: Optional[float], reason: str) -> bool:
+    """Shared long-entry path for both the fresh-cross and momentum-alignment
+    signals: enforce MAX_POSITIONS, size at EQUITY_PER_TRADE_PCT, place the buy,
+    and on a filled order mark the symbol signaled, log the trade, and arm the
+    trailing stop. Returns True iff an order was placed and accepted."""
+    open_count = _open_position_count(positions)
+    if open_count >= config.MAX_POSITIONS:
+        logger.info("Skip BUY %s: %d/%d positions open (max reached)",
+                    symbol, open_count, config.MAX_POSITIONS)
+        return False
+    qty = _shares_to_buy(price, equity)
+    if qty < 1:
+        logger.warning("Skip BUY %s: could not size order (equity=%s price=%.2f)",
+                       symbol, equity, price)
+        return False
+    logger.info("SIGNAL BUY %s x%d (~$%.0f, %.0f%% of $%.0f equity, %d/%d open) — %s",
+                symbol, qty, qty * price,
+                config.EQUITY_PER_TRADE_PCT * 100, equity or 0.0,
+                open_count, config.MAX_POSITIONS, reason)
+    result = tc.place_equity_order(account_id, symbol, "buy", qty)
+    if result:
+        _mark_signaled(symbol)
+        order_id = result.get("order", {}).get("id")
+        log_trade("BUY", symbol, qty, price, "market", order_id, reason)
+        _arm_stop_on_entry(symbol, price, sig.get("atr"))
+        return True
+    return False
+
 def evaluate_stock(symbol: str, account_id: str, positions: list[dict],
-                   equity: Optional[float]) -> None:
+                   equity: Optional[float],
+                   is_momentum: bool = False, momentum_generation: str = "") -> None:
+    global _momentum_align_entries
+
     history = tc.get_historical(symbol, days=90)
     if not history:
         return
@@ -275,6 +355,7 @@ def evaluate_stock(symbol: str, account_id: str, positions: list[dict],
         config.MA_SHORT_PERIOD,
         config.MA_LONG_PERIOD,
         config.RSI_PERIOD,
+        config.STOP_LOSS_ATR_PERIOD,
     )
     if not sig:
         logger.warning("%s: not enough history for indicators", symbol)
@@ -300,29 +381,26 @@ def evaluate_stock(symbol: str, account_id: str, positions: list[dict],
     if _already_signaled_today(symbol):
         return
 
-    # BUY signal
+    # BUY signal — fresh EMA cross (all symbols)
     if sig["bullish_cross"] and sig["rsi"] < config.RSI_OVERBOUGHT and held == 0:
-        open_count = _open_position_count(positions)
-        if open_count >= config.MAX_POSITIONS:
-            logger.info("Skip BUY %s: %d/%d positions open (max reached)",
-                        symbol, open_count, config.MAX_POSITIONS)
-            return
-        qty = _shares_to_buy(price, equity)
-        if qty < 1:
-            logger.warning("Skip BUY %s: could not size order (equity=%s price=%.2f)",
-                           symbol, equity, price)
-            return
-        logger.info("SIGNAL BUY %s x%d (~$%.0f, %.0f%% of $%.0f equity, %d/%d open)",
-                    symbol, qty, qty * price,
-                    config.EQUITY_PER_TRADE_PCT * 100, equity or 0.0,
-                    open_count, config.MAX_POSITIONS)
-        result = tc.place_equity_order(account_id, symbol, "buy", qty)
-        if result:
-            _mark_signaled(symbol)
-            order_id = result.get("order", {}).get("id")
-            log_trade("BUY", symbol, qty, price, "market", order_id,
-                      f"EMA cross up, RSI={sig['rsi']:.1f}")
-            _arm_stop_on_entry(symbol, price, sig.get("atr"))
+        _enter_long(symbol, sig, price, account_id, positions, equity,
+                    reason=f"EMA cross up, RSI={sig['rsi']:.1f}")
+
+    # BUY signal — momentum alignment (momentum slot only, one-shot per rotation).
+    # Reached only when there was NO fresh cross (elif), so a genuine cross always
+    # takes the standard path; this is the fallback for names already trending when
+    # the screen added them. The latch is consumed only on a *placed* order, so a
+    # MAX_POSITIONS block leaves the shot available to retry when a slot frees.
+    elif (is_momentum and held == 0 and config.USE_MOMENTUM_ALIGNMENT
+          and sig["ema_short"] > sig["ema_long"]
+          and sig["rsi"] < config.MOMENTUM_ALIGN_RSI_MAX
+          and not _momentum_entry_taken(symbol, momentum_generation)):
+        if _enter_long(symbol, sig, price, account_id, positions, equity,
+                       reason=f"momentum alignment entry, RSI={sig['rsi']:.1f}"):
+            _momentum_align_entries += 1
+            _record_momentum_entry(symbol, momentum_generation)
+            logger.info("MOMENTUM ALIGNMENT ENTRY %s (gen=%s) — align entries #%d",
+                        symbol, momentum_generation or "<none>", _momentum_align_entries)
 
     # SELL signal
     elif sig["bearish_cross"] and sig["rsi"] > config.RSI_OVERSOLD and held > 0:

@@ -109,9 +109,17 @@ def _run_cycle(account_id: str) -> None:
     # equity stop. Guarded internally against an empty/failed positions fetch too.
     strategy.reconcile_stops(positions)
 
+    # Momentum slot + rotation id, read once per cycle. is_momentum drives the
+    # one-shot alignment entry; generation re-arms the latch each new rotation.
+    momentum_symbols, generation = watchlist.momentum_slot()
+    momentum_set = set(momentum_symbols)
+    strategy.reconcile_momentum_entries(momentum_symbols)
+
     for symbol in watchlist.effective_stock_watchlist(positions):
         try:
-            strategy.evaluate_stock(symbol, account_id, positions, equity)
+            strategy.evaluate_stock(symbol, account_id, positions, equity,
+                                    is_momentum=(symbol in momentum_set),
+                                    momentum_generation=generation)
         except Exception as exc:
             logger.error("Error evaluating stock %s: %s", symbol, exc)
 
@@ -172,6 +180,13 @@ def main() -> None:
                     active, len(active))
         logger.info("Options     : %s", config.OPTIONS_WATCHLIST)
         logger.info("Next option exp.: %s", mh.next_monthly_expiration())
+        logger.info("Stop loss   : %s (%.1fx ATR%d trailing, file=%s)",
+                    "ENABLED" if config.USE_TRAILING_STOP else "DISABLED",
+                    config.STOP_LOSS_ATR_MULT, config.STOP_LOSS_ATR_PERIOD,
+                    config.STOP_PRICE_FILE)
+        logger.info("Mom. align  : %s (one-shot/rotation, RSI<%d, file=%s)",
+                    "ENABLED" if config.USE_MOMENTUM_ALIGNMENT else "DISABLED",
+                    config.MOMENTUM_ALIGN_RSI_MAX, config.MOMENTUM_ENTRY_FILE)
     logger.info("=" * 60)
 
     if not (config.TS_CLIENT_ID and config.TS_CLIENT_SECRET and config.TS_REFRESH_TOKEN):

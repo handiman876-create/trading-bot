@@ -12,3 +12,4 @@ bot.futures.pid
 momentum.lock
 data/momentum_watchlist.json
 data/stop_prices.json
+data/momentum_entries.json

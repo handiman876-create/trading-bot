@@ -92,6 +92,16 @@ STOP_LOSS_ATR_MULT   = 2.5    # stop sits this many ATRs below the high-water ma
 STOP_LOSS_ATR_PERIOD = 14     # ATR lookback (Wilder), computed once at entry
 STOP_PRICE_FILE      = "data/stop_prices.json"   # generated (gitignored)
 
+# ── Momentum alignment entry (momentum slot only) ─────────────────────────────
+# Momentum leaders are already trending when the twice-monthly screen adds them,
+# so they never produce a *fresh* EMA cross for the bot to enter on. Give the
+# momentum bucket a one-shot "enter on alignment" signal instead; core names keep
+# the patient fresh-cross entry. One entry per symbol per rotation, latched in
+# MOMENTUM_ENTRY_FILE so a stop-out can't trigger an immediate re-buy.
+USE_MOMENTUM_ALIGNMENT = True    # master switch; False = fresh-cross only, all names
+MOMENTUM_ALIGN_RSI_MAX = 60      # alignment entry only when RSI is below this
+MOMENTUM_ENTRY_FILE    = "data/momentum_entries.json"   # generated (gitignored)
+
 # ── Momentum Rotation (dynamic watchlist slot) ────────────────────────────────
 # Twice a month (1st & 15th, pre-market) momentum_screen.py screens the S&P 500
 # for momentum leaders and writes MOMENTUM_WATCHLIST_FILE; the bot folds up to

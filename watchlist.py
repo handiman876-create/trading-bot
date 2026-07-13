@@ -25,9 +25,9 @@ import config
 logger = logging.getLogger(__name__)
 
 
-def _load_momentum_symbols() -> list[str]:
-    """Read the generated momentum slot. Returns [] on any problem (missing file,
-    malformed JSON, wrong shape) so a failed/never-run screen degrades to
+def _load_momentum_doc() -> dict:
+    """Parse the generated momentum watchlist. Returns {} on any problem (missing
+    file, malformed JSON, non-object) so a failed/never-run screen degrades to
     core-only trading. Warns — but still uses — a slot older than
     MOMENTUM_MAX_AGE_DAYS so a missed rotation is visible in the logs."""
     path = config.MOMENTUM_WATCHLIST_FILE
@@ -36,15 +36,13 @@ def _load_momentum_symbols() -> list[str]:
             doc = json.load(f)
     except FileNotFoundError:
         logger.info("No momentum watchlist at %s yet — trading core-only.", path)
-        return []
+        return {}
     except (OSError, json.JSONDecodeError) as exc:
         logger.warning("Momentum watchlist unreadable (%s) — trading core-only.", exc)
-        return []
-
-    symbols = doc.get("symbols")
-    if not isinstance(symbols, list):
-        logger.warning("Momentum watchlist %s has no 'symbols' list — core-only.", path)
-        return []
+        return {}
+    if not isinstance(doc, dict):
+        logger.warning("Momentum watchlist %s is not an object — core-only.", path)
+        return {}
 
     generated = doc.get("generated")
     if generated:
@@ -58,8 +56,30 @@ def _load_momentum_symbols() -> list[str]:
         except ValueError:
             logger.warning("Momentum watchlist 'generated' timestamp unparseable: %r",
                            generated)
+    return doc
 
+
+def _symbols_from_doc(doc: dict) -> list[str]:
+    """Upper-cased symbol list from a momentum doc, or [] if the shape is wrong."""
+    symbols = doc.get("symbols")
+    if not isinstance(symbols, list):
+        if doc:                       # loaded but malformed (missing-file already logged)
+            logger.warning("Momentum watchlist has no 'symbols' list — core-only.")
+        return []
     return [str(s).upper() for s in symbols]
+
+
+def _load_momentum_symbols() -> list[str]:
+    """The momentum slot symbols (upper-cased), or [] if unavailable."""
+    return _symbols_from_doc(_load_momentum_doc())
+
+
+def momentum_slot() -> tuple[list[str], str]:
+    """(symbols, generation-id) for the current momentum slot. `generation` is the
+    file's 'generated' timestamp — the rotation id used to re-arm the one-shot
+    alignment latch; '' when absent so a missing timestamp never churns entries."""
+    doc = _load_momentum_doc()
+    return _symbols_from_doc(doc), (doc.get("generated") or "")
 
 
 def effective_stock_watchlist(positions: list[dict]) -> list[str]:

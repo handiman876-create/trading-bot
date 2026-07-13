@@ -1,0 +1,200 @@
+"""
+Unit tests for the momentum alignment entry + one-shot latch — NO network.
+
+Monkeypatches strategy's data deps (ind.compute_indicators, tc.get_historical /
+get_quote / place_equity_order) and points the stop + latch files at throwaway
+temp files, so we can drive evaluate_stock's entry branches without the API,
+without placing orders, and without touching live JSON state.
+
+Run:  python3 test_momentum_entry.py
+"""
+
+import os
+import tempfile
+
+import strategy
+
+_orders = []          # (symbol, side, qty) captured from place_equity_order
+
+
+def _fake_place(account_id, symbol, side, qty):
+    _orders.append((symbol, side, qty))
+    return {"order": {"id": "T1"}}
+
+
+def _buys():
+    return [o for o in _orders if o[1] == "buy"]
+
+
+def _reset():
+    _orders.clear()
+    strategy._stop_exits = 0
+    strategy._momentum_align_entries = 0
+    strategy._last_signal_date.clear()
+    strategy.config.USE_MOMENTUM_ALIGNMENT = True
+    strategy.config.USE_TRAILING_STOP = True
+    strategy.tc.place_equity_order = _fake_place
+    strategy.tc.get_historical = lambda *a, **k: [{"bar": 1}]     # truthy
+    strategy.tc.get_quote = lambda s: {"last": 10_000.0}          # high -> no stop breach
+    for path in (strategy._STOPS_PATH, strategy._MOM_ENTRIES_PATH):
+        if os.path.exists(path):
+            os.remove(path)
+
+
+def _set_sig(**kw):
+    """Default sig = alignment (EMA9>EMA21), RSI 55, no fresh cross."""
+    sig = {"close": 100.0, "ema_short": 105.0, "ema_long": 100.0, "rsi": 55.0,
+           "bullish_cross": False, "bearish_cross": False, "atr": 4.0}
+    sig.update(kw)
+    strategy.ind.compute_indicators = lambda *a, **k: sig
+    return sig
+
+
+# ── Alignment entry fires ─────────────────────────────────────────────────────
+
+def test_alignment_fires_for_momentum():
+    _reset(); _set_sig()
+    strategy.evaluate_stock("DAL", "ACCT", [], 100000.0,
+                            is_momentum=True, momentum_generation="G1")
+    assert _buys() == [("DAL", "buy", 50)], _orders     # 100000*0.05/100 = 50
+    assert strategy._momentum_entry_taken("DAL", "G1"), "latch recorded for G1"
+    assert "DAL" in strategy._load_stops(), "stop armed on alignment entry"
+
+
+def test_fresh_cross_enters_core():
+    """Regression: the fresh-cross path still works after the _enter_long refactor."""
+    _reset(); _set_sig(bullish_cross=True)
+    strategy.evaluate_stock("AAPL", "ACCT", [], 100000.0,
+                            is_momentum=False, momentum_generation="")
+    assert _buys() == [("AAPL", "buy", 50)], _orders
+    assert "AAPL" in strategy._load_stops(), "stop armed on fresh-cross entry"
+
+
+# ── Latch: one-shot per rotation ──────────────────────────────────────────────
+
+def test_latch_blocks_same_generation():
+    _reset(); _set_sig()
+    strategy._record_momentum_entry("DAL", "G1")        # already entered this rotation
+    strategy.evaluate_stock("DAL", "ACCT", [], 100000.0,
+                            is_momentum=True, momentum_generation="G1")
+    assert _buys() == [], "latch should block a second entry in the same rotation"
+
+
+def test_new_generation_rearms():
+    _reset(); _set_sig()
+    strategy._record_momentum_entry("DAL", "G1")
+    strategy.evaluate_stock("DAL", "ACCT", [], 100000.0,
+                            is_momentum=True, momentum_generation="G2")
+    assert _buys() == [("DAL", "buy", 50)], "new rotation id re-arms the shot"
+    assert strategy._momentum_entry_taken("DAL", "G2")
+
+
+def test_fresh_cross_ignores_alignment_latch():
+    """A genuine fresh cross re-enters even when the alignment latch is set —
+    the latch only gates the level-based alignment path, not the edge signal."""
+    _reset(); _set_sig(bullish_cross=True)
+    strategy._record_momentum_entry("DAL", "G1")
+    strategy.evaluate_stock("DAL", "ACCT", [], 100000.0,
+                            is_momentum=True, momentum_generation="G1")
+    assert _buys() == [("DAL", "buy", 50)], "fresh cross must bypass the latch"
+
+
+# ── Alignment gating ──────────────────────────────────────────────────────────
+
+def test_core_symbol_no_alignment():
+    _reset(); _set_sig()
+    strategy.evaluate_stock("AAPL", "ACCT", [], 100000.0,
+                            is_momentum=False, momentum_generation="G1")
+    assert _buys() == [], "core names never take the alignment entry"
+
+
+def test_rsi_too_high_blocks_alignment():
+    _reset(); _set_sig(rsi=65.0)                         # >= MOMENTUM_ALIGN_RSI_MAX (60)
+    strategy.evaluate_stock("DAL", "ACCT", [], 100000.0,
+                            is_momentum=True, momentum_generation="G1")
+    assert _buys() == [], "RSI >= 60 blocks the alignment entry"
+
+
+def test_held_blocks_alignment():
+    _reset(); _set_sig()
+    positions = [{"symbol": "DAL", "quantity": 50, "cost_basis": 5000.0}]
+    strategy.evaluate_stock("DAL", "ACCT", positions, 100000.0,
+                            is_momentum=True, momentum_generation="G1")
+    assert _buys() == [], "already holding -> no alignment entry"
+
+
+def test_master_switch_off_disables_alignment():
+    _reset(); _set_sig()
+    strategy.config.USE_MOMENTUM_ALIGNMENT = False
+    strategy.evaluate_stock("DAL", "ACCT", [], 100000.0,
+                            is_momentum=True, momentum_generation="G1")
+    assert _buys() == [], "USE_MOMENTUM_ALIGNMENT=False disables the branch"
+
+
+def test_max_positions_blocks_alignment_latch_not_consumed():
+    """MAX_POSITIONS reached -> alignment blocked -> latch NOT consumed -> retries
+    next cycle once a slot frees."""
+    _reset(); _set_sig()
+    full = [{"symbol": f"S{i}", "quantity": 1, "cost_basis": 100.0}
+            for i in range(strategy.config.MAX_POSITIONS)]      # 20 open, DAL not among them
+    strategy.evaluate_stock("DAL", "ACCT", full, 100000.0,
+                            is_momentum=True, momentum_generation="G1")
+    assert _buys() == [], "max positions blocks the entry"
+    assert not strategy._momentum_entry_taken("DAL", "G1"), "latch NOT consumed when blocked"
+
+    _orders.clear()                                             # a slot frees up
+    strategy.evaluate_stock("DAL", "ACCT", [], 100000.0,
+                            is_momentum=True, momentum_generation="G1")
+    assert _buys() == [("DAL", "buy", 50)], "retries and enters when slot frees"
+    assert strategy._momentum_entry_taken("DAL", "G1"), "latch consumed after a real entry"
+
+
+# ── Reconcile ─────────────────────────────────────────────────────────────────
+
+def test_reconcile_momentum_prunes_unlisted():
+    _reset()
+    strategy._save_json(strategy._MOM_ENTRIES_PATH, {
+        "DAL": {"generation": "G1", "entered": "d"},
+        "OLD": {"generation": "G1", "entered": "d"}})
+    strategy.reconcile_momentum_entries(["DAL", "DDOG"])
+    entries = strategy._load_json(strategy._MOM_ENTRIES_PATH)
+    assert "DAL" in entries, entries
+    assert "OLD" not in entries, "name no longer in slot pruned"
+
+
+def test_reconcile_empty_slot_guard():
+    _reset()
+    strategy._save_json(strategy._MOM_ENTRIES_PATH,
+                        {"DAL": {"generation": "G1", "entered": "d"}})
+    strategy.reconcile_momentum_entries([])                     # screen failed -> []
+    assert "DAL" in strategy._load_json(strategy._MOM_ENTRIES_PATH), \
+        "empty slot must not prune latches"
+
+
+if __name__ == "__main__":
+    _tmpdir = tempfile.mkdtemp(prefix="mom_test_")
+    strategy._STOPS_PATH = os.path.join(_tmpdir, "stop_prices.json")
+    strategy._MOM_ENTRIES_PATH = os.path.join(_tmpdir, "momentum_entries.json")
+    _orig = {
+        "place": strategy.tc.place_equity_order,
+        "hist":  strategy.tc.get_historical,
+        "quote": strategy.tc.get_quote,
+        "ci":    strategy.ind.compute_indicators,
+        "log":   strategy.log_trade,
+    }
+    strategy.log_trade = lambda *a, **k: None
+    try:
+        tests = [v for k, v in sorted(globals().items())
+                 if k.startswith("test_") and callable(v)]
+        passed = 0
+        for t in tests:
+            t()
+            print(f"  PASS  {t.__name__}")
+            passed += 1
+        print(f"All {passed} assertions passed.")
+    finally:
+        strategy.tc.place_equity_order = _orig["place"]
+        strategy.tc.get_historical    = _orig["hist"]
+        strategy.tc.get_quote         = _orig["quote"]
+        strategy.ind.compute_indicators = _orig["ci"]
+        strategy.log_trade            = _orig["log"]
