@@ -11,8 +11,10 @@ Options signals — same crossover applied to the underlying:
   Existing positions are closed on the opposite cross.
 """
 
+import json
 import logging
 import math
+import os
 from datetime import date
 from typing import Optional
 
@@ -73,6 +75,193 @@ def _current_position(positions: list[dict], symbol: str) -> int:
     return 0
 
 
+# ── Trailing Stop (bot-managed, persisted to config.STOP_PRICE_FILE) ──────────
+# Per-position ATR trailing-stop state survives restarts via a JSON file keyed by
+# symbol (schema documented in config.py). Checked every cycle BEFORE the EMA
+# signal so a same-day entry can still stop out. Paper-trading choice; swap to a
+# broker-native Sell Stop order when we go live.
+
+_STOPS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           config.STOP_PRICE_FILE)
+
+# Observability: stop-triggered exits this process lifetime. Every safety net
+# gets a counter so we can tell whether it's still earning its keep.
+_stop_exits = 0
+
+
+def _load_stops() -> dict:
+    """Read persisted stop records. Returns {} on any problem (missing file,
+    malformed JSON) so a corrupt/absent file degrades to 'no stored stops'
+    (bootstrap re-arms held positions) rather than crashing the cycle."""
+    try:
+        with open(_STOPS_PATH) as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except FileNotFoundError:
+        return {}
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.warning("Stop file unreadable (%s) — treating as empty.", exc)
+        return {}
+
+
+def _save_stops(stops: dict) -> None:
+    """Atomically persist stop records (temp file + os.replace) so a crash
+    mid-write can never leave a half-written, unparseable file."""
+    tmp = f"{_STOPS_PATH}.tmp"
+    try:
+        os.makedirs(os.path.dirname(_STOPS_PATH), exist_ok=True)
+        with open(tmp, "w") as f:
+            json.dump(stops, f, indent=2, sort_keys=True)
+        os.replace(tmp, _STOPS_PATH)
+    except OSError as exc:
+        logger.error("Could not write stop file %s: %s", _STOPS_PATH, exc)
+
+
+def _live_price(symbol: str) -> Optional[float]:
+    """Latest trade price from a live quote, or None if unavailable. Callers fall
+    back to the daily-bar close so a quote blip degrades the stop rather than
+    disabling it."""
+    q = tc.get_quote(symbol)
+    if q:
+        last = q.get("last") or q.get("bid")
+        if last:
+            try:
+                return float(last)
+            except (TypeError, ValueError):
+                return None
+    return None
+
+
+def _cost_basis(positions: list[dict], symbol: str) -> Optional[float]:
+    for p in positions:
+        if p.get("symbol") == symbol:
+            return p.get("cost_basis")
+    return None
+
+
+def _bootstrap_stop(symbol: str, held: int, sig: dict, positions: list[dict],
+                    price: float) -> Optional[dict]:
+    """Build a stop record for a pre-existing position we're adopting (no prior
+    record). Entry is estimated from cost_basis/qty; ATR is computed now; the
+    high-water seed is max(entry, current) so the stop is as tight as possible
+    without an immediate exit. Returns None if ATR is unavailable."""
+    atr = sig.get("atr")
+    if atr is None or atr <= 0:
+        logger.warning("STOP BOOTSTRAP %s skipped: ATR unavailable", symbol)
+        return None
+    basis = _cost_basis(positions, symbol)
+    entry = (basis / held) if (basis and held) else price
+    high_water = max(entry, price)
+    stop = high_water - config.STOP_LOSS_ATR_MULT * atr
+    logger.info("STOP BOOTSTRAP %s entry≈%.2f atr=%.2f stop=%.2f "
+                "(adopted pre-existing position)", symbol, entry, atr, stop)
+    return {
+        "entry_price":  round(entry, 4),
+        "atr_at_entry": round(atr, 4),
+        "high_water":   round(high_water, 4),
+        "stop_price":   round(stop, 4),
+        "opened":       date.today().isoformat(),
+        "bootstrapped": True,
+    }
+
+
+def _arm_stop_on_entry(symbol: str, entry_price: float, atr: Optional[float]) -> None:
+    """Create a fresh stop record after a BUY fills. No-op with a warning if ATR
+    is unavailable (equities always carry high/low, so this should never fire)."""
+    if atr is None or atr <= 0:
+        logger.warning("Could not arm stop for %s: ATR unavailable — position is "
+                       "UNPROTECTED until bootstrap re-arms it.", symbol)
+        return
+    stop = entry_price - config.STOP_LOSS_ATR_MULT * atr
+    stops = _load_stops()
+    stops[symbol] = {
+        "entry_price":  round(entry_price, 4),
+        "atr_at_entry": round(atr, 4),
+        "high_water":   round(entry_price, 4),
+        "stop_price":   round(stop, 4),
+        "opened":       date.today().isoformat(),
+        "bootstrapped": False,
+    }
+    _save_stops(stops)
+    logger.info("STOP ARMED %s entry=%.2f atr=%.2f stop=%.2f",
+                symbol, entry_price, atr, stop)
+
+
+def _clear_stop(symbol: str) -> None:
+    """Drop a symbol's stop record (called when we exit the position)."""
+    stops = _load_stops()
+    if symbol in stops:
+        del stops[symbol]
+        _save_stops(stops)
+
+
+def reconcile_stops(positions: list[dict]) -> None:
+    """Prune stop records for symbols we no longer hold. Called once per cycle.
+
+    Guarded on an empty positions list: get_positions() returns [] on API error,
+    and pruning against that would wipe every stop, then re-bootstrap next cycle
+    with a reset high-water — silently loosening ratcheted stops. Skipping prune
+    on empty leaves stale records inert for a cycle (harmless)."""
+    if not positions:
+        return
+    held = {p.get("symbol") for p in positions
+            if int(p.get("quantity", 0)) != 0 and p.get("symbol")}
+    stops = _load_stops()
+    stale = [s for s in stops if s not in held]
+    for s in stale:
+        del stops[s]
+        logger.info("STOP PRUNE %s: no longer held — dropping stop record", s)
+    if stale:
+        _save_stops(stops)
+
+
+def _check_and_trail_stop(symbol: str, held: int, sig: dict,
+                          account_id: str, positions: list[dict]) -> bool:
+    """Update the trailing stop for a held position and exit if breached.
+
+    Returns True iff a stop-exit order was placed (caller then returns, skipping
+    signal logic for the cycle). False = no exit; continue to EMA-cross logic."""
+    global _stop_exits
+
+    price = _live_price(symbol)
+    if price is None:
+        price = sig["close"]          # daily-bar fallback — degraded, not disabled
+
+    stops = _load_stops()
+    rec = stops.get(symbol)
+    if rec is None:
+        rec = _bootstrap_stop(symbol, held, sig, positions, price)
+        if rec is None:
+            return False              # no ATR → can't arm a stop this cycle
+    stops[symbol] = rec               # ensure present (bootstrap path)
+
+    # Ratchet: high-water and stop only ever rise — never lower the stop.
+    rec["high_water"] = round(max(rec["high_water"], price), 4)
+    new_stop = rec["high_water"] - config.STOP_LOSS_ATR_MULT * rec["atr_at_entry"]
+    rec["stop_price"] = round(max(rec["stop_price"], new_stop), 4)
+
+    if price <= rec["stop_price"]:
+        logger.warning("STOP-LOSS EXIT %s x%d @ %.2f (stop=%.2f entry=%.2f "
+                       "high_water=%.2f) — exit #%d",
+                       symbol, held, price, rec["stop_price"],
+                       rec["entry_price"], rec["high_water"], _stop_exits + 1)
+        result = tc.place_equity_order(account_id, symbol, "sell", held)
+        if result:
+            _stop_exits += 1
+            stops.pop(symbol, None)
+            _save_stops(stops)
+            _mark_signaled(symbol)    # block a same-day re-buy on the next cross
+            order_id = result.get("order", {}).get("id")
+            log_trade("SELL", symbol, held, price, "market", order_id,
+                      f"trailing stop hit @ {rec['stop_price']:.2f}")
+            return True
+        logger.error("STOP-LOSS EXIT %s: sell order failed — retrying next cycle",
+                     symbol)
+
+    _save_stops(stops)                # persist ratcheted high-water/stop progress
+    return False
+
+
 # ── Stock Strategy ────────────────────────────────────────────────────────────
 
 def evaluate_stock(symbol: str, account_id: str, positions: list[dict],
@@ -102,6 +291,12 @@ def evaluate_stock(symbol: str, account_id: str, positions: list[dict],
         sig["rsi"], held,
     )
 
+    # Trailing stop: checked BEFORE the daily-signal gate and the EMA logic, so a
+    # position bought today can still stop out the same day.
+    if held > 0 and config.USE_TRAILING_STOP:
+        if _check_and_trail_stop(symbol, held, sig, account_id, positions):
+            return                      # stop fired — exited, skip signal logic
+
     if _already_signaled_today(symbol):
         return
 
@@ -127,6 +322,7 @@ def evaluate_stock(symbol: str, account_id: str, positions: list[dict],
             order_id = result.get("order", {}).get("id")
             log_trade("BUY", symbol, qty, price, "market", order_id,
                       f"EMA cross up, RSI={sig['rsi']:.1f}")
+            _arm_stop_on_entry(symbol, price, sig.get("atr"))
 
     # SELL signal
     elif sig["bearish_cross"] and sig["rsi"] > config.RSI_OVERSOLD and held > 0:
@@ -137,6 +333,7 @@ def evaluate_stock(symbol: str, account_id: str, positions: list[dict],
             order_id = result.get("order", {}).get("id")
             log_trade("SELL", symbol, held, price, "market", order_id,
                       f"EMA cross down, RSI={sig['rsi']:.1f}")
+            _clear_stop(symbol)
 
 
 # ── Options Strategy ──────────────────────────────────────────────────────────

@@ -82,6 +82,16 @@ MAX_POSITIONS        = 20     # skip new stock entries once this many positions 
                               # open (0.05 × 20 = 100% fully deployed)
 OPTIONS_CONTRACTS    = 1      # contracts per options trade
 
+# ── Stop Loss (bot-managed trailing stop) ─────────────────────────────────────
+# Bot-managed (not broker-native) ATR trailing stop, checked every cycle in
+# strategy.evaluate_stock BEFORE the EMA-cross signal. Paper-trading choice for
+# now; switch to a broker Sell Stop order when we go live. See stop_prices.json
+# for the persisted per-position state (entry, ATR-at-entry, ratcheting stop).
+USE_TRAILING_STOP    = True   # master switch; False = no stop checks at all
+STOP_LOSS_ATR_MULT   = 2.5    # stop sits this many ATRs below the high-water mark
+STOP_LOSS_ATR_PERIOD = 14     # ATR lookback (Wilder), computed once at entry
+STOP_PRICE_FILE      = "data/stop_prices.json"   # generated (gitignored)
+
 # ── Momentum Rotation (dynamic watchlist slot) ────────────────────────────────
 # Twice a month (1st & 15th, pre-market) momentum_screen.py screens the S&P 500
 # for momentum leaders and writes MOMENTUM_WATCHLIST_FILE; the bot folds up to

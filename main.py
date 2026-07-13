@@ -103,6 +103,12 @@ def _run_cycle(account_id: str) -> None:
                 logger.error("Error evaluating future %s: %s", root, exc)
         return
 
+    # Prune trailing-stop records for positions we no longer hold (once per cycle,
+    # before per-symbol evaluation). Equities-only — the futures process shares
+    # this stop file, and pruning against futures positions would wipe every
+    # equity stop. Guarded internally against an empty/failed positions fetch too.
+    strategy.reconcile_stops(positions)
+
     for symbol in watchlist.effective_stock_watchlist(positions):
         try:
             strategy.evaluate_stock(symbol, account_id, positions, equity)
