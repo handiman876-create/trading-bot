@@ -109,10 +109,26 @@ def test_core_symbol_no_alignment():
 
 
 def test_rsi_too_high_blocks_alignment():
-    _reset(); _set_sig(rsi=65.0)                         # >= MOMENTUM_ALIGN_RSI_MAX (60)
+    _reset(); _set_sig(rsi=70.0)                         # > MOMENTUM_ALIGN_RSI_MAX (65)
     strategy.evaluate_stock("DAL", "ACCT", [], 100000.0,
                             is_momentum=True, momentum_generation="G1")
-    assert _buys() == [], "RSI >= 60 blocks the alignment entry"
+    assert _buys() == [], "RSI above the ceiling (65) blocks the alignment entry"
+
+
+def test_rsi_too_low_blocks_alignment():
+    _reset(); _set_sig(rsi=35.1)                         # < MOMENTUM_ALIGN_RSI_MIN (45), e.g. HCA
+    strategy.evaluate_stock("DAL", "ACCT", [], 100000.0,
+                            is_momentum=True, momentum_generation="G1")
+    assert _buys() == [], "RSI below the floor (45) blocks the alignment entry (breakdown)"
+
+
+def test_rsi_band_edges_allow_alignment():
+    """Both inclusive bounds (45 and 65) permit the alignment entry."""
+    for edge in (45.0, 65.0):
+        _reset(); _set_sig(rsi=edge)
+        strategy.evaluate_stock("DAL", "ACCT", [], 100000.0,
+                                is_momentum=True, momentum_generation="G1")
+        assert _buys() == [("DAL", "buy", 50)], f"RSI {edge} (inclusive edge) should enter"
 
 
 def test_held_blocks_alignment():

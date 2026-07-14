@@ -99,7 +99,11 @@ STOP_PRICE_FILE      = "data/stop_prices.json"   # generated (gitignored)
 # the patient fresh-cross entry. One entry per symbol per rotation, latched in
 # MOMENTUM_ENTRY_FILE so a stop-out can't trigger an immediate re-buy.
 USE_MOMENTUM_ALIGNMENT = True    # master switch; False = fresh-cross only, all names
-MOMENTUM_ALIGN_RSI_MAX = 60      # alignment entry only when RSI is below this
+# Momentum alignment only when RSI shows healthy momentum (not oversold, not
+# overbought): buy trending names on a healthy pullback, not on a breakdown
+# (RSI < MIN, e.g. HCA @ 35.1) or when already extended (RSI > MAX).
+MOMENTUM_ALIGN_RSI_MIN = 45      # skip alignment entry when RSI is below this (weakness/breakdown)
+MOMENTUM_ALIGN_RSI_MAX = 65      # skip alignment entry when RSI is above this (overbought); was 60
 MOMENTUM_ENTRY_FILE    = "data/momentum_entries.json"   # generated (gitignored)
 
 # ── Momentum Rotation (dynamic watchlist slot) ────────────────────────────────

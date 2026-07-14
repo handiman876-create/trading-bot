@@ -393,7 +393,7 @@ def evaluate_stock(symbol: str, account_id: str, positions: list[dict],
     # MAX_POSITIONS block leaves the shot available to retry when a slot frees.
     elif (is_momentum and held == 0 and config.USE_MOMENTUM_ALIGNMENT
           and sig["ema_short"] > sig["ema_long"]
-          and sig["rsi"] < config.MOMENTUM_ALIGN_RSI_MAX
+          and config.MOMENTUM_ALIGN_RSI_MIN <= sig["rsi"] <= config.MOMENTUM_ALIGN_RSI_MAX
           and not _momentum_entry_taken(symbol, momentum_generation)):
         if _enter_long(symbol, sig, price, account_id, positions, equity,
                        reason=f"momentum alignment entry, RSI={sig['rsi']:.1f}"):
