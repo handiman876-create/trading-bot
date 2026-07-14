@@ -38,6 +38,12 @@ import polygon_client as pc
 
 logger = logging.getLogger("momentum_screen")
 
+# Observability: how many candidates the sector filter removed on the last screen()
+# run, and how many had no sector data (fail-open — counted, not excluded). Every
+# filter carries a counter so we can tell whether it's still earning its keep.
+_sector_skips = 0
+_sector_unknown = 0
+
 # Enough trading days to cover the 20-day return window (needs LOOKBACK+1 closes)
 # plus RSI(14) warm-up. ~35 trading days is comfortable headroom.
 _TRADING_DAYS_NEEDED = config.MOM_LOOKBACK + 15
@@ -54,6 +60,23 @@ def _load_universe() -> list[str]:
     if not syms:
         raise ValueError(f"{path} contains no symbols")
     return syms
+
+
+def _load_sectors() -> dict:
+    """Return the per-symbol GICS map {symbol: {"sector","sub_industry"}} from the
+    universe file, or {} if the file predates sector enrichment. Missing data
+    fails OPEN (nothing excluded) rather than dropping the whole screen, so an old
+    sp500.json degrades to the pre-filter behaviour with a warning."""
+    try:
+        with open(config.MOMENTUM_UNIVERSE_FILE) as f:
+            sectors = json.load(f).get("sectors", {})
+    except (OSError, json.JSONDecodeError):
+        sectors = {}
+    if not sectors:
+        logger.warning("No 'sectors' map in %s — sector filter is a no-op. "
+                       "Run refresh_sp500.py to enrich it.",
+                       config.MOMENTUM_UNIVERSE_FILE)
+    return sectors if isinstance(sectors, dict) else {}
 
 
 def _normalize_symbol(sym: str) -> str:
@@ -124,10 +147,32 @@ def evaluate_symbol(symbol: str, closes: list[float], volumes: list[float]) -> d
     return None
 
 
+def _excluded_set() -> set[str]:
+    """config.EXCLUDED_SECTORS as a casefolded set for case-insensitive matching."""
+    return {s.casefold() for s in getattr(config, "EXCLUDED_SECTORS", [])}
+
+
+def _is_excluded_sector(info: dict | None, excluded: set[str]) -> bool:
+    """True if a symbol's GICS classification lands in an excluded bucket. Matches
+    the excluded names against BOTH the sector and sub-industry fields (a sector
+    name and a sub-industry name never collide). Pure — no I/O — so the tests
+    exercise it directly. Missing info (symbol absent from the map) fails OPEN:
+    returns False so a data gap can't silently drop a candidate."""
+    if not info:
+        return False
+    fields = (info.get("sector", ""), info.get("sub_industry", ""))
+    return any(f.casefold() in excluded for f in fields if f)
+
+
 def screen() -> list[dict]:
     """Run the screen. Returns ranked survivors (excluding core) as dicts with
     symbol/return_20d/rsi/rel_volume, best return first."""
+    global _sector_skips, _sector_unknown
+    _sector_skips = _sector_unknown = 0
+
     universe = _load_universe()
+    sectors = _load_sectors()
+    excluded = _excluded_set()
     core = {s.upper() for s in config.CORE_WATCHLIST}
     logger.info("Universe: %d symbols; collecting grouped-daily bars...", len(universe))
 
@@ -141,11 +186,26 @@ def screen() -> list[dict]:
         sym = _normalize_symbol(raw)
         if sym in core:
             continue
+        # Sector filter — skip excluded GICS sectors/sub-industries (config.
+        # EXCLUDED_SECTORS). Keyed by the raw sp500.json symbol form (the sectors
+        # map uses the same form). Fails open on missing data.
+        info = sectors.get(raw)
+        if excluded:
+            if info is None:
+                _sector_unknown += 1
+            elif _is_excluded_sector(info, excluded):
+                _sector_skips += 1
+                logger.info("SECTOR SKIP %-6s — %s / %s", sym,
+                            info.get("sector"), info.get("sub_industry"))
+                continue
         closes, volumes = _series_for(raw, dates_asc, by_date)
         row = evaluate_symbol(sym, closes, volumes)
         if row:
             survivors.append(row)
 
+    if excluded:
+        logger.info("Sector filter: %d skipped, %d had no sector data (kept)",
+                    _sector_skips, _sector_unknown)
     survivors.sort(key=lambda r: r["return_20d"], reverse=True)
     logger.info("%d symbols passed all criteria", len(survivors))
     return survivors[: config.MOMENTUM_SLOT_SIZE]
@@ -161,6 +221,7 @@ def _atomic_write(picks: list[dict], universe_size: int) -> None:
             "return_min":    config.MOM_RETURN_MIN,
             "rsi_range":     [config.MOM_RSI_MIN, config.MOM_RSI_MAX],
             "volume":        "latest > trailing 20-day average",
+            "excluded_sectors": config.EXCLUDED_SECTORS,
         },
         "slot_size":     config.MOMENTUM_SLOT_SIZE,
         "universe_size": universe_size,

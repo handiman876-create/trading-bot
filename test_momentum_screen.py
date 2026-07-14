@@ -107,6 +107,47 @@ def test_screen_excludes_core_ranks_and_truncates(monkeypatch):
     assert rets == sorted(rets, reverse=True)            # ranked best-first
 
 
+# ── sector exclusions: pure helper ────────────────────────────────────────────
+
+def test_is_excluded_sector():
+    excl = ms._excluded_set()   # from config.EXCLUDED_SECTORS
+    # excluded by sub-industry (airlines) and by whole sector (energy/util/REIT)
+    assert ms._is_excluded_sector({"sector": "Industrials",
+                                   "sub_industry": "Passenger Airlines"}, excl)
+    assert ms._is_excluded_sector({"sector": "Energy",
+                                   "sub_industry": "Integrated Oil & Gas"}, excl)
+    assert ms._is_excluded_sector({"sector": "Utilities",
+                                   "sub_industry": "Electric Utilities"}, excl)
+    assert ms._is_excluded_sector({"sector": "Real Estate",
+                                   "sub_industry": "Telecom Tower REITs"}, excl)
+    # not excluded — a normal momentum name
+    assert not ms._is_excluded_sector(
+        {"sector": "Information Technology",
+         "sub_industry": "Technology Hardware, Storage & Peripherals"}, excl)
+    # fail-open: no sector data -> never excluded
+    assert not ms._is_excluded_sector(None, excl)
+    assert not ms._is_excluded_sector({}, excl)
+
+
+def test_screen_applies_sector_filter(monkeypatch):
+    # Two would-be winners: DAL (airline -> excluded) and WINNER (kept).
+    series = {"DAL": _climb(1.013, 0.985), "WINNER": _climb(1.012, 0.986)}
+    n = len(next(iter(series.values())))
+    vols = {s: _vols(n) for s in series}
+    sectors = {
+        "DAL":    {"sector": "Industrials", "sub_industry": "Passenger Airlines"},
+        "WINNER": {"sector": "Information Technology", "sub_industry": "Systems Software"},
+    }
+    monkeypatch.setattr(ms, "_load_universe", lambda: list(series.keys()))
+    monkeypatch.setattr(ms, "_load_sectors", lambda: sectors)
+    monkeypatch.setattr(ms, "_collect_grouped_daily", lambda: _build_by_date(series, vols))
+
+    syms = [p["symbol"] for p in ms.screen()]
+    assert "DAL" not in syms          # airline filtered out
+    assert "WINNER" in syms           # non-excluded winner survives
+    assert ms._sector_skips == 1      # counter observed the skip
+
+
 # ── watchlist: effective list assembly ────────────────────────────────────────
 
 def test_effective_watchlist_union_dedup_order(monkeypatch):

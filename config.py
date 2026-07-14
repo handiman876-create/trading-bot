@@ -122,6 +122,22 @@ MOM_RETURN_MIN = 0.05    # 20-day price return must exceed +5%
 MOM_RSI_MIN    = 50      # RSI(14) lower bound (uptrend, not yet overbought)
 MOM_RSI_MAX    = 70      # RSI(14) upper bound
 
+# ── Sector exclusions (momentum screen) ───────────────────────────────────────
+# Names matched against BOTH the GICS Sector and GICS Sub-Industry fields stored
+# per symbol in data/sp500.json (a candidate is skipped if EITHER field matches).
+# A sector name and a sub-industry name never collide, so a flat list is safe.
+# "Energy" (sector) == the two GICS oil/gas industries "Oil, Gas & Consumable
+# Fuels" + "Energy Equipment & Services" — every S&P Energy name falls under one
+# of them, and the source CSV carries no Industry column, so the sector is the
+# exact, data-backed equivalent. Airlines are a sub-industry of Industrials, so
+# they're excluded by sub-industry name rather than by whole sector.
+EXCLUDED_SECTORS = [
+    "Energy",             # Oil, Gas & Consumable Fuels + Energy Equipment & Services
+    "Utilities",          # entire sector
+    "Real Estate",        # entire sector (REITs)
+    "Passenger Airlines", # airlines — GICS sub-industry of Industrials
+]
+
 # ── Polygon.io (momentum-screen data source; free tier) ───────────────────────
 POLYGON_API_KEY  = os.environ.get("POLYGON_API_KEY", "")
 POLYGON_BASE_URL = "https://api.polygon.io"
