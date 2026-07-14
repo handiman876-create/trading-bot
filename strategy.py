@@ -2,8 +2,11 @@
 Signal generation and order execution for stocks and options.
 
 Stock signals  — EMA crossover + RSI confirmation:
-  BUY  when short EMA crosses above long EMA  AND  RSI < overbought
-  SELL when short EMA crosses below long EMA  AND  RSI > oversold
+  BUY         when short EMA crosses above long EMA  AND  RSI < overbought
+  SELL        when short EMA crosses below long EMA  AND  RSI > oversold (long held)
+  SELL SHORT  on a death cross (core names only, ENABLE_SHORTING) when flat —
+              sized like a long, stop ABOVE entry ratcheting DOWN
+  BUY TO COVER on a bullish cross while short (RSI < overbought)
 
 Options signals — same crossover applied to the underlying:
   BUY_TO_OPEN  call when bullish cross + RSI < overbought
@@ -90,6 +93,8 @@ _MOM_ENTRIES_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 # net gets a counter so we can tell whether it's still earning its keep.
 _stop_exits = 0
 _momentum_align_entries = 0
+_short_entries = 0
+_short_covers = 0
 
 
 def _load_json(path: str) -> dict:
@@ -153,49 +158,68 @@ def _cost_basis(positions: list[dict], symbol: str) -> Optional[float]:
 def _bootstrap_stop(symbol: str, held: int, sig: dict, positions: list[dict],
                     price: float) -> Optional[dict]:
     """Build a stop record for a pre-existing position we're adopting (no prior
-    record). Entry is estimated from cost_basis/qty; ATR is computed now; the
-    high-water seed is max(entry, current) so the stop is as tight as possible
-    without an immediate exit. Returns None if ATR is unavailable."""
+    record). Direction is inferred from the sign of `held` (negative = short).
+    Entry is estimated from cost_basis/|qty|; ATR is computed now; the water-mark
+    seed is chosen so the stop is as tight as possible without an immediate exit
+    (max(entry, price) for longs, min(entry, price) for shorts). Returns None if
+    ATR is unavailable."""
     atr = sig.get("atr")
     if atr is None or atr <= 0:
         logger.warning("STOP BOOTSTRAP %s skipped: ATR unavailable", symbol)
         return None
     basis = _cost_basis(positions, symbol)
-    entry = (basis / held) if (basis and held) else price
-    high_water = max(entry, price)
-    stop = high_water - config.STOP_LOSS_ATR_MULT * atr
-    logger.info("STOP BOOTSTRAP %s entry≈%.2f atr=%.2f stop=%.2f "
-                "(adopted pre-existing position)", symbol, entry, atr, stop)
-    return {
+    entry = (basis / abs(held)) if (basis and held) else price
+    rec = {
         "entry_price":  round(entry, 4),
         "atr_at_entry": round(atr, 4),
-        "high_water":   round(high_water, 4),
-        "stop_price":   round(stop, 4),
         "opened":       date.today().isoformat(),
         "bootstrapped": True,
     }
+    if held < 0:                                   # short
+        low_water = min(entry, price)
+        stop = low_water + config.STOP_LOSS_ATR_MULT * atr
+        rec.update({"direction": "short", "low_water": round(low_water, 4),
+                    "stop_price": round(stop, 4)})
+    else:                                          # long
+        high_water = max(entry, price)
+        stop = high_water - config.STOP_LOSS_ATR_MULT * atr
+        rec.update({"direction": "long", "high_water": round(high_water, 4),
+                    "stop_price": round(stop, 4)})
+    logger.info("STOP BOOTSTRAP %s %s entry≈%.2f atr=%.2f stop=%.2f "
+                "(adopted pre-existing position)",
+                symbol, rec["direction"], entry, atr, stop)
+    return rec
 
 
-def _arm_stop_on_entry(symbol: str, entry_price: float, atr: Optional[float]) -> None:
-    """Create a fresh stop record after a BUY fills. No-op with a warning if ATR
-    is unavailable (equities always carry high/low, so this should never fire)."""
+def _arm_stop_on_entry(symbol: str, entry_price: float, atr: Optional[float],
+                       direction: str = "long") -> None:
+    """Create a fresh stop record after a BUY (long) or SELLSHORT (short) fills.
+    A short's stop sits ABOVE entry (entry + MULT*atr) and will ratchet DOWN; a
+    long's sits below and ratchets up. No-op with a warning if ATR is unavailable
+    (equities always carry high/low, so this should never fire)."""
     if atr is None or atr <= 0:
         logger.warning("Could not arm stop for %s: ATR unavailable — position is "
                        "UNPROTECTED until bootstrap re-arms it.", symbol)
         return
-    stop = entry_price - config.STOP_LOSS_ATR_MULT * atr
-    stops = _load_stops()
-    stops[symbol] = {
+    rec = {
         "entry_price":  round(entry_price, 4),
         "atr_at_entry": round(atr, 4),
-        "high_water":   round(entry_price, 4),
-        "stop_price":   round(stop, 4),
         "opened":       date.today().isoformat(),
         "bootstrapped": False,
+        "direction":    direction,
     }
+    if direction == "short":
+        stop = entry_price + config.STOP_LOSS_ATR_MULT * atr
+        rec["low_water"] = round(entry_price, 4)
+    else:
+        stop = entry_price - config.STOP_LOSS_ATR_MULT * atr
+        rec["high_water"] = round(entry_price, 4)
+    rec["stop_price"] = round(stop, 4)
+    stops = _load_stops()
+    stops[symbol] = rec
     _save_stops(stops)
-    logger.info("STOP ARMED %s entry=%.2f atr=%.2f stop=%.2f",
-                symbol, entry_price, atr, stop)
+    logger.info("STOP ARMED %s %s entry=%.2f atr=%.2f stop=%.2f",
+                symbol, direction, entry_price, atr, stop)
 
 
 def _clear_stop(symbol: str) -> None:
@@ -246,30 +270,47 @@ def _check_and_trail_stop(symbol: str, held: int, sig: dict,
             return False              # no ATR → can't arm a stop this cycle
     stops[symbol] = rec               # ensure present (bootstrap path)
 
-    # Ratchet: high-water and stop only ever rise — never lower the stop.
-    rec["high_water"] = round(max(rec["high_water"], price), 4)
-    new_stop = rec["high_water"] - config.STOP_LOSS_ATR_MULT * rec["atr_at_entry"]
-    rec["stop_price"] = round(max(rec["stop_price"], new_stop), 4)
+    direction = rec.get("direction", "long")   # legacy records (no key) are longs
+    mult_atr = config.STOP_LOSS_ATR_MULT * rec["atr_at_entry"]
 
-    if price <= rec["stop_price"]:
-        logger.warning("STOP-LOSS EXIT %s x%d @ %.2f (stop=%.2f entry=%.2f "
-                       "high_water=%.2f) — exit #%d",
-                       symbol, held, price, rec["stop_price"],
-                       rec["entry_price"], rec["high_water"], _stop_exits + 1)
-        result = tc.place_equity_order(account_id, symbol, "sell", held)
+    if direction == "short":
+        # Ratchet DOWN: low-water and stop only ever fall — never raise the stop.
+        rec["low_water"] = round(min(rec["low_water"], price), 4)
+        new_stop = rec["low_water"] + mult_atr
+        rec["stop_price"] = round(min(rec["stop_price"], new_stop), 4)
+        water = rec["low_water"]
+        breached = price >= rec["stop_price"]     # price rose into the stop
+        exit_side, exit_qty = "buy_to_cover", abs(held)
+        exit_action = "BUY_TO_COVER"
+    else:
+        # Ratchet UP: high-water and stop only ever rise — never lower the stop.
+        rec["high_water"] = round(max(rec["high_water"], price), 4)
+        new_stop = rec["high_water"] - mult_atr
+        rec["stop_price"] = round(max(rec["stop_price"], new_stop), 4)
+        water = rec["high_water"]
+        breached = price <= rec["stop_price"]     # price fell into the stop
+        exit_side, exit_qty = "sell", held
+        exit_action = "SELL"
+
+    if breached:
+        logger.warning("STOP-LOSS EXIT %s %s x%d @ %.2f (stop=%.2f entry=%.2f "
+                       "water=%.2f) — exit #%d",
+                       symbol, direction, exit_qty, price, rec["stop_price"],
+                       rec["entry_price"], water, _stop_exits + 1)
+        result = tc.place_equity_order(account_id, symbol, exit_side, exit_qty)
         if result:
             _stop_exits += 1
             stops.pop(symbol, None)
             _save_stops(stops)
-            _mark_signaled(symbol)    # block a same-day re-buy on the next cross
+            _mark_signaled(symbol)    # block a same-day re-entry on the next cross
             order_id = result.get("order", {}).get("id")
-            log_trade("SELL", symbol, held, price, "market", order_id,
+            log_trade(exit_action, symbol, exit_qty, price, "market", order_id,
                       f"trailing stop hit @ {rec['stop_price']:.2f}")
             return True
-        logger.error("STOP-LOSS EXIT %s: sell order failed — retrying next cycle",
-                     symbol)
+        logger.error("STOP-LOSS EXIT %s: %s order failed — retrying next cycle",
+                     symbol, exit_side)
 
-    _save_stops(stops)                # persist ratcheted high-water/stop progress
+    _save_stops(stops)                # persist ratcheted water/stop progress
     return False
 
 
@@ -341,10 +382,41 @@ def _enter_long(symbol: str, sig: dict, price: float, account_id: str,
         return True
     return False
 
+
+def _enter_short(symbol: str, sig: dict, price: float, account_id: str,
+                 positions: list[dict], equity: Optional[float], reason: str) -> bool:
+    """Short-entry path (core names only, fresh death cross): enforce MAX_POSITIONS,
+    size like a long at EQUITY_PER_TRADE_PCT, place a SELLSHORT, and on a filled
+    order mark the symbol signaled, log the trade, and arm the ABOVE-entry trailing
+    stop. Mirrors _enter_long. Returns True iff an order was placed and accepted."""
+    open_count = _open_position_count(positions)
+    if open_count >= config.MAX_POSITIONS:
+        logger.info("Skip SHORT %s: %d/%d positions open (max reached)",
+                    symbol, open_count, config.MAX_POSITIONS)
+        return False
+    qty = _shares_to_buy(price, equity)          # same sizing as a long
+    if qty < 1:
+        logger.warning("Skip SHORT %s: could not size order (equity=%s price=%.2f)",
+                       symbol, equity, price)
+        return False
+    logger.info("SIGNAL SELL_SHORT %s x%d (~$%.0f, %.0f%% of $%.0f equity, %d/%d open) — %s",
+                symbol, qty, qty * price,
+                config.EQUITY_PER_TRADE_PCT * 100, equity or 0.0,
+                open_count, config.MAX_POSITIONS, reason)
+    result = tc.place_equity_order(account_id, symbol, "sell_short", qty)
+    if result:
+        _mark_signaled(symbol)
+        order_id = result.get("order", {}).get("id")
+        log_trade("SELL_SHORT", symbol, qty, price, "market", order_id, reason)
+        _arm_stop_on_entry(symbol, price, sig.get("atr"), direction="short")
+        return True
+    return False
+
+
 def evaluate_stock(symbol: str, account_id: str, positions: list[dict],
                    equity: Optional[float],
                    is_momentum: bool = False, momentum_generation: str = "") -> None:
-    global _momentum_align_entries
+    global _momentum_align_entries, _short_entries, _short_covers
 
     history = tc.get_historical(symbol, days=90)
     if not history:
@@ -373,8 +445,9 @@ def evaluate_stock(symbol: str, account_id: str, positions: list[dict],
     )
 
     # Trailing stop: checked BEFORE the daily-signal gate and the EMA logic, so a
-    # position bought today can still stop out the same day.
-    if held > 0 and config.USE_TRAILING_STOP:
+    # position opened today can still stop out the same day. held != 0 covers both
+    # longs (stop below) and shorts (stop above).
+    if held != 0 and config.USE_TRAILING_STOP:
         if _check_and_trail_stop(symbol, held, sig, account_id, positions):
             return                      # stop fired — exited, skip signal logic
 
@@ -402,7 +475,7 @@ def evaluate_stock(symbol: str, account_id: str, positions: list[dict],
             logger.info("MOMENTUM ALIGNMENT ENTRY %s (gen=%s) — align entries #%d",
                         symbol, momentum_generation or "<none>", _momentum_align_entries)
 
-    # SELL signal
+    # SELL signal — close a long
     elif sig["bearish_cross"] and sig["rsi"] > config.RSI_OVERSOLD and held > 0:
         logger.info("SIGNAL SELL %s x%d", symbol, held)
         result = tc.place_equity_order(account_id, symbol, "sell", held)
@@ -411,6 +484,28 @@ def evaluate_stock(symbol: str, account_id: str, positions: list[dict],
             order_id = result.get("order", {}).get("id")
             log_trade("SELL", symbol, held, price, "market", order_id,
                       f"EMA cross down, RSI={sig['rsi']:.1f}")
+            _clear_stop(symbol)
+
+    # SHORT signal — fresh death cross, CORE names only (momentum slot stays
+    # long-only). Mirrors the long BUY: same RSI gate, same held==0 requirement.
+    elif (sig["bearish_cross"] and sig["rsi"] > config.RSI_OVERSOLD and held == 0
+          and not is_momentum and config.ENABLE_SHORTING):
+        if _enter_short(symbol, sig, price, account_id, positions, equity,
+                        reason=f"EMA cross down (short), RSI={sig['rsi']:.1f}"):
+            _short_entries += 1
+            logger.info("SHORT ENTRY %s — short entries #%d", symbol, _short_entries)
+
+    # COVER signal — buy to close a short on a bullish cross (mirror of SELL).
+    elif sig["bullish_cross"] and sig["rsi"] < config.RSI_OVERBOUGHT and held < 0:
+        qty = abs(held)
+        logger.info("SIGNAL BUY_TO_COVER %s x%d", symbol, qty)
+        result = tc.place_equity_order(account_id, symbol, "buy_to_cover", qty)
+        if result:
+            _short_covers += 1
+            _mark_signaled(symbol)
+            order_id = result.get("order", {}).get("id")
+            log_trade("BUY_TO_COVER", symbol, qty, price, "market", order_id,
+                      f"EMA cross up (cover), RSI={sig['rsi']:.1f}")
             _clear_stop(symbol)
 
 

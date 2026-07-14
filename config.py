@@ -88,9 +88,24 @@ OPTIONS_CONTRACTS    = 1      # contracts per options trade
 # now; switch to a broker Sell Stop order when we go live. See stop_prices.json
 # for the persisted per-position state (entry, ATR-at-entry, ratcheting stop).
 USE_TRAILING_STOP    = True   # master switch; False = no stop checks at all
-STOP_LOSS_ATR_MULT   = 2.5    # stop sits this many ATRs below the high-water mark
+STOP_LOSS_ATR_MULT   = 2.5    # stop sits this many ATRs from the water-mark
 STOP_LOSS_ATR_PERIOD = 14     # ATR lookback (Wilder), computed once at entry
 STOP_PRICE_FILE      = "data/stop_prices.json"   # generated (gitignored)
+# stop_prices.json schema, per symbol:
+#   entry_price, atr_at_entry, stop_price, opened, bootstrapped, direction
+#   + "high_water" (longs: max price seen; stop = high_water - MULT*atr, rises)
+#   OR "low_water"  (shorts: min price seen; stop = low_water + MULT*atr, falls)
+# "direction" is "long" | "short"; records written before shorts existed have no
+# such key and are read as "long" (rec.get("direction", "long")) — fully back-compat.
+
+# ── Short selling (core watchlist only, fresh death-cross entries) ─────────────
+# When enabled, a fresh EMA death cross on a CORE name with no position opens a
+# SHORT (SELLSHORT), sized like a long (EQUITY_PER_TRADE_PCT) and counting toward
+# MAX_POSITIONS. The momentum slot stays long-only (it's screened for long
+# momentum; shorting volatile leaders is too risky for now). Shorts are covered
+# (BUYTOCOVER) on a bullish cross, and carry a trailing stop that sits ABOVE
+# entry and ratchets DOWN with a low-water mark, reusing STOP_LOSS_ATR_MULT.
+ENABLE_SHORTING = True   # master switch; False = long-only (prior behaviour)
 
 # ── Momentum alignment entry (momentum slot only) ─────────────────────────────
 # Momentum leaders are already trending when the twice-monthly screen adds them,

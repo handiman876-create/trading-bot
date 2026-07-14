@@ -26,13 +26,20 @@ def _buys():
     return [o for o in _orders if o[1] == "buy"]
 
 
+def _sides(side):
+    return [o for o in _orders if o[1] == side]
+
+
 def _reset():
     _orders.clear()
     strategy._stop_exits = 0
     strategy._momentum_align_entries = 0
+    strategy._short_entries = 0
+    strategy._short_covers = 0
     strategy._last_signal_date.clear()
     strategy.config.USE_MOMENTUM_ALIGNMENT = True
     strategy.config.USE_TRAILING_STOP = True
+    strategy.config.ENABLE_SHORTING = True
     strategy.tc.place_equity_order = _fake_place
     strategy.tc.get_historical = lambda *a, **k: [{"bar": 1}]     # truthy
     strategy.tc.get_quote = lambda s: {"last": 10_000.0}          # high -> no stop breach
@@ -163,6 +170,75 @@ def test_max_positions_blocks_alignment_latch_not_consumed():
                             is_momentum=True, momentum_generation="G1")
     assert _buys() == [("DAL", "buy", 50)], "retries and enters when slot frees"
     assert strategy._momentum_entry_taken("DAL", "G1"), "latch consumed after a real entry"
+
+
+# ── Short selling: entry / cover / guards ─────────────────────────────────────
+
+def test_short_enters_core_on_death_cross():
+    """Core name, fresh death cross, flat -> SELLSHORT, sized like a long, with a
+    trailing stop armed ABOVE entry."""
+    _reset(); _set_sig(bearish_cross=True, close=100.0)
+    strategy.evaluate_stock("AAPL", "ACCT", [], 100000.0,
+                            is_momentum=False, momentum_generation="")
+    assert _sides("sell_short") == [("AAPL", "sell_short", 50)], _orders
+    assert strategy._short_entries == 1, "short-entry counter incremented"
+    rec = strategy._load_stops()["AAPL"]
+    assert rec["direction"] == "short", rec
+    assert abs(rec["stop_price"] - 110.0) < 1e-6, rec        # 100 + 2.5*4, stop ABOVE
+    assert abs(rec["low_water"] - 100.0) < 1e-6, rec
+
+
+def test_momentum_name_does_not_short():
+    """The momentum slot is long-only: a death cross must NOT open a short."""
+    _reset(); _set_sig(bearish_cross=True)
+    strategy.evaluate_stock("DDOG", "ACCT", [], 100000.0,
+                            is_momentum=True, momentum_generation="G1")
+    assert _sides("sell_short") == [], "momentum names never short"
+
+
+def test_shorting_disabled_no_short():
+    _reset(); _set_sig(bearish_cross=True)
+    strategy.config.ENABLE_SHORTING = False
+    strategy.evaluate_stock("AAPL", "ACCT", [], 100000.0,
+                            is_momentum=False, momentum_generation="")
+    assert _sides("sell_short") == [], "ENABLE_SHORTING=False disables shorting"
+
+
+def test_short_respects_max_positions():
+    _reset(); _set_sig(bearish_cross=True)
+    full = [{"symbol": f"S{i}", "quantity": 1, "cost_basis": 100.0}
+            for i in range(strategy.config.MAX_POSITIONS)]
+    strategy.evaluate_stock("AAPL", "ACCT", full, 100000.0,
+                            is_momentum=False, momentum_generation="")
+    assert _sides("sell_short") == [], "max positions blocks a new short"
+
+
+def test_cover_on_bullish_cross():
+    """A held short is bought to cover on a bullish cross; the stop record clears.
+    Quote is below the ABOVE stop so the trailing stop does NOT fire first."""
+    _reset(); _set_sig(bullish_cross=True, close=100.0)
+    strategy.tc.get_quote = lambda s: {"last": 100.0}       # below short stop (110) -> no breach
+    strategy._arm_stop_on_entry("AAPL", 100.0, 4.0, direction="short")   # stop 110
+    positions = [{"symbol": "AAPL", "quantity": -50, "cost_basis": 5000.0}]
+    strategy.evaluate_stock("AAPL", "ACCT", positions, 100000.0,
+                            is_momentum=False, momentum_generation="")
+    assert _sides("buy_to_cover") == [("AAPL", "buy_to_cover", 50)], _orders
+    assert strategy._short_covers == 1, "cover counter incremented"
+    assert "AAPL" not in strategy._load_stops(), "stop cleared on cover"
+
+
+def test_short_stops_out_when_price_rises_into_stop():
+    """Trailing stop fires (buy_to_cover) BEFORE the signal when price rises into
+    the ABOVE stop — even on the same cycle."""
+    _reset(); _set_sig(bullish_cross=False, bearish_cross=False, close=115.0)
+    strategy.tc.get_quote = lambda s: {"last": 115.0}       # above short stop (110) -> breach
+    strategy._arm_stop_on_entry("AAPL", 100.0, 4.0, direction="short")   # stop 110
+    positions = [{"symbol": "AAPL", "quantity": -50, "cost_basis": 5000.0}]
+    strategy.evaluate_stock("AAPL", "ACCT", positions, 100000.0,
+                            is_momentum=False, momentum_generation="")
+    assert _sides("buy_to_cover") == [("AAPL", "buy_to_cover", 50)], _orders
+    assert strategy._stop_exits == 1, "short stop-out counted"
+    assert "AAPL" not in strategy._load_stops(), "record cleared after stop-out"
 
 
 # ── Reconcile ─────────────────────────────────────────────────────────────────

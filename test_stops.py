@@ -124,6 +124,62 @@ def test_failed_exit_order_keeps_record():
         _order_result = {"order": {"id": "T1"}}
 
 
+# ── Short direction ───────────────────────────────────────────────────────────
+
+def test_short_arms_above_and_ratchets_down_only():
+    """A short's stop sits ABOVE entry and only ever falls with a new low-water
+    mark — it must never rise back when price bounces."""
+    _reset(quote_price=90.0)          # entry 100, atr 4 -> stop 110; price drops to 90
+    strategy._arm_stop_on_entry("AAA", 100.0, 4.0, direction="short")
+    rec = strategy._load_stops()["AAA"]
+    assert abs(rec["stop_price"] - 110.0) < 1e-6, rec         # 100 + 2.5*4, ABOVE entry
+    assert rec["direction"] == "short", rec
+
+    strategy._check_and_trail_stop("AAA", -10, {"close": 90.0, "atr": 4.0}, "ACCT", [])
+    rec = strategy._load_stops()["AAA"]
+    assert abs(rec["low_water"] - 90.0) < 1e-6, rec
+    assert abs(rec["stop_price"] - 100.0) < 1e-6, rec         # 90 + 2.5*4, ratcheted DOWN
+    assert _orders == [], "price 90 below stop 100 -> no cover"
+
+    # Price bounces to 96 (still below stop 100): stop must NOT rise back up.
+    strategy.tc.get_quote = _fake_quote(96.0)
+    strategy._check_and_trail_stop("AAA", -10, {"close": 96.0, "atr": 4.0}, "ACCT", [])
+    rec = strategy._load_stops()["AAA"]
+    assert abs(rec["low_water"] - 90.0) < 1e-6, "low_water should not rise"
+    assert abs(rec["stop_price"] - 100.0) < 1e-6, "short stop should not rise"
+    assert _orders == [], "96 still below stop 100 -> no cover"
+
+
+def test_short_covers_when_price_rises_into_stop():
+    _reset(quote_price=112.0)          # price 112 >= stop 110 -> cover
+    strategy._save_stops({"AAA": {
+        "entry_price": 100.0, "atr_at_entry": 4.0, "low_water": 100.0,
+        "stop_price": 110.0, "opened": "2026-07-14", "bootstrapped": False,
+        "direction": "short"}})
+    exited = strategy._check_and_trail_stop(
+        "AAA", -10, {"close": 112.0, "atr": 4.0}, "ACCT", [])
+    assert exited is True, "should cover when price >= stop"
+    assert _orders == [("AAA", "buy_to_cover", 10)], _orders
+    assert "AAA" not in strategy._load_stops(), "record cleared after cover"
+    assert strategy._stop_exits == 1, "counter incremented"
+
+
+def test_short_bootstrap_from_negative_held():
+    """Adopting a pre-existing short (no record) infers direction from held<0 and
+    seeds the stop ABOVE entry."""
+    _reset(quote_price=95.0)
+    positions = [{"symbol": "AAA", "quantity": -10, "cost_basis": 1000.0}]  # entry 100
+    exited = strategy._check_and_trail_stop(
+        "AAA", -10, {"close": 95.0, "atr": 4.0}, "ACCT", positions)
+    assert exited is False, "95 below the ABOVE stop -> no cover on bootstrap"
+    rec = strategy._load_stops()["AAA"]
+    assert rec["direction"] == "short", rec
+    assert abs(rec["entry_price"] - 100.0) < 1e-6, rec        # 1000/|−10|
+    assert abs(rec["low_water"] - 95.0) < 1e-6, rec           # min(entry, price)
+    assert abs(rec["stop_price"] - 105.0) < 1e-6, rec         # 95 + 2.5*4
+    assert rec["bootstrapped"] is True, rec
+
+
 # ── Live-quote fallback ───────────────────────────────────────────────────────
 
 def test_daily_close_fallback_when_quote_fails():
