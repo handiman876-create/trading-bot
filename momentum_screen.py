@@ -164,6 +164,17 @@ def _is_excluded_sector(info: dict | None, excluded: set[str]) -> bool:
     return any(f.casefold() in excluded for f in fields if f)
 
 
+def count_excluded_universe() -> tuple[int, int]:
+    """(excluded, total) — how many universe names the sector filter removes.
+    Pure file read (no Polygon), for the bot's startup banner. Core names aren't
+    in any excluded sector, so leaving them in doesn't change the count."""
+    universe = _load_universe()
+    sectors = _load_sectors()
+    excluded = _excluded_set()
+    n = sum(1 for s in universe if _is_excluded_sector(sectors.get(s), excluded))
+    return n, len(universe)
+
+
 def screen() -> list[dict]:
     """Run the screen. Returns ranked survivors (excluding core) as dicts with
     symbol/return_20d/rsi/rel_volume, best return first."""

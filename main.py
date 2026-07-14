@@ -44,6 +44,7 @@ import market_hours as mh
 import futures_market_hours as fmh
 import strategy
 import watchlist
+import momentum_screen
 from trade_logger import log_performance
 
 logger = logging.getLogger("bot")
@@ -187,6 +188,15 @@ def main() -> None:
         logger.info("Mom. align  : %s (one-shot/rotation, RSI<%d, file=%s)",
                     "ENABLED" if config.USE_MOMENTUM_ALIGNMENT else "DISABLED",
                     config.MOMENTUM_ALIGN_RSI_MAX, config.MOMENTUM_ENTRY_FILE)
+        logger.info("Shorting    : %s (SELLSHORT/BUYTOCOVER, core names only, death-cross entries)",
+                    "ENABLED" if config.ENABLE_SHORTING else "DISABLED")
+        try:
+            _excl, _univ = momentum_screen.count_excluded_universe()
+            logger.info("Sector filter: %d of %d universe excluded %s "
+                        "(applied at momentum screen, not per-cycle)",
+                        _excl, _univ, config.EXCLUDED_SECTORS)
+        except Exception as exc:
+            logger.warning("Sector filter: could not summarize (%s)", exc)
     logger.info("=" * 60)
 
     if not (config.TS_CLIENT_ID and config.TS_CLIENT_SECRET and config.TS_REFRESH_TOKEN):
