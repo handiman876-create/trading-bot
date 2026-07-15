@@ -190,12 +190,6 @@ def main() -> None:
                     config.MOMENTUM_ALIGN_RSI_MAX, config.MOMENTUM_ENTRY_FILE)
         logger.info("Shorting    : %s (SELLSHORT/BUYTOCOVER, core names only, death-cross entries)",
                     "ENABLED" if config.ENABLE_SHORTING else "DISABLED")
-        logger.info("Exit logic  : STATE (EMA%d</>EMA%d), not edge — exits fire on "
-                    "trend state, entries still need a cross",
-                    config.MA_SHORT_PERIOD, config.MA_LONG_PERIOD)
-        logger.info("Entry delay : %d min after session open (entries only; "
-                    "exits + stops live from the bell)",
-                    config.CROSS_ENTRY_DELAY_MINUTES)
         try:
             _excl, _univ = momentum_screen.count_excluded_universe()
             logger.info("Sector filter: %d of %d universe excluded %s "
@@ -203,6 +197,17 @@ def main() -> None:
                         _excl, _univ, config.EXCLUDED_SECTORS)
         except Exception as exc:
             logger.warning("Sector filter: could not summarize (%s)", exc)
+
+    # Both modes: state exits and the entry delay apply to stocks, options AND
+    # futures, so this reports outside the mode branch. The delay anchors to each
+    # mode's own session open — 9:30 ET for equities, 18:00 ET for CME.
+    logger.info("Exit logic  : STATE (EMA%d</>EMA%d), not edge — exits fire on "
+                "trend state; entries still need a cross",
+                config.MA_SHORT_PERIOD, config.MA_LONG_PERIOD)
+    logger.info("Entry delay : %d min after the %s session open (entries only; "
+                "exits + stops live from the open)",
+                config.CROSS_ENTRY_DELAY_MINUTES,
+                "CME 18:00 ET" if MODE == "futures" else "9:30 ET")
     logger.info("=" * 60)
 
     if not (config.TS_CLIENT_ID and config.TS_CLIENT_SECRET and config.TS_REFRESH_TOKEN):
