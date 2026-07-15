@@ -307,6 +307,22 @@ def _arm_stop_on_entry(symbol: str, entry_price: float, atr: Optional[float],
     A short's stop sits ABOVE entry (entry + MULT*atr) and will ratchet DOWN; a
     long's sits below and ratchets up. No-op with a warning if ATR is unavailable
     (equities always carry high/low, so this should never fire)."""
+    # TODO: callers pass the SIGNAL-bar close (sig["close"]), not the actual fill
+    # price — the order response carries no fill price to read (a market order is
+    # accepted async, and _place_order returns only the OrderID). Market fills
+    # typically arrive at or above sig["close"], so entry_price lands low and the
+    # stop sits slightly lower than intended: under-protective, not over. Measured
+    # 2026-07-15: DDOG 254.64 armed vs 256.34 basis (+1.70/sh), LII 559.87 vs
+    # 568.03 (+8.16/sh).
+    # Fix: reconcile entry_price from cost_basis/qty on a later cycle (the
+    # arithmetic already exists in _bootstrap_stop) WITHOUT lowering an
+    # already-ratcheted stop_price — the ratchet is monotonic by design.
+    # Re-measure first: every stop armed so far predates CROSS_ENTRY_DELAY_MINUTES
+    # going live (2026-07-15 21:26). LII was armed at 09:30:10 ET off a daily bar
+    # holding seconds of data, so its gap is inflated; the 30-min delay should
+    # shrink this on its own. Confirm the size on post-delay entries before
+    # prioritising.
+    # See memory: project_stop_armed_at_signal_price
     if atr is None or atr <= 0:
         logger.warning("Could not arm stop for %s: ATR unavailable — position is "
                        "UNPROTECTED until bootstrap re-arms it.", symbol)
