@@ -23,23 +23,131 @@ from typing import Optional
 
 import config
 import tradestation_client as tc
+import market_hours as mh
 import futures_market_hours as fmh
 import indicators as ind
 from trade_logger import log_trade
 
 logger = logging.getLogger(__name__)
 
-# Tracks the last date a BUY/SELL was fired per symbol, preventing the daily
-# EMA cross from re-triggering on every 60-second poll within the same day.
-_last_signal_date: dict[str, str] = {}
+# Tracks the last date a signal fired per symbol, preventing the daily EMA
+# signal from re-triggering on every 60-second poll within the same day.
+#
+# SPLIT by order side, because one shared gate silently blocked EXITS: a name
+# bought at 9:30 could not be sold for the rest of that day, even as its stop
+# ran. Buy-side ops (BUY, BUY_TO_COVER) check the buy gate; sell-side ops
+# (SELL, SELL_SHORT) check the sell gate. Neither blocks the other, so an
+# entry can always be exited the same day.
+#
+# Kept as date-keyed dicts rather than sets so they self-expire on the date
+# comparison — a set would need a midnight reset hook that could be missed.
+_signaled_buy_today:  dict[str, str] = {}
+_signaled_sell_today: dict[str, str] = {}
 
 
-def _already_signaled_today(symbol: str) -> bool:
-    return _last_signal_date.get(symbol) == date.today().isoformat()
+def _already_bought_today(symbol: str) -> bool:
+    return _signaled_buy_today.get(symbol) == date.today().isoformat()
 
 
-def _mark_signaled(symbol: str) -> None:
-    _last_signal_date[symbol] = date.today().isoformat()
+def _already_sold_today(symbol: str) -> bool:
+    return _signaled_sell_today.get(symbol) == date.today().isoformat()
+
+
+def _mark_bought(symbol: str) -> None:
+    _signaled_buy_today[symbol] = date.today().isoformat()
+
+
+def _mark_sold(symbol: str) -> None:
+    _signaled_sell_today[symbol] = date.today().isoformat()
+
+
+# ── Exit conditions — STATE, not edge ─────────────────────────────────────────
+# `bearish_cross`/`bullish_cross` are EDGES: true only on the single bar where
+# the previous CLOSED bar sat one side of the crossover and the current bar sits
+# the other. An edge is a memory of a transition, so it can be missed — and once
+# missed it is gone forever, because the next bar's `prev` already reflects the
+# new state. Anything that stops us observing that exact bar (a still-forming
+# bar, a restart, an outage, a same-day round trip) silently strands the
+# position with no exit but its stop. That is what happened to HCA and QQQ:
+# both crossed up and back down inside one live bar, so relative to yesterday's
+# CLOSE they never transitioned, no bearish edge was ever generated, and neither
+# could exit on a cross again at any point in the future.
+#
+# A state is re-derived from current data every poll and cannot be missed. So:
+# ENTRIES are edges (they need a trigger — a reason to act now and not
+# yesterday); EXITS are states (if the condition holds and we are still in the
+# position, we are wrong to be there, and why we missed the transition is
+# irrelevant). Entry paths below deliberately keep their edges.
+
+def _bearish_state(sig: dict) -> bool:
+    """Fast EMA below slow — the trend state a long should not be held in."""
+    return sig["ema_short"] < sig["ema_long"]
+
+
+def _bullish_state(sig: dict) -> bool:
+    """Fast EMA above slow — the trend state a short should not be held in."""
+    return sig["ema_short"] > sig["ema_long"]
+
+
+def _exit_long_signal(sig: dict) -> bool:
+    """True when a long should be flat: bearish state, RSI not oversold.
+
+    The RSI floor now DEFERS an exit rather than cancelling it — an edge-based
+    exit blocked by RSI < oversold was lost permanently; this one fires as soon
+    as RSI recovers, while the bearish state persists.
+
+    The bare state predicates above exist because the OPTIONS closes never had an
+    RSI gate (open with confirmation, close unconditionally on the opposite
+    signal) and must not gain one: a contract decays, so refusing to close a
+    losing call because RSI < 30 would hold it into theta. Options take the
+    primitive; stocks and futures take this policy.
+    """
+    return _bearish_state(sig) and sig["rsi"] > config.RSI_OVERSOLD
+
+
+def _exit_short_signal(sig: dict) -> bool:
+    """True when a short should be flat: bullish state, RSI not overbought.
+    Mirror of _exit_long_signal."""
+    return _bullish_state(sig) and sig["rsi"] < config.RSI_OVERBOUGHT
+
+
+# One ENTRY DELAYED log/count per name per day. Without this latch the counter
+# would tick on every quiet poll inside the window (~20 symbols x 30 polls) and
+# measure nothing but the clock; we want the number of real would-be entries the
+# delay actually deferred, which is the only figure that says whether it earns
+# its keep.
+_entry_delay_logged: dict[str, str] = {}
+
+
+def _note_entry_delayed(symbol: str, would_enter: bool) -> None:
+    """Count an entry the post-open delay deferred. `would_enter` is the caller's
+    answer to 'would this poll have placed an order but for the gate?'"""
+    global _entries_delayed
+    if not would_enter:
+        return
+    if _entry_delay_logged.get(symbol) == date.today().isoformat():
+        return
+    _entry_delay_logged[symbol] = date.today().isoformat()
+    _entries_delayed += 1
+    logger.info("ENTRY DELAYED %s — entry signal present but the daily bar is "
+                "still forming (needs %d min after the session open). Re-checked "
+                "every poll: it enters only if the signal survives the window "
+                "(delayed entries #%d)",
+                symbol, config.CROSS_ENTRY_DELAY_MINUTES, _entries_delayed)
+
+
+def _note_state_only_exit(symbol: str, sig: dict, edge_key: str) -> None:
+    """Count exits that fired on STATE with no matching EDGE this bar — i.e. the
+    exits the old edge-based logic would have missed entirely. This counter is
+    the fix's justification: if it stays at zero over a long run of real
+    crossovers, the edge was adequate and this is dead weight; while it climbs,
+    every increment is a position that would otherwise have been stranded."""
+    global _state_only_exits
+    if not sig.get(edge_key):
+        _state_only_exits += 1
+        logger.info("STATE-ONLY EXIT %s — no %s edge on this bar; edge-based "
+                    "logic would have missed this exit (state-only exits #%d)",
+                    symbol, edge_key, _state_only_exits)
 
 
 def _shares_to_buy(price: float, equity: Optional[float]) -> int:
@@ -92,6 +200,8 @@ _MOM_ENTRIES_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 # Observability: safety-net / signal counters this process lifetime. Every safety
 # net gets a counter so we can tell whether it's still earning its keep.
 _stop_exits = 0
+_state_only_exits = 0
+_entries_delayed = 0
 _momentum_align_entries = 0
 _short_entries = 0
 _short_covers = 0
@@ -302,7 +412,13 @@ def _check_and_trail_stop(symbol: str, held: int, sig: dict,
             _stop_exits += 1
             stops.pop(symbol, None)
             _save_stops(stops)
-            _mark_signaled(symbol)    # block a same-day re-entry on the next cross
+            # Mark BOTH gates: a stop-out should block every same-day signal for
+            # this name (the old single gate did exactly that). The buy mark is
+            # the one that matters — it blocks the re-entry this comment has
+            # always been about — but marking only the exit side would leave a
+            # stopped-out name free to re-enter on the next cross the same day.
+            _mark_bought(symbol)
+            _mark_sold(symbol)
             order_id = result.get("order", {}).get("id")
             log_trade(exit_action, symbol, exit_qty, price, "market", order_id,
                       f"trailing stop hit @ {rec['stop_price']:.2f}")
@@ -375,7 +491,7 @@ def _enter_long(symbol: str, sig: dict, price: float, account_id: str,
                 open_count, config.MAX_POSITIONS, reason)
     result = tc.place_equity_order(account_id, symbol, "buy", qty)
     if result:
-        _mark_signaled(symbol)
+        _mark_bought(symbol)
         order_id = result.get("order", {}).get("id")
         log_trade("BUY", symbol, qty, price, "market", order_id, reason)
         _arm_stop_on_entry(symbol, price, sig.get("atr"))
@@ -405,7 +521,7 @@ def _enter_short(symbol: str, sig: dict, price: float, account_id: str,
                 open_count, config.MAX_POSITIONS, reason)
     result = tc.place_equity_order(account_id, symbol, "sell_short", qty)
     if result:
-        _mark_signaled(symbol)
+        _mark_sold(symbol)
         order_id = result.get("order", {}).get("id")
         log_trade("SELL_SHORT", symbol, qty, price, "market", order_id, reason)
         _arm_stop_on_entry(symbol, price, sig.get("atr"), direction="short")
@@ -416,7 +532,7 @@ def _enter_short(symbol: str, sig: dict, price: float, account_id: str,
 def evaluate_stock(symbol: str, account_id: str, positions: list[dict],
                    equity: Optional[float],
                    is_momentum: bool = False, momentum_generation: str = "") -> None:
-    global _momentum_align_entries, _short_entries, _short_covers
+    global _momentum_align_entries, _short_entries, _short_covers, _entries_delayed
 
     history = tc.get_historical(symbol, days=90)
     if not history:
@@ -451,7 +567,56 @@ def evaluate_stock(symbol: str, account_id: str, positions: list[dict],
         if _check_and_trail_stop(symbol, held, sig, account_id, positions):
             return                      # stop fired — exited, skip signal logic
 
-    if _already_signaled_today(symbol):
+    # ── EXITS ─────────────────────────────────────────────────────────────────
+    # Evaluated BEFORE the entry gate, and on state rather than an edge, so a
+    # position can always leave: at the bell, mid-outage, or the same day it was
+    # opened. The sell/buy gate below blocks only a DUPLICATE exit while an order
+    # is in flight (held stays non-zero until it fills), never the first one.
+
+    # SELL — close a long whenever the trend is bearish, not just on the crossing
+    # bar. This is the HCA/QQQ fix.
+    if held > 0 and _exit_long_signal(sig) and not _already_sold_today(symbol):
+        logger.info("SIGNAL SELL %s x%d", symbol, held)
+        result = tc.place_equity_order(account_id, symbol, "sell", held)
+        if result:
+            _mark_sold(symbol)
+            order_id = result.get("order", {}).get("id")
+            log_trade("SELL", symbol, held, price, "market", order_id,
+                      f"EMA bearish, RSI={sig['rsi']:.1f}")
+            _note_state_only_exit(symbol, sig, "bearish_cross")
+            _clear_stop(symbol)
+        return
+
+    # COVER — close a short whenever the trend is bullish (mirror of SELL).
+    if held < 0 and _exit_short_signal(sig) and not _already_bought_today(symbol):
+        qty = abs(held)
+        logger.info("SIGNAL BUY_TO_COVER %s x%d", symbol, qty)
+        result = tc.place_equity_order(account_id, symbol, "buy_to_cover", qty)
+        if result:
+            _short_covers += 1
+            _mark_bought(symbol)
+            order_id = result.get("order", {}).get("id")
+            log_trade("BUY_TO_COVER", symbol, qty, price, "market", order_id,
+                      f"EMA bullish (cover), RSI={sig['rsi']:.1f}")
+            _note_state_only_exit(symbol, sig, "bullish_cross")
+            _clear_stop(symbol)
+        return
+
+    # ── ENTRIES ───────────────────────────────────────────────────────────────
+    # One gate for every entry path below. The daily bar is still forming — at
+    # 9:30:05 its EMAs are computed from seconds of data, which is how QQQ was
+    # bought on a 0.017%-wide "cross" and HCA on a five-minute-old stub bar at
+    # RSI 35. A stub bar is a stub bar whether it is read as an edge or a state,
+    # so this gates the momentum path too. Exits above are deliberately outside
+    # it: acting on noise costs an early exit, entering on noise costs capital.
+    if not mh.entries_allowed():
+        _note_entry_delayed(symbol, held == 0 and (
+            sig["bullish_cross"] or (is_momentum and _bullish_state(sig))))
+        return
+
+    # One entry per name per day (what the old single gate actually protected).
+    # A name that already traded today does not get re-entered on a later blip.
+    if _already_bought_today(symbol) or _already_sold_today(symbol):
         return
 
     # BUY signal — fresh EMA cross (all symbols)
@@ -463,7 +628,8 @@ def evaluate_stock(symbol: str, account_id: str, positions: list[dict],
     # Reached only when there was NO fresh cross (elif), so a genuine cross always
     # takes the standard path; this is the fallback for names already trending when
     # the screen added them. The latch is consumed only on a *placed* order, so a
-    # MAX_POSITIONS block leaves the shot available to retry when a slot frees.
+    # MAX_POSITIONS block — or the entry delay above — leaves the shot available
+    # to retry once the bar has formed.
     elif (is_momentum and held == 0 and config.USE_MOMENTUM_ALIGNMENT
           and sig["ema_short"] > sig["ema_long"]
           and config.MOMENTUM_ALIGN_RSI_MIN <= sig["rsi"] <= config.MOMENTUM_ALIGN_RSI_MAX
@@ -475,38 +641,15 @@ def evaluate_stock(symbol: str, account_id: str, positions: list[dict],
             logger.info("MOMENTUM ALIGNMENT ENTRY %s (gen=%s) — align entries #%d",
                         symbol, momentum_generation or "<none>", _momentum_align_entries)
 
-    # SELL signal — close a long
-    elif sig["bearish_cross"] and sig["rsi"] > config.RSI_OVERSOLD and held > 0:
-        logger.info("SIGNAL SELL %s x%d", symbol, held)
-        result = tc.place_equity_order(account_id, symbol, "sell", held)
-        if result:
-            _mark_signaled(symbol)
-            order_id = result.get("order", {}).get("id")
-            log_trade("SELL", symbol, held, price, "market", order_id,
-                      f"EMA cross down, RSI={sig['rsi']:.1f}")
-            _clear_stop(symbol)
-
     # SHORT signal — fresh death cross, CORE names only (momentum slot stays
     # long-only). Mirrors the long BUY: same RSI gate, same held==0 requirement.
+    # Stays EDGE-based: it is an entry. On state it would re-short every poll.
     elif (sig["bearish_cross"] and sig["rsi"] > config.RSI_OVERSOLD and held == 0
           and not is_momentum and config.ENABLE_SHORTING):
         if _enter_short(symbol, sig, price, account_id, positions, equity,
                         reason=f"EMA cross down (short), RSI={sig['rsi']:.1f}"):
             _short_entries += 1
             logger.info("SHORT ENTRY %s — short entries #%d", symbol, _short_entries)
-
-    # COVER signal — buy to close a short on a bullish cross (mirror of SELL).
-    elif sig["bullish_cross"] and sig["rsi"] < config.RSI_OVERBOUGHT and held < 0:
-        qty = abs(held)
-        logger.info("SIGNAL BUY_TO_COVER %s x%d", symbol, qty)
-        result = tc.place_equity_order(account_id, symbol, "buy_to_cover", qty)
-        if result:
-            _short_covers += 1
-            _mark_signaled(symbol)
-            order_id = result.get("order", {}).get("id")
-            log_trade("BUY_TO_COVER", symbol, qty, price, "market", order_id,
-                      f"EMA cross up (cover), RSI={sig['rsi']:.1f}")
-            _clear_stop(symbol)
 
 
 # ── Options Strategy ──────────────────────────────────────────────────────────
@@ -518,6 +661,8 @@ def evaluate_option(
     account_id: str,
     positions:  list[dict],
 ) -> None:
+    global _entries_delayed
+
     history = tc.get_historical(symbol, days=90)
     if not history:
         return
@@ -549,32 +694,46 @@ def evaluate_option(
         sig["close"], sig["rsi"], opt_price, held,
     )
 
-    if _already_signaled_today(occ_symbol):
-        return
-
+    # NOTE: the old single gate sat here, above BOTH branches, so a contract
+    # opened today could not be closed today — the same defect as the equities
+    # path. The gate now lives inside the open branch only; closes below are
+    # never gated on it.
     is_call = opt_type.lower() == "call"
 
-    # Open new position
+    # Open new position — an entry, so it waits for the bar to form like every
+    # other entry path. Options run off the same underlying's daily bar, so a
+    # 9:30:05 open would be bought on the same stub EMAs as QQQ was.
     if held == 0:
+        if not mh.entries_allowed():
+            _note_entry_delayed(occ_symbol, sig["bullish_cross"] if is_call
+                                else sig["bearish_cross"])
+            return
+        if _already_bought_today(occ_symbol) or _already_sold_today(occ_symbol):
+            return
         if is_call and sig["bullish_cross"] and sig["rsi"] < config.RSI_OVERBOUGHT:
             if _open_option(account_id, occ_symbol, "buy_to_open", opt_price,
                             symbol, expiration, strike, opt_type, sig):
-                _mark_signaled(occ_symbol)
+                _mark_bought(occ_symbol)
         elif not is_call and sig["bearish_cross"] and sig["rsi"] > config.RSI_OVERSOLD:
             if _open_option(account_id, occ_symbol, "buy_to_open", opt_price,
                             symbol, expiration, strike, opt_type, sig):
-                _mark_signaled(occ_symbol)
+                _mark_bought(occ_symbol)
 
-    # Close existing position on opposite cross
+    # Close existing position on the opposite STATE (not edge) — same fix as the
+    # equities exits: a long call stranded by a missed bearish edge would ride to
+    # expiry. A call is long the underlying, a put is short it, so they take the
+    # long/short exit helpers respectively.
     elif held > 0:
-        if is_call and sig["bearish_cross"]:
+        if is_call and _bearish_state(sig):
             if _close_option(account_id, occ_symbol, held, opt_price,
                              symbol, expiration, strike, opt_type, sig):
-                _mark_signaled(occ_symbol)
-        elif not is_call and sig["bullish_cross"]:
+                _mark_sold(occ_symbol)
+                _note_state_only_exit(occ_symbol, sig, "bearish_cross")
+        elif not is_call and _bullish_state(sig):
             if _close_option(account_id, occ_symbol, held, opt_price,
                              symbol, expiration, strike, opt_type, sig):
-                _mark_signaled(occ_symbol)
+                _mark_sold(occ_symbol)
+                _note_state_only_exit(occ_symbol, sig, "bullish_cross")
 
 
 # ── Futures Strategy ──────────────────────────────────────────────────────────
@@ -595,6 +754,8 @@ def _stale_futures_position(positions: list[dict], root: str, current_symbol: st
 
 
 def evaluate_future(root: str, account_id: str, positions: list[dict]) -> None:
+    global _entries_delayed
+
     trade_symbol = fmh.front_month_contract(root, roll_days=config.FUTURES_ROLL_DAYS)
     sig_symbol   = fmh.signal_symbol(root)
 
@@ -638,30 +799,38 @@ def evaluate_future(root: str, account_id: str, positions: list[dict]) -> None:
                       f"{root} roll: flatten expiring contract")
         return
 
-    if _already_signaled_today(trade_symbol):
-        return
-
     qty = config.FUTURES_CONTRACTS
 
-    # BUY signal — open long front month
+    # SELL — flatten the long on bearish STATE, before the entry gate, same as
+    # equities. Uses the FUTURES clock: the ES daily bar runs 18:00 -> 17:00 ET,
+    # so its unformed stub window is the evening reopen, not the 9:30 bell.
+    if held > 0 and _exit_long_signal(sig) and not _already_sold_today(trade_symbol):
+        logger.info("SIGNAL SELL %s x%d", trade_symbol, held)
+        result = tc.place_futures_order(account_id, trade_symbol, "sell", held)
+        if result:
+            _mark_sold(trade_symbol)
+            order_id = result.get("order", {}).get("id")
+            log_trade("SELL", trade_symbol, held, price, "market", order_id,
+                      f"{root} EMA bearish, RSI={sig['rsi']:.1f}")
+            _note_state_only_exit(trade_symbol, sig, "bearish_cross")
+        return
+
+    if not fmh.entries_allowed():
+        _note_entry_delayed(trade_symbol, held == 0 and sig["bullish_cross"])
+        return
+
+    if _already_bought_today(trade_symbol) or _already_sold_today(trade_symbol):
+        return
+
+    # BUY signal — open long front month (EDGE: it is an entry)
     if sig["bullish_cross"] and sig["rsi"] < config.RSI_OVERBOUGHT and held == 0:
         logger.info("SIGNAL BUY %s x%d", trade_symbol, qty)
         result = tc.place_futures_order(account_id, trade_symbol, "buy", qty)
         if result:
-            _mark_signaled(trade_symbol)
+            _mark_bought(trade_symbol)
             order_id = result.get("order", {}).get("id")
             log_trade("BUY", trade_symbol, qty, price, "market", order_id,
                       f"{root} EMA cross up, RSI={sig['rsi']:.1f}")
-
-    # SELL signal — flatten long front month
-    elif sig["bearish_cross"] and sig["rsi"] > config.RSI_OVERSOLD and held > 0:
-        logger.info("SIGNAL SELL %s x%d", trade_symbol, held)
-        result = tc.place_futures_order(account_id, trade_symbol, "sell", held)
-        if result:
-            _mark_signaled(trade_symbol)
-            order_id = result.get("order", {}).get("id")
-            log_trade("SELL", trade_symbol, held, price, "market", order_id,
-                      f"{root} EMA cross down, RSI={sig['rsi']:.1f}")
 
 
 def _open_option(account_id, occ_symbol, side, price, symbol, exp, strike, opt_type, sig):

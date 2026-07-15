@@ -115,6 +115,29 @@ def seconds_until_close(now: datetime = None) -> float:
     return _scan_minutes(now, want_open=False)
 
 
+def entries_allowed(now: datetime = None) -> bool:
+    """True once the CME session has been open CROSS_ENTRY_DELAY_MINUTES.
+
+    Mirrors ``market_hours.entries_allowed`` but anchors to the GLOBEX session
+    open (18:00 ET), NOT the 9:30 equity bell — the ES daily bar runs 18:00 ->
+    17:00 ET, so its unformed stub window is the evening reopen. Using the equity
+    anchor here would be exactly backwards: it would block 9:30-10:00 (~15h into
+    a fully formed bar) and wave through 18:00:05 (bar five seconds old).
+
+    Before the 17:00 halt we are inside the session that opened the previous
+    evening, so the bar is many hours old and entries are always allowed.
+    """
+    now = now or now_et()
+    if not is_market_open(now):
+        return False
+    if now.time() < _SESSION_START:
+        return True          # session opened last evening — bar long since formed
+    session_open = now.replace(hour=_SESSION_START.hour,
+                               minute=_SESSION_START.minute,
+                               second=0, microsecond=0)
+    return now >= session_open + timedelta(minutes=config.CROSS_ENTRY_DELAY_MINUTES)
+
+
 def describe_next_open(now: datetime = None) -> str:
     """Human-readable next-open timestamp, e.g. '2026-07-19 18:00 ET'."""
     now = now or now_et()

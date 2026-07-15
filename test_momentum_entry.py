@@ -36,7 +36,13 @@ def _reset():
     strategy._momentum_align_entries = 0
     strategy._short_entries = 0
     strategy._short_covers = 0
-    strategy._last_signal_date.clear()
+    strategy._entries_delayed = 0
+    strategy._signaled_buy_today.clear()
+    strategy._signaled_sell_today.clear()
+    # These tests exercise SIGNAL logic, not the clock: pin the entry gate open
+    # so they pass regardless of when the suite runs. The gate's own behaviour is
+    # covered in test_entry_delay.py.
+    strategy.mh.entries_allowed = lambda *a, **k: True
     strategy.config.USE_MOMENTUM_ALIGNMENT = True
     strategy.config.USE_TRAILING_STOP = True
     strategy.config.ENABLE_SHORTING = True

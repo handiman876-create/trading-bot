@@ -50,6 +50,19 @@ MARKET_CLOSE_HOUR  = 16
 MARKET_CLOSE_MIN   = 0
 MARKET_TZ          = "America/New_York"
 
+# ── Entry delay after the session open ───────────────────────────────────────
+# Signals are computed on DAILY bars whose last bar is today's live, still-
+# forming bar. At the opening bell that bar holds seconds of data, so its EMAs
+# are noise: on 2026-07-15 QQQ fired a bullish cross at 9:30:05 with the EMAs
+# 0.017% apart and was back below within 44 minutes. Entries wait this many
+# minutes for the bar to form; exits and stops stay live from the open (an early
+# exit costs little, an entry on noise commits capital).
+#
+# This is a confirmation window, not a skip: `prev` is pinned to yesterday's
+# CLOSED bar, so a cross stays true all day while the state holds. Delaying does
+# not miss the signal — it requires the signal to survive the delay.
+CROSS_ENTRY_DELAY_MINUTES = 30
+
 # ── Watchlist (fixed core) ────────────────────────────────────────────────────
 # The live stock list is assembled every cycle by
 # watchlist.effective_stock_watchlist() as:  CORE_WATCHLIST ∪ momentum slot ∪

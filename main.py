@@ -190,6 +190,12 @@ def main() -> None:
                     config.MOMENTUM_ALIGN_RSI_MAX, config.MOMENTUM_ENTRY_FILE)
         logger.info("Shorting    : %s (SELLSHORT/BUYTOCOVER, core names only, death-cross entries)",
                     "ENABLED" if config.ENABLE_SHORTING else "DISABLED")
+        logger.info("Exit logic  : STATE (EMA%d</>EMA%d), not edge — exits fire on "
+                    "trend state, entries still need a cross",
+                    config.MA_SHORT_PERIOD, config.MA_LONG_PERIOD)
+        logger.info("Entry delay : %d min after session open (entries only; "
+                    "exits + stops live from the bell)",
+                    config.CROSS_ENTRY_DELAY_MINUTES)
         try:
             _excl, _univ = momentum_screen.count_excluded_universe()
             logger.info("Sector filter: %d of %d universe excluded %s "

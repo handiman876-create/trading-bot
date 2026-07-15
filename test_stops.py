@@ -32,7 +32,8 @@ def _reset(quote_price=None):
     """Fresh empty stop file + cleared captured state before each test."""
     _orders.clear()
     strategy._stop_exits = 0
-    strategy._last_signal_date.clear()
+    strategy._signaled_buy_today.clear()
+    strategy._signaled_sell_today.clear()
     strategy.tc.place_equity_order = _fake_place
     strategy.tc.get_quote = _fake_quote(quote_price)
     if os.path.exists(strategy._STOPS_PATH):
@@ -104,7 +105,11 @@ def test_exit_when_price_breaches_stop():
     assert _orders == [("NVDA", "sell", 238)], _orders
     assert "NVDA" not in strategy._load_stops(), "record cleared after exit"
     assert strategy._stop_exits == 1, "counter incremented"
-    assert strategy._already_signaled_today("NVDA"), "same-day re-buy blocked"
+    # A stop-out marks BOTH gates: the buy mark is the one that blocks the
+    # same-day re-entry this has always been about; the sell mark preserves the
+    # old single gate's "no further signals today for this name" behaviour.
+    assert strategy._already_bought_today("NVDA"), "same-day re-buy blocked"
+    assert strategy._already_sold_today("NVDA"), "same-day re-sell blocked"
 
 
 def test_failed_exit_order_keeps_record():

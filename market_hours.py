@@ -121,6 +121,27 @@ def is_market_open() -> bool:
     return _OPEN <= current_time < _CLOSE
 
 
+def entries_allowed(now: datetime = None) -> bool:
+    """True once the regular session has been open CROSS_ENTRY_DELAY_MINUTES.
+
+    Gates ENTRIES only — exits and stops stay live from the bell. The daily bar
+    the EMAs are computed from is still forming; at 9:30:05 it holds seconds of
+    data. See config.CROSS_ENTRY_DELAY_MINUTES.
+
+    `futures_market_hours.entries_allowed` mirrors this, anchored to the CME
+    session open instead, so main.py can treat either module as the same clock.
+    """
+    now = now or now_et()
+    if not _is_trading_day(now.date()):
+        return False
+    if not (_OPEN <= now.time() < _CLOSE):
+        return False
+    open_dt = now.replace(hour=config.MARKET_OPEN_HOUR,
+                          minute=config.MARKET_OPEN_MIN,
+                          second=0, microsecond=0)
+    return now >= open_dt + timedelta(minutes=config.CROSS_ENTRY_DELAY_MINUTES)
+
+
 def seconds_until_open() -> float:
     """Seconds until the next market open (always positive).
 
