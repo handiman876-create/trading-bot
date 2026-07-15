@@ -27,7 +27,7 @@ import json
 import logging
 import os
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import config
 
@@ -44,6 +44,9 @@ PERF_GLOB    = os.path.join(_HERE, config.PERF_LOG_FILE + "*")
 MIN_TRADES_FOR_STATS = 10          # a feature needs this many closed trips to judge
 OPTION_MULTIPLIER    = 100         # shares per option contract
 LEDGER_VERSION       = 1
+STALE_OPEN_DAYS      = 90           # an unpaired entry older than this is pre-analyzer
+                                    # noise (its exit rotated out before the ledger
+                                    # existed) — excluded from open tracking + pairing
 
 # The four report buckets, in display order.
 FEATURES = ["long_fresh_cross", "momentum_alignment", "short", "option"]
@@ -103,6 +106,27 @@ def _parse_ts(s: str) -> datetime:
         return datetime.strptime((s or "")[:19], "%Y-%m-%d %H:%M:%S")
     except (ValueError, TypeError):
         return datetime.min
+
+
+def _reference_now() -> datetime:
+    """Naive 'now' for age comparisons against _parse_ts. Isolated so tests can
+    monkeypatch it deterministically."""
+    return datetime.now()
+
+
+def _partition_stale(events: list, cutoff: datetime):
+    """Split events into (recent, stale_entries). An ENTRY older than `cutoff` is
+    pre-analyzer noise — its exit rotated out before the ledger existed, so it
+    would otherwise sit forever as a phantom 'open' position and could mispair
+    with a recent exit. Such entries are pulled out of the pairing pool; stale
+    NON-entry events are simply dropped."""
+    recent, stale_entries = [], []
+    for e in events:
+        if _parse_ts(e["timestamp"]) >= cutoff:
+            recent.append(e)
+        elif e.get("role") == "entry":
+            stale_entries.append(e)
+    return recent, stale_entries
 
 
 # ── Log reading ───────────────────────────────────────────────────────────────
@@ -461,19 +485,25 @@ def _now_ts() -> str:
 
 
 def build_report(ledger: dict, stops: dict, data_quality: dict) -> dict:
-    events = list(ledger["events"].values())
+    all_events = list(ledger["events"].values())
+    cutoff = _reference_now() - timedelta(days=STALE_OPEN_DAYS)
+    # Drop pre-analyzer entries (>90d) so they can't sit as phantom opens or
+    # mispair with recent exits; keep them only as a count for Data Quality.
+    events, stale_entries = _partition_stale(all_events, cutoff)
+
     # Pair once to see which held positions lack an OPEN entry, inject synthetic
     # bootstrap entries for those, then re-pair so their exits can match.
     _c0, _o0, open0 = _pair_round_trips(events)
     open_keys = {(e["symbol"], e["direction"]) for e in open0}
     injected = _inject_bootstrap_entries(ledger, stops, open_keys)
     if injected:
-        events = list(ledger["events"].values())
+        events, stale_entries = _partition_stale(list(ledger["events"].values()), cutoff)
     closed, orphans, open_entries = _pair_round_trips(events)
     ledger["closed_trips"] = closed        # recomputed view, not appended
 
     data_quality = dict(data_quality)
     data_quality["bootstrap_injected"] = injected
+    data_quality["stale_pre_analyzer_entries"] = len(stale_entries)
     agg = _aggregate(closed)
     est_closed = sum(1 for t in closed if t["estimated_entry"])
     est_open   = sum(1 for e in open_entries if e.get("estimated_entry"))
@@ -573,6 +603,8 @@ def render_txt(report: dict) -> str:
         L.append(f"      - {e}")
     L.append(f"  estimated (bootstrapped) entries: {dq['estimated_entry_trips_closed']} closed, "
              f"{dq['estimated_entry_open']} open")
+    L.append(f"  pre-analyzer entries excluded (>{STALE_OPEN_DAYS}d): "
+             f"{dq.get('stale_pre_analyzer_entries', 0)}")
     L.append(f"  exits missing an entry (orphans): {len(dq['orphan_exits_missing_entry'])}")
     for o in dq["orphan_exits_missing_entry"][:5]:
         L.append(f"      - {o['symbol']} {o['action']} @ {o['ts']}")

@@ -235,6 +235,36 @@ def test_inject_bootstrap_when_no_open_entry():
     assert pa._inject_bootstrap_entries(ledger, stops, open_keys) == 0
 
 
+# ── Stale (pre-analyzer) entry exclusion ──────────────────────────────────────
+
+def test_partition_stale_excludes_old_entries():
+    from datetime import datetime
+    cutoff = datetime(2026, 7, 1)      # entries before this are pre-analyzer
+    events = [
+        _ev("2026-04-17 09:30:00 EDT", "BUY",  "OLD",  10, 100.0, "EMA cross up"),   # stale entry
+        _ev("2026-07-10 09:30:00 EDT", "BUY",  "NEW",  10, 100.0, "EMA cross up"),   # recent entry
+        _ev("2026-04-18 09:30:00 EDT", "SELL", "OLD",  10, 110.0, "EMA cross down"), # stale exit -> dropped
+    ]
+    recent, stale = pa._partition_stale(events, cutoff)
+    assert [e["symbol"] for e in stale] == ["OLD"]           # only the old ENTRY is stale
+    assert [e["symbol"] for e in recent] == ["NEW"]          # recent kept; stale exit dropped
+
+
+def test_stale_old_entry_not_paired_with_recent_exit():
+    """An ancient open entry must NOT pair with a recent exit (wrong-era P&L)."""
+    from datetime import datetime
+    cutoff = datetime(2026, 7, 1)
+    events = [
+        _ev("2026-04-17 09:30:00 EDT", "BUY",  "AAPL", 10, 100.0, "EMA cross up"),   # stale
+        _ev("2026-07-10 09:30:00 EDT", "SELL", "AAPL", 10, 999.0, "EMA cross down"), # recent exit
+    ]
+    recent, stale = pa._partition_stale(events, cutoff)
+    closed, orphans, opens = pa._pair_round_trips(recent)
+    assert closed == [], "recent exit must not pair with a pre-analyzer entry"
+    assert len(orphans) == 1 and orphans[0]["symbol"] == "AAPL"   # surfaced, not mispriced
+    assert len(stale) == 1
+
+
 # ── SPY close lookup ──────────────────────────────────────────────────────────
 
 def test_spy_close_on_or_before():
