@@ -1,0 +1,14 @@
+[Unit]
+Description=Run the weekly performance analyzer on Sunday 00:07 America/New_York
+
+[Timer]
+# Sunday 00:07 Eastern — a quiet off-hour, and the :07 minute keeps it off the
+# top-of-hour cron pile-up. The America/New_York suffix tracks EST/EDT.
+OnCalendar=Sun *-*-* 00:07:00 America/New_York
+# If the machine was off at the scheduled time, run once at next boot instead of
+# skipping the week entirely.
+Persistent=true
+RandomizedDelaySec=120
+
+[Install]
+WantedBy=timers.target

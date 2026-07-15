@@ -1,0 +1,19 @@
+[Unit]
+Description=TradeStation bot — weekly performance analyzer (per-feature P&L vs SPY)
+Documentation=file:/root/trading-bot/deploy/run-performance-analyzer.sh
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# oneshot: run to completion, then exit (the .timer schedules it; not a daemon).
+Type=oneshot
+User=root
+WorkingDirectory=/root/trading-bot
+ExecStart=/root/trading-bot/deploy/run-performance-analyzer.sh
+# Reads only local logs plus one SPY history call — a couple minutes at most.
+TimeoutStartSec=600
+StandardOutput=append:/root/trading-bot/logs/performance.analyzer.log
+StandardError=append:/root/trading-bot/logs/performance.analyzer.log
+
+# No [Install] section: a timer-activated oneshot is pulled in by its .timer,
+# not enabled directly.

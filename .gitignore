@@ -10,6 +10,11 @@ bot.futures.log
 bot.futures.lock
 bot.futures.pid
 momentum.lock
+performance.lock
 data/momentum_watchlist.json
 data/stop_prices.json
 data/momentum_entries.json
+data/trade_ledger.json
+.venv/
+bot.log.*
+bot.futures.log.*
