@@ -12,6 +12,7 @@ Run:  python3 test_momentum_entry.py
 import os
 import tempfile
 
+import _testlib
 import strategy
 
 _orders = []          # (symbol, side, qty) captured from place_equity_order
@@ -50,8 +51,7 @@ def _reset():
     strategy.tc.get_historical = lambda *a, **k: [{"bar": 1}]     # truthy
     strategy.tc.get_quote = lambda s: {"last": 10_000.0}          # high -> no stop breach
     for path in (strategy._STOPS_PATH, strategy._MOM_ENTRIES_PATH):
-        if os.path.exists(path):
-            os.remove(path)
+        _testlib.safe_remove(path)
 
 
 def _set_sig(**kw):

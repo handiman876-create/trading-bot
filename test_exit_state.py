@@ -12,7 +12,9 @@ Run:  python3 test_exit_state.py
 """
 
 import os
+import tempfile
 
+import _testlib
 import strategy
 
 # ── Test doubles ──────────────────────────────────────────────────────────────
@@ -48,8 +50,7 @@ def _reset():
     strategy.tc.get_historical = lambda *a, **k: [{"bar": 1}]
     strategy.tc.get_quote = lambda s: {"last": 10_000.0}
     for path in (strategy._STOPS_PATH, strategy._MOM_ENTRIES_PATH):
-        if os.path.exists(path):
-            os.remove(path)
+        _testlib.safe_remove(path)
 
 
 def _set_sig(**kw):
@@ -236,6 +237,12 @@ def test_momentum_entry_also_blocked_while_delayed():
 
 
 if __name__ == "__main__":
+    # Point state files at a throwaway tmpdir BEFORE any test runs. conftest.py
+    # does this under pytest; this block is the only thing standing between a
+    # direct `python3 test_exit_state.py` and the live data/ files.
+    _tmpdir = tempfile.mkdtemp(prefix="exit_state_test_")
+    strategy._STOPS_PATH       = os.path.join(_tmpdir, "stop_prices.json")
+    strategy._MOM_ENTRIES_PATH = os.path.join(_tmpdir, "momentum_entries.json")
     _orig = {
         "place": strategy.tc.place_equity_order,
         "hist":  strategy.tc.get_historical,

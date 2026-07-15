@@ -12,6 +12,7 @@ Run:  python3 test_stops.py
 import os
 import tempfile
 
+import _testlib
 import strategy
 
 # ── Test doubles ──────────────────────────────────────────────────────────────
@@ -36,8 +37,7 @@ def _reset(quote_price=None):
     strategy._signaled_sell_today.clear()
     strategy.tc.place_equity_order = _fake_place
     strategy.tc.get_quote = _fake_quote(quote_price)
-    if os.path.exists(strategy._STOPS_PATH):
-        os.remove(strategy._STOPS_PATH)
+    _testlib.safe_remove(strategy._STOPS_PATH)
 
 
 # ── Bootstrap ─────────────────────────────────────────────────────────────────
@@ -262,7 +262,9 @@ def test_save_load_roundtrip():
 
 def test_load_corrupt_file_degrades_to_empty():
     _reset()
-    with open(strategy._STOPS_PATH, "w") as f:
+    # Guarded like the deletes: writing this to the live file would corrupt real
+    # stops just as thoroughly as removing it.
+    with open(_testlib.assert_disposable(strategy._STOPS_PATH), "w") as f:
         f.write("{not valid json")
     assert strategy._load_stops() == {}, "corrupt file -> empty, no crash"
 
