@@ -38,6 +38,7 @@ def _reset():
     strategy._short_entries = 0
     strategy._short_covers = 0
     strategy._entries_delayed = 0
+    strategy._latches_reconstructed = 0
     strategy._signaled_buy_today.clear()
     strategy._signaled_sell_today.clear()
     # These tests exercise SIGNAL logic, not the clock: pin the entry gate open
@@ -254,7 +255,7 @@ def test_reconcile_momentum_prunes_unlisted():
     strategy._save_json(strategy._MOM_ENTRIES_PATH, {
         "DAL": {"generation": "G1", "entered": "d"},
         "OLD": {"generation": "G1", "entered": "d"}})
-    strategy.reconcile_momentum_entries(["DAL", "DDOG"])
+    strategy.reconcile_momentum_entries(["DAL", "DDOG"], [], "G1")
     entries = strategy._load_json(strategy._MOM_ENTRIES_PATH)
     assert "DAL" in entries, entries
     assert "OLD" not in entries, "name no longer in slot pruned"
@@ -264,9 +265,94 @@ def test_reconcile_empty_slot_guard():
     _reset()
     strategy._save_json(strategy._MOM_ENTRIES_PATH,
                         {"DAL": {"generation": "G1", "entered": "d"}})
-    strategy.reconcile_momentum_entries([])                     # screen failed -> []
+    strategy.reconcile_momentum_entries([], [], "G1")           # screen failed -> []
     assert "DAL" in strategy._load_json(strategy._MOM_ENTRIES_PATH), \
         "empty slot must not prune latches"
+
+
+# ── Latch reconstruction (the 2026-07-16 CRL/LII doubling) ───────────────────
+# A held momentum name with no latch record means the record was LOST (the test
+# wipe of 07-15), not never written. Broker positions are the authority — the
+# stop file is not, because the same _reset() deletes both.
+
+def _held(symbol, qty=440):
+    return [{"symbol": symbol, "quantity": qty, "cost_basis": 1000.0}]
+
+
+def test_reconstruct_latch_for_held_name_with_no_record():
+    _reset()
+    strategy._save_json(strategy._MOM_ENTRIES_PATH, {})          # wiped
+    strategy.reconcile_momentum_entries(["CRL"], _held("CRL"), "G1")
+    rec = strategy._load_json(strategy._MOM_ENTRIES_PATH).get("CRL")
+    assert rec, "held momentum name with no latch must be reconstructed"
+    assert rec["generation"] == "G1", rec
+    assert rec.get("reconstructed") is True, "reconstructed records are marked"
+    assert strategy._latches_reconstructed == 1, "counter incremented"
+
+
+def test_reconstructed_latch_blocks_the_re_entry():
+    """End-to-end: the exact 07-16 scenario. Wiped latch + a positions fetch that
+    wrongly reads flat = the double entry. With reconcile run first, the latch is
+    back and the entry is blocked."""
+    _reset(); _set_sig(rsi=63.1)                                 # CRL's RSI that day
+    strategy._save_json(strategy._MOM_ENTRIES_PATH, {})          # latch wiped 07-15
+    strategy.reconcile_momentum_entries(["CRL"], _held("CRL", 219), "G1")
+    # The 503: positions read as [] -> held == 0 -> "flat".
+    strategy.evaluate_stock("CRL", "ACCT", [], 998905.0,
+                            is_momentum=True, momentum_generation="G1")
+    assert _buys() == [], "reconstructed latch must block the 503 re-entry"
+
+
+def test_reconstruct_does_not_overwrite_older_generation():
+    """A name held from rotation G1 into G2 keeps its G1 latch: the shot for G2 is
+    legitimately unused (the latch re-arms per rotation), and stamping it G2 would
+    silently consume a re-entry the strategy is entitled to after a stop-out."""
+    _reset()
+    strategy._save_json(strategy._MOM_ENTRIES_PATH,
+                        {"CRL": {"generation": "G1", "entered": "d"}})
+    strategy.reconcile_momentum_entries(["CRL"], _held("CRL"), "G2")
+    rec = strategy._load_json(strategy._MOM_ENTRIES_PATH)["CRL"]
+    assert rec["generation"] == "G1", "existing record must not be overwritten"
+    assert "reconstructed" not in rec, rec
+    assert strategy._latches_reconstructed == 0, "nothing was reconstructed"
+
+
+def test_no_reconstruct_when_not_held():
+    _reset()
+    strategy._save_json(strategy._MOM_ENTRIES_PATH, {})
+    strategy.reconcile_momentum_entries(["CRL"], [], "G1")       # in slot, not held
+    assert strategy._load_json(strategy._MOM_ENTRIES_PATH) == {}, \
+        "a name we don't hold has no entry to latch"
+    assert strategy._latches_reconstructed == 0
+
+
+def test_no_reconstruct_for_zero_quantity_position():
+    _reset()
+    strategy._save_json(strategy._MOM_ENTRIES_PATH, {})
+    strategy.reconcile_momentum_entries(["CRL"], _held("CRL", 0), "G1")
+    assert strategy._load_json(strategy._MOM_ENTRIES_PATH) == {}, \
+        "a closed (qty=0) position is not held"
+
+
+def test_no_reconstruct_for_held_name_outside_slot():
+    """Held but not in the momentum slot (e.g. a core name): the alignment path
+    never applies to it, so it has no latch to rebuild."""
+    _reset()
+    strategy._save_json(strategy._MOM_ENTRIES_PATH, {})
+    strategy.reconcile_momentum_entries(["CRL"], _held("AAPL"), "G1")
+    assert strategy._load_json(strategy._MOM_ENTRIES_PATH) == {}, \
+        "only momentum-slot names get latches"
+
+
+def test_reconstruct_and_prune_in_one_pass():
+    """Both directions at once, single write."""
+    _reset()
+    strategy._save_json(strategy._MOM_ENTRIES_PATH,
+                        {"OLD": {"generation": "G1", "entered": "d"}})
+    strategy.reconcile_momentum_entries(["CRL"], _held("CRL"), "G1")
+    entries = strategy._load_json(strategy._MOM_ENTRIES_PATH)
+    assert "OLD" not in entries, "pruned"
+    assert entries["CRL"]["reconstructed"] is True, "reconstructed"
 
 
 if __name__ == "__main__":

@@ -224,7 +224,21 @@ def get_futures_account_id() -> Optional[str]:
     return _find_account_id(_is_futures)
 
 
-def get_positions(account_id: str) -> list[dict]:
+def get_positions(account_id: str) -> Optional[list[dict]]:
+    """Open positions for an account, or None if the fetch FAILED.
+
+    None and [] are NOT interchangeable and callers must not conflate them:
+      []   — the request succeeded; the account genuinely holds nothing.
+      None — we do not know what the account holds.
+
+    This returned [] on error until 2026-07-16, when a 503 on the positions
+    endpoint made every symbol read as held=0 for one cycle. `held == 0` is the
+    precondition for BOTH entry paths, so the bot re-entered CRL and LII on top
+    of positions it already had (10% of equity each, double the 5% target). The
+    same read would have let _enter_short open a SELLSHORT on a name held long,
+    had the outage landed on a death-cross bar instead of two minutes earlier.
+    "I can't see the account" must never be indistinguishable from "the account
+    is flat"."""
     try:
         data = _get(f"brokerage/accounts/{account_id}/positions")
         out = []
@@ -240,7 +254,7 @@ def get_positions(account_id: str) -> list[dict]:
         return out
     except Exception as exc:
         logger.error("Positions fetch failed: %s", exc)
-        return []
+        return None
 
 
 def get_account_balance(account_id: str) -> Optional[dict]:

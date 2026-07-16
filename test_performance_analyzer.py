@@ -10,6 +10,7 @@ Run:  python3 test_performance_analyzer.py
 
 import sys
 
+import config
 import performance_analyzer as pa
 
 
@@ -28,9 +29,9 @@ def _ev(ts, action, symbol, qty, price, notes="", order_id=None, estimated=False
     }
 
 
-def _closed(feature, pnl, symbol="X", win=None):
+def _closed(feature, pnl, symbol="X", win=None, exit_reason="signal"):
     return {"feature": feature, "pnl": pnl, "symbol": symbol,
-            "win": (pnl > 0) if win is None else win}
+            "win": (pnl > 0) if win is None else win, "exit_reason": exit_reason}
 
 
 # ── Classification ────────────────────────────────────────────────────────────
@@ -171,6 +172,77 @@ def test_aggregate_stats():
 
 
 # ── Warnings (only >=10 trades AND negative) ─────────────────────────────────
+
+# ── Correction exits (the 2026-07-16 CRL/LII trim) ───────────────────────────
+# A correction is an exit the STRATEGY never signalled — a hand-placed repair of
+# a bug's damage. It must be identifiable and must not be scored against the
+# entry's feature.
+
+def test_exit_reason_correction():
+    note = f"trim — {config.CORRECTION_NOTE_MARKER} (503 re-entry)"
+    assert pa._exit_reason(note) == "correction", note
+
+
+def test_exit_reason_stop_and_signal_unchanged():
+    """Regression: the existing two reasons still classify."""
+    assert pa._exit_reason("trailing stop hit @ 207.82") == "stop"
+    assert pa._exit_reason("EMA bearish, RSI=49.0") == "signal"
+    assert pa._exit_reason(None) == "signal"
+    assert pa._exit_reason("") == "signal"
+
+
+def test_correction_wins_over_stop_marker():
+    """A correction stays a correction even if the note also mentions a stop —
+    checked first, deliberately."""
+    assert pa._exit_reason(
+        f"trailing stop — {config.CORRECTION_NOTE_MARKER}") == "correction"
+
+
+def test_trim_script_note_matches_the_marker():
+    """Cross-program contract: the trim script WRITES the note and the analyzer
+    READS it, in different processes. If they drift, the trim is silently scored
+    as a real momentum_alignment exit — the exact thing the marker prevents."""
+    import trim_duplicate_entries as trim
+    assert pa._exit_reason(trim.NOTE) == "correction", trim.NOTE
+
+
+def test_aggregate_excludes_correction_trips():
+    """`feature` is attributed from the ENTRY, so without this the trim would be
+    scored against momentum_alignment — a trade the strategy never chose."""
+    closed = [
+        _closed("momentum_alignment", 100.0),
+        _closed("momentum_alignment", 100.0),
+        _closed("momentum_alignment", -5000.0, exit_reason="correction"),
+    ]
+    agg = pa._aggregate(closed)
+    a = agg["momentum_alignment"]
+    assert a["count"] == 2, f"correction must not be counted: {a}"
+    assert a["total_pnl"] == 200.0, f"correction P&L must not land in stats: {a}"
+    assert a["win_rate"] == 1.0, f"correction must not move win rate: {a}"
+
+
+def test_correction_only_feature_reports_zero_not_crash():
+    """A feature whose ONLY trip is a correction has no data — not a divide-by-zero
+    on an empty list."""
+    agg = pa._aggregate([_closed("short", 10.0, exit_reason="correction")])
+    assert agg["short"] == {"count": 0}, agg
+
+
+def test_pair_round_trip_tags_correction_end_to_end():
+    """Through the real pairing path: entry + a correction exit."""
+    events = [
+        _ev("2026-07-15 10:00:00 EDT", "BUY", "CRL", 219, 227.29,
+            notes="momentum alignment entry, RSI=63.1"),
+        _ev("2026-07-17 09:30:00 EDT", "SELL", "CRL", 219, 229.00,
+            notes=f"trim — {config.CORRECTION_NOTE_MARKER} (503 re-entry)"),
+    ]
+    closed, orphans, open_entries = pa._pair_round_trips(events)
+    assert len(closed) == 1, closed
+    assert closed[0]["exit_reason"] == "correction", closed[0]
+    assert closed[0]["feature"] == "momentum_alignment", \
+        "the ENTRY still carries its feature; the exclusion happens in _aggregate"
+    assert not orphans and not open_entries
+
 
 def test_warn_negative_over_threshold():
     trips = [_closed("short", -5.0, f"S{i}") for i in range(10)]

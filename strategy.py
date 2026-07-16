@@ -205,6 +205,7 @@ _entries_delayed = 0
 _momentum_align_entries = 0
 _short_entries = 0
 _short_covers = 0
+_latches_reconstructed = 0
 
 
 def _load_json(path: str) -> dict:
@@ -466,19 +467,67 @@ def _record_momentum_entry(symbol: str, generation: str) -> None:
     _save_json(_MOM_ENTRIES_PATH, entries)
 
 
-def reconcile_momentum_entries(momentum_symbols) -> None:
-    """Prune latch records for names no longer in the momentum slot. Once per
-    cycle. Guarded on an empty slot (screen failure returns []) so a blip can't
-    wipe latches — mirrors reconcile_stops."""
+def reconcile_momentum_entries(momentum_symbols, positions: list[dict],
+                               generation: str) -> None:
+    """Reconcile the latch file against the slot and the broker, once per cycle.
+
+    Two directions:
+      PRUNE       — drop latches for names no longer in the momentum slot.
+      RECONSTRUCT — re-create a missing latch for a momentum name we HOLD.
+
+    Reconstruct exists because the latch file is deletable out from under a
+    running bot: test_exit_state.py's _reset() os.remove()d the live file twice
+    (fixed in f08931f), and on 2026-07-15 that wipe plus a 503 the next day cost
+    us double-sized CRL and LII. A held momentum name with no latch is proof we
+    entered it — the record was lost, not never written.
+
+    `positions` is the authority, deliberately NOT stop_prices.json: the same
+    _reset() deletes BOTH files, so the stop records are empty in exactly the
+    scenario this defends against (the bootstrapped=true flags on AAPL/AMZN/META/
+    NVDA are the scar). The broker is the only witness that survives.
+
+    Per-cycle rather than at startup, also deliberately: the 07-15 wipe landed
+    ~27 minutes AFTER the last process start, and the bot then ran unrestarted
+    through the 07-16 doubling. A startup-only check would have slept through it.
+
+    Guarded on an empty slot (screen failure returns []) so a blip can't wipe
+    latches — mirrors reconcile_stops."""
+    global _latches_reconstructed
+
     if not momentum_symbols:
         return
     current = set(momentum_symbols)
     entries = _load_json(_MOM_ENTRIES_PATH)
+    dirty = False
+
     stale = [s for s in entries if s not in current]
     for s in stale:
         del entries[s]
+        dirty = True
         logger.info("MOMENTUM LATCH PRUNE %s: no longer in slot — dropping latch", s)
-    if stale:
+
+    # Reconstruct ONLY where there is no record at all. An existing record with an
+    # older generation is meaningful and must not be overwritten: a name held from
+    # rotation N-1 into rotation N legitimately has an unused shot for N (the latch
+    # re-arms per rotation), and stamping it with N would silently consume a
+    # re-entry the strategy is entitled to after a stop-out. Reconstructed records
+    # take the CURRENT generation, which is mildly conservative in the other
+    # direction — a stop-out during recovery won't re-buy this rotation — and only
+    # ever applies to state we already know is corrupt.
+    held = {p.get("symbol") for p in positions
+            if int(p.get("quantity", 0)) != 0 and p.get("symbol") in current}
+    for s in sorted(held - set(entries)):
+        entries[s] = {"generation": generation, "entered": date.today().isoformat(),
+                      "reconstructed": True}
+        dirty = True
+        _latches_reconstructed += 1
+        logger.warning(
+            "MOMENTUM LATCH RECONSTRUCTED %s (gen=%s) — held with no latch record; "
+            "the latch was lost, not unwritten. Blocking re-entry this rotation "
+            "(latches reconstructed #%d)",
+            s, generation or "<none>", _latches_reconstructed)
+
+    if dirty:
         _save_json(_MOM_ENTRIES_PATH, entries)
 
 

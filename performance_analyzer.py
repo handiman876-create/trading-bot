@@ -271,6 +271,23 @@ def _pnl_pct(direction: str, entry_price: float, exit_price: float) -> float | N
     return (exit_price - entry_price) / entry_price
 
 
+def _exit_reason(notes: str) -> str:
+    """Why a position was closed, from the exit's notes.
+
+      correction — a hand-placed repair of a bug's damage; the strategy never
+                   signalled it. Checked FIRST: a correction is a correction
+                   regardless of what else the note says.
+      stop       — the trailing stop fired.
+      signal     — the strategy's own exit logic.
+    """
+    n = (notes or "").lower()
+    if config.CORRECTION_NOTE_MARKER.lower() in n:
+        return "correction"
+    if "trailing stop" in n:
+        return "stop"
+    return "signal"
+
+
 def _pair_round_trips(events: list):
     """FIFO-pair entries and exits per (symbol, direction). An exit closes the
     OLDEST open entry of the same symbol+direction. Returns
@@ -307,8 +324,7 @@ def _pair_round_trips(events: list):
                 "exit_order_id":   ev.get("order_id"),
                 "exit_ts":         ev.get("timestamp"),
                 "exit_price":      exit_price,
-                "exit_reason":     "stop" if "trailing stop" in (ev.get("notes") or "").lower()
-                                   else "signal",
+                "exit_reason":     _exit_reason(ev.get("notes")),
                 "pnl":             round(pnl, 2),
                 "pnl_pct":         _pnl_pct(direction, entry_price, exit_price),
                 "win":             pnl > 0,
@@ -320,10 +336,18 @@ def _pair_round_trips(events: list):
 # ── Aggregation ───────────────────────────────────────────────────────────────
 
 def _aggregate(closed_trips: list) -> dict:
-    """Per-feature stats: count, win_rate, avg_pnl, total_pnl, best, worst."""
+    """Per-feature stats: count, win_rate, avg_pnl, total_pnl, best, worst.
+
+    Correction exits are EXCLUDED. `feature` is attributed from the ENTRY, so a
+    hand-placed repair would otherwise be scored against whichever strategy
+    feature opened the position — crediting or blaming it for a trade it never
+    chose. The samples here are small enough that one artificial round trip
+    visibly moves a feature's win rate. The excluded count is surfaced in Data
+    Quality rather than dropped silently."""
     agg = {}
     for feat in FEATURES:
-        trips = [t for t in closed_trips if t["feature"] == feat]
+        trips = [t for t in closed_trips
+                 if t["feature"] == feat and t.get("exit_reason") != "correction"]
         if not trips:
             agg[feat] = {"count": 0}
             continue
@@ -509,6 +533,8 @@ def build_report(ledger: dict, stops: dict, data_quality: dict) -> dict:
     est_open   = sum(1 for e in open_entries if e.get("estimated_entry"))
 
     data_quality.update({
+        "correction_trips_excluded":    sum(1 for t in closed
+                                            if t.get("exit_reason") == "correction"),
         "estimated_entry_trips_closed": est_closed,
         "estimated_entry_open":         est_open,
         "orphan_exits_missing_entry":   [
@@ -603,6 +629,9 @@ def render_txt(report: dict) -> str:
         L.append(f"      - {e}")
     L.append(f"  estimated (bootstrapped) entries: {dq['estimated_entry_trips_closed']} closed, "
              f"{dq['estimated_entry_open']} open")
+    L.append(f"  correction trips excluded from per-feature stats: "
+             f"{dq.get('correction_trips_excluded', 0)} "
+             f"(hand-placed repairs; not strategy decisions)")
     L.append(f"  pre-analyzer entries excluded (>{STALE_OPEN_DAYS}d): "
              f"{dq.get('stale_pre_analyzer_entries', 0)}")
     L.append(f"  exits missing an entry (orphans): {len(dq['orphan_exits_missing_entry'])}")

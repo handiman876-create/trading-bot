@@ -200,3 +200,16 @@ LOG_DIR        = "logs"
 APP_LOG_FILE   = f"logs/{_LOG_PREFIX}bot.log"
 TRADE_LOG_FILE = f"logs/{_LOG_PREFIX}trades.log"
 PERF_LOG_FILE  = f"logs/{_LOG_PREFIX}performance.log"
+
+# ── Trade-note markers ────────────────────────────────────────────────────────
+# The analyzer classifies exits by pattern-matching the free-text `notes` field
+# of a trade record. That couples a writer (whoever places the order) to a reader
+# (performance_analyzer) across process boundaries, so the marker lives here
+# rather than as a literal at either end — a drifted string would silently
+# reclassify trades instead of failing.
+#
+# CORRECTION: an exit the STRATEGY never signalled — placed by hand to repair a
+# bug's damage. Excluded from per-feature stats: attributing it to the entry's
+# feature would score the strategy on a trade it did not choose. First use was
+# the 2026-07-16 CRL/LII trim, unwinding a 503-induced double entry.
+CORRECTION_NOTE_MARKER = "duplicate-entry correction"

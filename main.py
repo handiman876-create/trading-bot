@@ -51,6 +51,18 @@ logger = logging.getLogger("bot")
 
 _shutdown = threading.Event()
 
+# Cycles abandoned because the positions fetch failed (see _run_cycle). Counted
+# so the banner can report whether the guard is still firing; _consecutive is
+# tracked separately because a sustained outage is a different problem from an
+# isolated blip and should be louder.
+_positions_fetch_failures = 0
+_positions_fetch_consecutive = 0
+
+# Consecutive skips before the log escalates WARNING -> ERROR. At a 60s poll,
+# 3 skips is ~3 minutes with no stop enforcement (stops are bot-managed, so an
+# outage suspends them entirely — the same hole as the overnight gap).
+_POSITIONS_FAILURE_ESCALATE_AFTER = 3
+
 # Per-mode clock, account getter and singleton lock so an equities instance and a
 # futures instance can run as independent processes.
 _clock       = fmh if MODE == "futures" else mh
@@ -90,8 +102,34 @@ def _handle_signal(signum, frame):
 
 
 def _run_cycle(account_id: str) -> None:
-    """One evaluation pass over the active watchlist."""
+    """One evaluation pass over the active watchlist.
+
+    Abandons the cycle outright when the positions fetch fails. Everything below
+    is derived from `positions` — held quantity, stop trailing, the effective
+    watchlist, the performance snapshot — so a failed fetch invalidates the whole
+    pass, not just the entry paths. Skipping costs one poll and loses nothing:
+    with holdings unknown every symbol reads held=0, and no exit or stop check
+    can fire on held=0 anyway (that is already true today). What it prevents is
+    the entry paths reading held=0 as "flat" and re-entering held positions."""
+    global _positions_fetch_failures, _positions_fetch_consecutive
+
     positions = tc.get_positions(account_id)
+    if positions is None:                     # None = fetch failed; [] = truly flat
+        _positions_fetch_failures += 1
+        _positions_fetch_consecutive += 1
+        escalate = _positions_fetch_consecutive >= _POSITIONS_FAILURE_ESCALATE_AFTER
+        logger.log(
+            logging.ERROR if escalate else logging.WARNING,
+            "Skipping cycle — positions fetch failed; holdings UNKNOWN, not flat. "
+            "No entries, exits or stop checks this pass (%d consecutive, "
+            "skipped cycles #%d)%s",
+            _positions_fetch_consecutive, _positions_fetch_failures,
+            " — SUSTAINED OUTAGE: stops are unenforced while this persists."
+            if escalate else "",
+        )
+        return
+    _positions_fetch_consecutive = 0
+
     balance   = tc.get_account_balance(account_id)
     equity    = balance.get("total_equity") if balance else None
     log_performance(account_id, balance, positions)
@@ -114,7 +152,7 @@ def _run_cycle(account_id: str) -> None:
     # one-shot alignment entry; generation re-arms the latch each new rotation.
     momentum_symbols, generation = watchlist.momentum_slot()
     momentum_set = set(momentum_symbols)
-    strategy.reconcile_momentum_entries(momentum_symbols)
+    strategy.reconcile_momentum_entries(momentum_symbols, positions, generation)
 
     for symbol in watchlist.effective_stock_watchlist(positions):
         try:
@@ -188,6 +226,9 @@ def main() -> None:
         logger.info("Mom. align  : %s (one-shot/rotation, RSI<%d, file=%s)",
                     "ENABLED" if config.USE_MOMENTUM_ALIGNMENT else "DISABLED",
                     config.MOMENTUM_ALIGN_RSI_MAX, config.MOMENTUM_ENTRY_FILE)
+        logger.info("Latch repair: ON — a held momentum name with no latch is "
+                    "rebuilt each cycle from BROKER POSITIONS (not stop records: "
+                    "the same wipe takes both)")
         logger.info("Shorting    : %s (SELLSHORT/BUYTOCOVER, core names only, death-cross entries)",
                     "ENABLED" if config.ENABLE_SHORTING else "DISABLED")
         try:
@@ -208,6 +249,10 @@ def main() -> None:
                 "exits + stops live from the open)",
                 config.CROSS_ENTRY_DELAY_MINUTES,
                 "CME 18:00 ET" if MODE == "futures" else "9:30 ET")
+    logger.info("Pos. guard  : a FAILED positions fetch skips the whole cycle "
+                "(unknown != flat); ERROR after %d consecutive — stops are "
+                "unenforced during an outage",
+                _POSITIONS_FAILURE_ESCALATE_AFTER)
     logger.info("=" * 60)
 
     if not (config.TS_CLIENT_ID and config.TS_CLIENT_SECRET and config.TS_REFRESH_TOKEN):
