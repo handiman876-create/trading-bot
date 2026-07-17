@@ -18,6 +18,7 @@ import json
 import logging
 import math
 import os
+import time
 from datetime import date
 from typing import Optional
 
@@ -206,6 +207,7 @@ _momentum_align_entries = 0
 _short_entries = 0
 _short_covers = 0
 _latches_reconstructed = 0
+_crisis_exits = 0
 
 
 def _load_json(path: str) -> dict:
@@ -378,7 +380,8 @@ def reconcile_stops(positions: list[dict]) -> None:
 
 
 def _check_and_trail_stop(symbol: str, held: int, sig: dict,
-                          account_id: str, positions: list[dict]) -> bool:
+                          account_id: str, positions: list[dict],
+                          regime: str = "risk_on") -> bool:
     """Update the trailing stop for a held position and exit if breached.
 
     Returns True iff a stop-exit order was placed (caller then returns, skipping
@@ -398,12 +401,32 @@ def _check_and_trail_stop(symbol: str, held: int, sig: dict,
     stops[symbol] = rec               # ensure present (bootstrap path)
 
     direction = rec.get("direction", "long")   # legacy records (no key) are longs
-    mult_atr = config.STOP_LOSS_ATR_MULT * rec["atr_at_entry"]
+    entry = rec.get("entry_price")
+
+    # VIX regime stop adjustments — both hold the monotonic ratchet (they only ever
+    # move a stop favorably, never loosen it) and both are IMMEDIATE: this runs every
+    # cycle for every held position, BEFORE the entry gate, so a mid-day VIX spike
+    # re-stops open positions on the next poll rather than waiting for a new entry.
+    #   defensive → tighten the trail to 1.5x ATR (vs 2.5x) on a >3% loser
+    #   crisis    → floor the stop at breakeven (entry), applied per-branch below
+    mult = config.STOP_LOSS_ATR_MULT
+    if regime == "defensive" and entry:
+        drawdown = ((price - entry) / entry) if direction == "short" \
+                   else ((entry - price) / entry)
+        if drawdown > config.VIX_DEFENSIVE_DRAWDOWN:
+            mult = config.VIX_DEFENSIVE_ATR_MULT
+            logger.info("DEFENSIVE stop tighten %s: down %.1f%% -> %.1fx ATR",
+                        symbol, drawdown * 100, mult)
+    mult_atr = mult * rec["atr_at_entry"]
+    # Crisis breakeven floor is armed-only (shadow logs the regime, changes nothing).
+    crisis_floor = (regime == "crisis" and not config.VIX_CRISIS_SHADOW and bool(entry))
 
     if direction == "short":
         # Ratchet DOWN: low-water and stop only ever fall — never raise the stop.
         rec["low_water"] = round(min(rec["low_water"], price), 4)
         new_stop = rec["low_water"] + mult_atr
+        if crisis_floor:
+            new_stop = min(new_stop, entry)      # crisis: cap short stop at breakeven
         rec["stop_price"] = round(min(rec["stop_price"], new_stop), 4)
         water = rec["low_water"]
         breached = price >= rec["stop_price"]     # price rose into the stop
@@ -413,6 +436,8 @@ def _check_and_trail_stop(symbol: str, held: int, sig: dict,
         # Ratchet UP: high-water and stop only ever rise — never lower the stop.
         rec["high_water"] = round(max(rec["high_water"], price), 4)
         new_stop = rec["high_water"] - mult_atr
+        if crisis_floor:
+            new_stop = max(new_stop, entry)      # crisis: floor long stop at breakeven
         rec["stop_price"] = round(max(rec["stop_price"], new_stop), 4)
         water = rec["high_water"]
         breached = price <= rec["stop_price"]     # price fell into the stop
@@ -594,10 +619,97 @@ def _enter_short(symbol: str, sig: dict, price: float, account_id: str,
     return False
 
 
+# ── VIX fear gauge / market regime ────────────────────────────────────────────
+# One VIX quote drives a market-wide regime that gates entries (equities AND
+# futures) and, at the extreme, tightens stops and de-risks the momentum slot.
+# _get_market_regime is a PURE mapping (unit-tested at every boundary);
+# current_regime wraps it with a 5-minute cache and a fail-OPEN path; note_regime
+# does per-cycle logging (level, transitions, mode line) and counting.
+_REGIMES = ("risk_on", "cautious", "defensive", "crisis", "unknown")
+_regime_counts = {r: 0 for r in _REGIMES}
+_vix_cache = {"ts": None, "vix": None, "regime": "risk_on"}
+_last_logged_regime = None            # drives REGIME TRANSITION logging
+
+
+def _get_market_regime(vix: Optional[float]) -> str:
+    """Pure VIX → regime. Constants mark the CEILING of their namesake regime, so
+    the original boundaries hold: risk_on <20, cautious 20-25, defensive 25-30,
+    crisis >=30. vix=None → 'unknown' (caller fails open to risk_on)."""
+    if vix is None:
+        return "unknown"
+    if vix >= config.VIX_DEFENSIVE:        # >= 30
+        return "crisis"
+    if vix >= config.VIX_CAUTIOUS:         # >= 25
+        return "defensive"
+    if vix >= config.VIX_NORMAL:           # >= 20
+        return "cautious"
+    return "risk_on"
+
+
+def _is_extreme(vix: Optional[float]) -> bool:
+    """True at/above the EXTREME sub-tier of crisis (VIX_CRISIS, 35)."""
+    return vix is not None and vix >= config.VIX_CRISIS
+
+
+def _apply_regime_rules(regime: str):
+    """Map a regime to entry gates: (block_new_entries, block_momentum_align).
+    Centralized so evaluate_stock and evaluate_future read identical logic and a
+    rule change lands in exactly one place."""
+    block_new_entries    = regime in ("defensive", "crisis")
+    block_momentum_align = regime in ("cautious", "defensive", "crisis")
+    return block_new_entries, block_momentum_align
+
+
+def current_regime(now: Optional[float] = None):
+    """(vix, regime) for this cycle, refetching config.VIX_SYMBOL at most every
+    VIX_CACHE_SECONDS.  Fail-OPEN: a failed/absent quote yields 'unknown', which
+    every gate treats as risk_on — a VIX data glitch never blocks trading or
+    liquidates.  ENABLE_VIX_FILTER False forces (None, 'risk_on').  `now` is
+    injectable for tests."""
+    if not config.ENABLE_VIX_FILTER:
+        return None, "risk_on"
+    t = now if now is not None else time.time()
+    ts = _vix_cache["ts"]
+    if ts is not None and (t - ts) < config.VIX_CACHE_SECONDS:
+        return _vix_cache["vix"], _vix_cache["regime"]
+    vix = tc.get_vix_level()
+    regime = _get_market_regime(vix)
+    if vix is None:
+        logger.warning("VIX unavailable — regime unknown; failing OPEN (risk_on "
+                       "gating this cycle)")
+    _vix_cache.update({"ts": t, "vix": vix, "regime": regime})
+    return vix, regime
+
+
+def note_regime(vix: Optional[float], regime: str) -> None:
+    """Per-cycle bookkeeping — call once per cycle from the run loop when the
+    filter is enabled. Counts the regime, logs the level, flags transitions, and
+    emits the human-readable mode line for the entry-gating regimes."""
+    global _last_logged_regime
+    _regime_counts[regime if regime in _regime_counts else "unknown"] += 1
+    vtxt = f"{vix:.1f}" if isinstance(vix, (int, float)) else "n/a"
+    extreme = " EXTREME" if _is_extreme(vix) else ""
+    if _last_logged_regime is not None and regime != _last_logged_regime:
+        logger.warning("REGIME TRANSITION %s -> %s (VIX=%s%s)",
+                       _last_logged_regime, regime, vtxt, extreme)
+    logger.info("VIX=%s regime=%s%s", vtxt, regime, extreme)
+    if regime == "cautious":
+        logger.info("CAUTIOUS MODE - skipping momentum alignment (VIX=%s)", vtxt)
+    elif regime == "defensive":
+        logger.info("DEFENSIVE MODE - no new entries (VIX=%s)", vtxt)
+    elif regime == "crisis":
+        logger.warning("CRISIS MODE%s [%s] - no entries; de-risking momentum slot; "
+                       "stops -> breakeven (VIX=%s)", extreme,
+                       "SHADOW" if config.VIX_CRISIS_SHADOW else "LIVE", vtxt)
+    _last_logged_regime = regime
+
+
 def evaluate_stock(symbol: str, account_id: str, positions: list[dict],
                    equity: Optional[float],
-                   is_momentum: bool = False, momentum_generation: str = "") -> None:
+                   is_momentum: bool = False, momentum_generation: str = "",
+                   regime: str = "risk_on") -> None:
     global _momentum_align_entries, _short_entries, _short_covers, _entries_delayed
+    global _crisis_exits
 
     history = tc.get_historical(symbol, days=90)
     if not history:
@@ -629,8 +741,32 @@ def evaluate_stock(symbol: str, account_id: str, positions: list[dict],
     # position opened today can still stop out the same day. held != 0 covers both
     # longs (stop below) and shorts (stop above).
     if held != 0 and config.USE_TRAILING_STOP:
-        if _check_and_trail_stop(symbol, held, sig, account_id, positions):
+        if _check_and_trail_stop(symbol, held, sig, account_id, positions, regime):
             return                      # stop fired — exited, skip signal logic
+
+    # CRISIS de-risk — force-exit a held momentum-slot name through the SAME SELL
+    # path as a normal state exit, regardless of EMA state (the momentum slot is
+    # the highest-risk bucket in a panic). Core names are kept; their stops move to
+    # breakeven in _check_and_trail_stop above. Shadow only LOGS and falls through,
+    # so normal signals still apply; armed sells and returns.
+    if (regime == "crisis" and is_momentum and held > 0
+            and not _already_sold_today(symbol)):
+        if config.VIX_CRISIS_SHADOW:
+            logger.warning("CRISIS would SELL momentum %s x%d (shadow — normal "
+                           "signals still apply)", symbol, held)
+        else:
+            logger.warning("CRISIS de-risk SELL %s x%d", symbol, held)
+            result = tc.place_equity_order(account_id, symbol, "sell", held)
+            if result:
+                _crisis_exits += 1
+                _mark_sold(symbol)
+                order_id = result.get("order", {}).get("id")
+                log_trade("SELL", symbol, held, price, "market", order_id,
+                          "VIX crisis de-risk")
+                _clear_stop(symbol)
+            else:
+                logger.error("CRISIS SELL %s FAILED — retry next cycle", symbol)
+            return
 
     # ── EXITS ─────────────────────────────────────────────────────────────────
     # Evaluated BEFORE the entry gate, and on state rather than an edge, so a
@@ -684,8 +820,15 @@ def evaluate_stock(symbol: str, account_id: str, positions: list[dict],
     if _already_bought_today(symbol) or _already_sold_today(symbol):
         return
 
+    # VIX regime entry gates (centralized in _apply_regime_rules). Exits and stops
+    # above are deliberately ungated — de-risking is always allowed; only ENTRIES
+    # are throttled by fear. cautious blocks only momentum-alignment; defensive and
+    # crisis block every new entry (fresh-cross longs, alignment, and shorts).
+    block_new_entries, block_momentum_align = _apply_regime_rules(regime)
+
     # BUY signal — fresh EMA cross (all symbols)
-    if sig["bullish_cross"] and sig["rsi"] < config.RSI_OVERBOUGHT and held == 0:
+    if (sig["bullish_cross"] and sig["rsi"] < config.RSI_OVERBOUGHT and held == 0
+            and not block_new_entries):
         _enter_long(symbol, sig, price, account_id, positions, equity,
                     reason=f"EMA cross up, RSI={sig['rsi']:.1f}")
 
@@ -695,7 +838,8 @@ def evaluate_stock(symbol: str, account_id: str, positions: list[dict],
     # the screen added them. The latch is consumed only on a *placed* order, so a
     # MAX_POSITIONS block — or the entry delay above — leaves the shot available
     # to retry once the bar has formed.
-    elif (is_momentum and held == 0 and config.USE_MOMENTUM_ALIGNMENT
+    elif (is_momentum and held == 0 and not block_momentum_align
+          and config.USE_MOMENTUM_ALIGNMENT
           and sig["ema_short"] > sig["ema_long"]
           and config.MOMENTUM_ALIGN_RSI_MIN <= sig["rsi"] <= config.MOMENTUM_ALIGN_RSI_MAX
           and not _momentum_entry_taken(symbol, momentum_generation)):
@@ -710,7 +854,7 @@ def evaluate_stock(symbol: str, account_id: str, positions: list[dict],
     # long-only). Mirrors the long BUY: same RSI gate, same held==0 requirement.
     # Stays EDGE-based: it is an entry. On state it would re-short every poll.
     elif (sig["bearish_cross"] and sig["rsi"] > config.RSI_OVERSOLD and held == 0
-          and not is_momentum and config.ENABLE_SHORTING):
+          and not is_momentum and config.ENABLE_SHORTING and not block_new_entries):
         if _enter_short(symbol, sig, price, account_id, positions, equity,
                         reason=f"EMA cross down (short), RSI={sig['rsi']:.1f}"):
             _short_entries += 1
@@ -818,7 +962,8 @@ def _stale_futures_position(positions: list[dict], root: str, current_symbol: st
     return None
 
 
-def evaluate_future(root: str, account_id: str, positions: list[dict]) -> None:
+def evaluate_future(root: str, account_id: str, positions: list[dict],
+                    regime: str = "risk_on") -> None:
     global _entries_delayed
 
     trade_symbol = fmh.front_month_contract(root, roll_days=config.FUTURES_ROLL_DAYS)
@@ -887,8 +1032,14 @@ def evaluate_future(root: str, account_id: str, positions: list[dict]) -> None:
     if _already_bought_today(trade_symbol) or _already_sold_today(trade_symbol):
         return
 
+    # VIX regime gate — futures have no momentum slot or bot-managed stop, so the
+    # filter reduces to blocking new entries in defensive/crisis (the roll-flatten
+    # and state exit above are de-risking and stay ungated).
+    block_new_entries, _ = _apply_regime_rules(regime)
+
     # BUY signal — open long front month (EDGE: it is an entry)
-    if sig["bullish_cross"] and sig["rsi"] < config.RSI_OVERBOUGHT and held == 0:
+    if (sig["bullish_cross"] and sig["rsi"] < config.RSI_OVERBOUGHT and held == 0
+            and not block_new_entries):
         logger.info("SIGNAL BUY %s x%d", trade_symbol, qty)
         result = tc.place_futures_order(account_id, trade_symbol, "buy", qty)
         if result:

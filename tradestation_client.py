@@ -147,6 +147,22 @@ def get_quote(symbol: str) -> Optional[dict]:
         return None
 
 
+def get_vix_level() -> Optional[float]:
+    """Latest CBOE VIX index level via config.VIX_SYMBOL ("$VIX.X"), or None.
+
+    The cash index carries no bid/ask book — only Last/Close — so read Last with a
+    Close fallback (get_quote already normalizes both). Returns None on any failure
+    so callers can fail open rather than block trading on a data glitch."""
+    q = get_quote(config.VIX_SYMBOL)
+    if not q:
+        return None
+    val = q.get("last") or q.get("close")
+    try:
+        return float(val) if val is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
 _UNIT_MAP = {"daily": "Daily", "weekly": "Weekly", "monthly": "Monthly", "minute": "Minute"}
 
 

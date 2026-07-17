@@ -166,6 +166,38 @@ EXCLUDED_SECTORS = [
     "Passenger Airlines", # airlines — GICS sub-industry of Industrials
 ]
 
+# ── VIX fear gauge (market-regime filter) ─────────────────────────────────────
+# A market-wide risk overlay driven by the CBOE Volatility Index, applied to BOTH
+# equities and futures. One quote per cycle (cached VIX_CACHE_SECONDS) maps to a
+# regime that gates entries and, at the extreme, tightens stops and de-risks the
+# momentum slot. Master switch OFF ⇒ always "risk_on" (prior behaviour).
+#
+# SYMBOL: TradeStation quotes the cash index as "$VIX.X" (the "$XXX.X" index
+# convention, same as "$SPX.X"). Bare "VIX"/"$VIX" return INVALID SYMBOL, and the
+# index carries NO bid/ask book — only Last/Close — so get_vix_level reads Last
+# with a Close fallback. Verified against sim-api 2026-07-17.
+ENABLE_VIX_FILTER = True
+VIX_SYMBOL        = "$VIX.X"
+VIX_CACHE_SECONDS = 300     # reuse one quote for 5 min; don't refetch every 60s poll
+# Each constant is the CEILING of its namesake regime — the VIX level at which
+# that regime ends and the next begins — so the original 20/25/30 rule boundaries
+# hold exactly:
+#     risk_on   VIX < 20                  cautious   20 <= VIX < 25
+#     defensive 25 <= VIX < 30            crisis     VIX >= 30
+# VIX_CRISIS (35) marks an EXTREME sub-tier WITHIN crisis: same protective actions,
+# tagged EXTREME in the log (so the constant is live, not decorative).
+VIX_NORMAL    = 20   # top of risk_on   → cautious begins here
+VIX_CAUTIOUS  = 25   # top of cautious  → defensive begins here
+VIX_DEFENSIVE = 30   # top of defensive → crisis begins here
+VIX_CRISIS    = 35   # within crisis    → EXTREME tag at/above here
+# Defensive stop tighten: on a position already down > DRAWDOWN from entry, trail
+# with this tighter ATR multiple instead of STOP_LOSS_ATR_MULT (2.5).
+VIX_DEFENSIVE_ATR_MULT = 1.5
+VIX_DEFENSIVE_DRAWDOWN = 0.03
+# Crisis is DESTRUCTIVE (market-sells the held momentum slot, moves every stop to
+# breakeven). Shadow ⇒ LOG what it would do and place nothing; flip to False to arm.
+VIX_CRISIS_SHADOW = True
+
 # ── Polygon.io (momentum-screen data source; free tier) ───────────────────────
 POLYGON_API_KEY  = os.environ.get("POLYGON_API_KEY", "")
 POLYGON_BASE_URL = "https://api.polygon.io"

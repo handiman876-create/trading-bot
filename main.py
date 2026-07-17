@@ -130,6 +130,12 @@ def _run_cycle(account_id: str) -> None:
         return
     _positions_fetch_consecutive = 0
 
+    # Market-wide VIX regime, once per cycle (cached 5 min). Gates entries for both
+    # modes; equities crisis de-risking is applied below, before the symbol loop.
+    vix, regime = strategy.current_regime()
+    if config.ENABLE_VIX_FILTER:
+        strategy.note_regime(vix, regime)
+
     balance   = tc.get_account_balance(account_id)
     equity    = balance.get("total_equity") if balance else None
     log_performance(account_id, balance, positions)
@@ -137,7 +143,7 @@ def _run_cycle(account_id: str) -> None:
     if MODE == "futures":
         for root in config.FUTURES_WATCHLIST:
             try:
-                strategy.evaluate_future(root, account_id, positions)
+                strategy.evaluate_future(root, account_id, positions, regime)
             except Exception as exc:
                 logger.error("Error evaluating future %s: %s", root, exc)
         return
@@ -154,11 +160,15 @@ def _run_cycle(account_id: str) -> None:
     momentum_set = set(momentum_symbols)
     strategy.reconcile_momentum_entries(momentum_symbols, positions, generation)
 
+    # Crisis de-risking is applied per-symbol inside evaluate_stock (momentum exits
+    # via the normal SELL path) and _check_and_trail_stop (breakeven-floored stops),
+    # so there is no separate bulk step here — the regime flows in via evaluate_stock.
     for symbol in watchlist.effective_stock_watchlist(positions):
         try:
             strategy.evaluate_stock(symbol, account_id, positions, equity,
                                     is_momentum=(symbol in momentum_set),
-                                    momentum_generation=generation)
+                                    momentum_generation=generation,
+                                    regime=regime)
         except Exception as exc:
             logger.error("Error evaluating stock %s: %s", symbol, exc)
 
@@ -253,6 +263,16 @@ def main() -> None:
                 "(unknown != flat); ERROR after %d consecutive — stops are "
                 "unenforced during an outage",
                 _POSITIONS_FAILURE_ESCALATE_AFTER)
+    if config.ENABLE_VIX_FILTER:
+        logger.info("VIX filter  : ENABLED — %s, %ds cache; risk_on/cautious/"
+                    "defensive/crisis @ <%g/%g/%g/>=%g (crisis>=%g EXTREME); "
+                    "crisis actions=%s",
+                    config.VIX_SYMBOL, config.VIX_CACHE_SECONDS,
+                    config.VIX_NORMAL, config.VIX_CAUTIOUS, config.VIX_DEFENSIVE,
+                    config.VIX_DEFENSIVE, config.VIX_CRISIS,
+                    "SHADOW" if config.VIX_CRISIS_SHADOW else "LIVE")
+    else:
+        logger.info("VIX filter  : DISABLED (always risk_on)")
     logger.info("=" * 60)
 
     if not (config.TS_CLIENT_ID and config.TS_CLIENT_SECRET and config.TS_REFRESH_TOKEN):
