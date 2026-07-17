@@ -1,0 +1,19 @@
+[Unit]
+Description=TradeStation bot — morning market-sentiment analysis (Claude over Polygon headlines)
+Documentation=file:/root/trading-bot/deploy/run-sentiment.sh
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# oneshot: run to completion, then exit (the .timer schedules it; not a daemon).
+Type=oneshot
+User=root
+WorkingDirectory=/root/trading-bot
+ExecStart=/root/trading-bot/deploy/run-sentiment.sh
+# One Polygon news call + one Claude call — a couple of minutes at most.
+TimeoutStartSec=300
+StandardOutput=append:/root/trading-bot/logs/sentiment.log
+StandardError=append:/root/trading-bot/logs/sentiment.log
+
+# No [Install] section: a timer-activated oneshot is pulled in by its .timer,
+# not enabled directly.

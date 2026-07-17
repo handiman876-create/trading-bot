@@ -208,6 +208,7 @@ _short_entries = 0
 _short_covers = 0
 _latches_reconstructed = 0
 _crisis_exits = 0
+_sentiment_sector_blocks = 0
 
 
 def _load_json(path: str) -> dict:
@@ -660,6 +661,17 @@ def _apply_regime_rules(regime: str):
     return block_new_entries, block_momentum_align
 
 
+# Fear ordering for the belt-&-suspenders VIX-vs-sentiment combination.
+_REGIME_RANK = {"risk_on": 0, "unknown": 0, "cautious": 1, "defensive": 2, "crisis": 3}
+
+
+def _more_fearful(a: str, b: str) -> str:
+    """Return the more fearful of two regimes — the effective regime is the MORE
+    fearful of the VIX regime and the Claude-sentiment regime (if either says fear,
+    respect it)."""
+    return a if _REGIME_RANK.get(a, 0) >= _REGIME_RANK.get(b, 0) else b
+
+
 def current_regime(now: Optional[float] = None):
     """(vix, regime) for this cycle, refetching config.VIX_SYMBOL at most every
     VIX_CACHE_SECONDS.  Fail-OPEN: a failed/absent quote yields 'unknown', which
@@ -681,10 +693,13 @@ def current_regime(now: Optional[float] = None):
     return vix, regime
 
 
-def note_regime(vix: Optional[float], regime: str) -> None:
-    """Per-cycle bookkeeping — call once per cycle from the run loop when the
-    filter is enabled. Counts the regime, logs the level, flags transitions, and
-    emits the human-readable mode line for the entry-gating regimes."""
+def note_regime(vix: Optional[float], regime: str, vix_regime: Optional[str] = None,
+                sent_regime: Optional[str] = None, fear=None, risks=None) -> None:
+    """Per-cycle bookkeeping — call once per cycle from the run loop. `regime` is the
+    EFFECTIVE (combined) regime; the optional vix_regime/sent_regime/fear/risks let it
+    log a SENTIMENT OVERRIDE when Claude's read is strictly more fearful than the VIX
+    read. Counts the effective regime, logs the level, flags transitions, and emits
+    the human-readable mode line for the entry-gating regimes."""
     global _last_logged_regime
     _regime_counts[regime if regime in _regime_counts else "unknown"] += 1
     vtxt = f"{vix:.1f}" if isinstance(vix, (int, float)) else "n/a"
@@ -693,6 +708,11 @@ def note_regime(vix: Optional[float], regime: str) -> None:
         logger.warning("REGIME TRANSITION %s -> %s (VIX=%s%s)",
                        _last_logged_regime, regime, vtxt, extreme)
     logger.info("VIX=%s regime=%s%s", vtxt, regime, extreme)
+    if (sent_regime and vix_regime
+            and _REGIME_RANK.get(sent_regime, 0) > _REGIME_RANK.get(vix_regime, 0)):
+        logger.warning("SENTIMENT OVERRIDE: %s mode from Claude analysis "
+                       "(fear=%s, VIX-regime=%s, risks: %s)", sent_regime, fear,
+                       vix_regime, ", ".join(risks or []) or "n/a")
     if regime == "cautious":
         logger.info("CAUTIOUS MODE - skipping momentum alignment (VIX=%s)", vtxt)
     elif regime == "defensive":
@@ -707,9 +727,10 @@ def note_regime(vix: Optional[float], regime: str) -> None:
 def evaluate_stock(symbol: str, account_id: str, positions: list[dict],
                    equity: Optional[float],
                    is_momentum: bool = False, momentum_generation: str = "",
-                   regime: str = "risk_on") -> None:
+                   regime: str = "risk_on",
+                   blocked_symbols=frozenset()) -> None:
     global _momentum_align_entries, _short_entries, _short_covers, _entries_delayed
-    global _crisis_exits
+    global _crisis_exits, _sentiment_sector_blocks
 
     history = tc.get_historical(symbol, days=90)
     if not history:
@@ -829,8 +850,13 @@ def evaluate_stock(symbol: str, account_id: str, positions: list[dict],
     # BUY signal — fresh EMA cross (all symbols)
     if (sig["bullish_cross"] and sig["rsi"] < config.RSI_OVERBOUGHT and held == 0
             and not block_new_entries):
-        _enter_long(symbol, sig, price, account_id, positions, equity,
-                    reason=f"EMA cross up, RSI={sig['rsi']:.1f}")
+        if symbol in blocked_symbols:
+            _sentiment_sector_blocks += 1
+            logger.info("SECTOR RISK: skipping %s long entry — sector rated high "
+                        "(sentiment) #%d", symbol, _sentiment_sector_blocks)
+        else:
+            _enter_long(symbol, sig, price, account_id, positions, equity,
+                        reason=f"EMA cross up, RSI={sig['rsi']:.1f}")
 
     # BUY signal — momentum alignment (momentum slot only, one-shot per rotation).
     # Reached only when there was NO fresh cross (elif), so a genuine cross always
@@ -843,8 +869,13 @@ def evaluate_stock(symbol: str, account_id: str, positions: list[dict],
           and sig["ema_short"] > sig["ema_long"]
           and config.MOMENTUM_ALIGN_RSI_MIN <= sig["rsi"] <= config.MOMENTUM_ALIGN_RSI_MAX
           and not _momentum_entry_taken(symbol, momentum_generation)):
-        if _enter_long(symbol, sig, price, account_id, positions, equity,
-                       reason=f"momentum alignment entry, RSI={sig['rsi']:.1f}"):
+        if symbol in blocked_symbols:
+            _sentiment_sector_blocks += 1
+            logger.info("SECTOR RISK: skipping %s momentum entry — sector rated high "
+                        "(sentiment) #%d — latch preserved", symbol,
+                        _sentiment_sector_blocks)
+        elif _enter_long(symbol, sig, price, account_id, positions, equity,
+                         reason=f"momentum alignment entry, RSI={sig['rsi']:.1f}"):
             _momentum_align_entries += 1
             _record_momentum_entry(symbol, momentum_generation)
             logger.info("MOMENTUM ALIGNMENT ENTRY %s (gen=%s) — align entries #%d",

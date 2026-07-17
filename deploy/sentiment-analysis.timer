@@ -1,0 +1,17 @@
+[Unit]
+Description=Run the market-sentiment analysis on weekdays at 08:00 America/New_York
+
+[Timer]
+# Weekdays 08:00 Eastern — ~90 min before the 09:30 open, so the report is fresh
+# for the session. Mon..Fri only (no weekend runs); the bot treats a report older
+# than SENTIMENT_MAX_AGE_HOURS as NEUTRAL, so Monday pre-open runs neutral until
+# this fires. The America/New_York suffix tracks EST/EDT automatically.
+OnCalendar=Mon..Fri 08:00:00 America/New_York
+# If the machine was off at 08:00, run once at next boot rather than leaving the
+# day on a stale/neutral report.
+Persistent=true
+# Small jitter so it isn't hitting Polygon/Claude at exactly :00.
+RandomizedDelaySec=120
+
+[Install]
+WantedBy=timers.target

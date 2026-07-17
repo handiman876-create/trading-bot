@@ -203,6 +203,31 @@ POLYGON_API_KEY  = os.environ.get("POLYGON_API_KEY", "")
 POLYGON_BASE_URL = "https://api.polygon.io"
 POLYGON_MAX_CALLS_PER_MIN = 5    # free-tier rate limit; the screen self-throttles
 
+# ── Claude sentiment analysis (Feature 2 of the VIX + sentiment overlay) ──────
+# sentiment_analyzer.py (run weekdays 08:00 ET by systemd) scores market fear from
+# Polygon SPY headlines via Claude and writes SENTIMENT_REPORT_FILE. The bot reads
+# it each cycle and takes the MORE FEARFUL of {VIX regime, sentiment regime}, plus
+# per-sector entry gating. OFF ⇒ the bot ignores sentiment entirely (VIX-only).
+ENABLE_SENTIMENT        = True
+SENTIMENT_REPORT_FILE   = "data/sentiment_report.json"   # generated (gitignored)
+SENTIMENT_MODEL         = "claude-sonnet-4-6"
+SENTIMENT_MAX_TOKENS    = 500
+SENTIMENT_NEWS_TICKER   = "SPY"    # broad-market proxy for market-wide sentiment
+SENTIMENT_NEWS_LIMIT    = 20       # headlines per run
+SENTIMENT_NEWS_HOURS    = 24       # headline look-back window
+# Staleness: a report older than this is treated as absent → NEUTRAL. 48h keeps a
+# weekday report valid across one missed run (resilience). The bot doesn't trade
+# weekends and Monday's 08:00 timer writes a fresh report before the open, so this
+# never drives a normal-week decision; on the edge where Monday's run is missed,
+# Friday's report is ~72h old (> 48h) → NEUTRAL, so stale weekend sentiment can never
+# drive Monday. The live VIX regime still applies throughout.
+SENTIMENT_MAX_AGE_HOURS = 48
+# Cost guardrail — Sonnet 4.6 is $3/$15 per 1M tok, so a run is ~$0.01. Alert (ERROR
+# log) if a run somehow exceeds the cap; runaway-cost backstop.
+SENTIMENT_PRICE_IN      = 3.0      # $/1M input tokens
+SENTIMENT_PRICE_OUT     = 15.0     # $/1M output tokens
+SENTIMENT_MAX_COST_USD  = 0.10
+
 # ── Poll interval while market is open (seconds) ─────────────────────────────
 POLL_INTERVAL = 60
 

@@ -43,6 +43,7 @@ import tradestation_client as tc
 import market_hours as mh
 import futures_market_hours as fmh
 import strategy
+import sentiment_analyzer
 import watchlist
 import momentum_screen
 from trade_logger import log_performance
@@ -130,11 +131,19 @@ def _run_cycle(account_id: str) -> None:
         return
     _positions_fetch_consecutive = 0
 
-    # Market-wide VIX regime, once per cycle (cached 5 min). Gates entries for both
-    # modes; equities crisis de-risking is applied below, before the symbol loop.
-    vix, regime = strategy.current_regime()
-    if config.ENABLE_VIX_FILTER:
-        strategy.note_regime(vix, regime)
+    # Market-wide regime, once per cycle: the MORE FEARFUL of the VIX regime (cached
+    # 5 min) and the Claude-sentiment regime (from the 08:00 report; NEUTRAL if
+    # missing/stale). `blocked` = symbols in a sentiment "high"-risk sector, gated
+    # from NEW long entries. Both modes use `regime`; equities also use `blocked`.
+    vix, vix_regime = strategy.current_regime()
+    sentiment = sentiment_analyzer.current_sentiment()
+    sent_regime = sentiment_analyzer.sentiment_regime(sentiment)
+    regime = strategy._more_fearful(vix_regime, sent_regime)
+    blocked = sentiment_analyzer.sectors_blocked(sentiment)
+    if config.ENABLE_VIX_FILTER or config.ENABLE_SENTIMENT:
+        strategy.note_regime(vix, regime, vix_regime=vix_regime, sent_regime=sent_regime,
+                             fear=sentiment.get("fear_score"),
+                             risks=sentiment.get("top_risks"))
 
     balance   = tc.get_account_balance(account_id)
     equity    = balance.get("total_equity") if balance else None
@@ -168,7 +177,7 @@ def _run_cycle(account_id: str) -> None:
             strategy.evaluate_stock(symbol, account_id, positions, equity,
                                     is_momentum=(symbol in momentum_set),
                                     momentum_generation=generation,
-                                    regime=regime)
+                                    regime=regime, blocked_symbols=blocked)
         except Exception as exc:
             logger.error("Error evaluating stock %s: %s", symbol, exc)
 
@@ -273,6 +282,19 @@ def main() -> None:
                     "SHADOW" if config.VIX_CRISIS_SHADOW else "LIVE")
     else:
         logger.info("VIX filter  : DISABLED (always risk_on)")
+    if config.ENABLE_SENTIMENT:
+        _rep = sentiment_analyzer.current_sentiment()
+        logger.info("Sentiment   : fear=%s/10 regime=%s risks=%s%s (model=%s, "
+                    "weekdays 08:00 ET, stale>%dh, cap=$%.2f)",
+                    _rep.get("fear_score"), _rep.get("regime"),
+                    _rep.get("top_risks") or [],
+                    " [FALLBACK]" if _rep.get("fallback") else "",
+                    config.SENTIMENT_MODEL, config.SENTIMENT_MAX_AGE_HOURS,
+                    config.SENTIMENT_MAX_COST_USD)
+        logger.info("Combine     : effective regime = MORE FEARFUL of (VIX, sentiment); "
+                    "sentiment 'high' sector → blocks new long entries in that sector")
+    else:
+        logger.info("Sentiment   : DISABLED")
     logger.info("=" * 60)
 
     if not (config.TS_CLIENT_ID and config.TS_CLIENT_SECRET and config.TS_REFRESH_TOKEN):
