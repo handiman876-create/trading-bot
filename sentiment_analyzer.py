@@ -82,33 +82,63 @@ def _neutral_report(reason: str) -> dict:
     }
 
 
+def _dedup_recent(articles: list) -> list:
+    """From raw Polygon articles (pooled across tickers), drop titleless ones, dedup
+    by article_url (→ id → title), sort newest-first, and cap at SENTIMENT_NEWS_LIMIT.
+    Pure (no network) so it's unit-testable."""
+    seen, out = set(), []
+    for x in articles:
+        title = x.get("title")
+        if not title:
+            continue
+        key = x.get("article_url") or x.get("id") or title
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append({"title": title, "published_utc": x.get("published_utc", ""),
+                    "tickers": x.get("tickers", [])})
+    out.sort(key=lambda h: h.get("published_utc", ""), reverse=True)
+    return out[:config.SENTIMENT_NEWS_LIMIT]
+
+
 def _fetch_headlines() -> list | None:
-    """Last-24h SPY headlines from Polygon /v2/reference/news, or None on failure."""
+    """Last-48h broad-market headlines from Polygon /v2/reference/news: one call per
+    SENTIMENT_NEWS_TICKERS entry (SPY/QQQ/DIA) plus, when SENTIMENT_NEWS_INCLUDE_GENERAL,
+    one no-ticker GENERAL market-news call (which is what actually fills the count —
+    free-tier ETFs are sparsely tagged). Merged + deduped by URL, 20 most recent. None
+    only if every source fails/returns nothing; a single source's failure is logged
+    and skipped (partial breadth beats none)."""
     import requests  # lazy: only the timer job fetches
     if not config.POLYGON_API_KEY:
         logger.error("POLYGON_API_KEY missing — cannot fetch headlines")
         return None
     since = (datetime.now(timezone.utc)
              - timedelta(hours=config.SENTIMENT_NEWS_HOURS)).strftime("%Y-%m-%dT%H:%M:%SZ")
-    try:
-        r = requests.get(
-            f"{config.POLYGON_BASE_URL}/v2/reference/news",
-            params={"ticker": config.SENTIMENT_NEWS_TICKER, "order": "desc",
-                    "limit": config.SENTIMENT_NEWS_LIMIT, "published_utc.gte": since,
-                    "apiKey": config.POLYGON_API_KEY},
-            timeout=15,
-        )
-        r.raise_for_status()
-        results = r.json().get("results", [])
-    except Exception as exc:
-        logger.error("Polygon news fetch failed: %s", exc)
-        return None
-    headlines = [{"title": x.get("title", ""), "published_utc": x.get("published_utc", "")}
-                 for x in results if x.get("title")]
+    # (label, extra-params): a ticker filter per index symbol, then optional general news.
+    sources = [(t, {"ticker": t}) for t in config.SENTIMENT_NEWS_TICKERS]
+    if config.SENTIMENT_NEWS_INCLUDE_GENERAL:
+        sources.append(("GENERAL", {}))
+    raw = []
+    for label, extra in sources:
+        try:
+            r = requests.get(
+                f"{config.POLYGON_BASE_URL}/v2/reference/news",
+                params={"order": "desc", "limit": config.SENTIMENT_NEWS_LIMIT,
+                        "published_utc.gte": since, "apiKey": config.POLYGON_API_KEY,
+                        **extra},
+                timeout=15,
+            )
+            r.raise_for_status()
+            raw.extend(r.json().get("results", []))
+        except Exception as exc:
+            logger.warning("Polygon news fetch failed for %s: %s", label, exc)
+    headlines = _dedup_recent(raw)
     if not headlines:
-        logger.warning("Polygon returned no headlines in the last %dh",
-                       config.SENTIMENT_NEWS_HOURS)
+        logger.warning("Polygon returned no headlines (sources=%s) in the last %dh",
+                       [s[0] for s in sources], config.SENTIMENT_NEWS_HOURS)
         return None
+    logger.info("Fetched %d unique headlines from %s (last %dh)",
+                len(headlines), [s[0] for s in sources], config.SENTIMENT_NEWS_HOURS)
     return headlines
 
 

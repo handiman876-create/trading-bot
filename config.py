@@ -212,9 +212,13 @@ ENABLE_SENTIMENT        = True
 SENTIMENT_REPORT_FILE   = "data/sentiment_report.json"   # generated (gitignored)
 SENTIMENT_MODEL         = "claude-sonnet-4-6"
 SENTIMENT_MAX_TOKENS    = 500
-SENTIMENT_NEWS_TICKER   = "SPY"    # broad-market proxy for market-wide sentiment
-SENTIMENT_NEWS_LIMIT    = 20       # headlines per run
-SENTIMENT_NEWS_HOURS    = 24       # headline look-back window
+SENTIMENT_NEWS_TICKERS  = ["SPY", "QQQ", "DIA"]  # index breadth; one Polygon call each
+# Free-tier Polygon barely tags index ETFs (SPY/QQQ/DIA ≈ 1 article/48h combined), so
+# also pull GENERAL market news (one no-ticker call ≈ 20 articles) and merge — that's
+# what actually fills the headline count. All sources deduped by URL, capped below.
+SENTIMENT_NEWS_INCLUDE_GENERAL = True
+SENTIMENT_NEWS_LIMIT    = 20       # per-source fetch cap AND final cap (20 most recent)
+SENTIMENT_NEWS_HOURS    = 48       # headline look-back window (catches weekend news)
 # Staleness: a report older than this is treated as absent → NEUTRAL. 48h keeps a
 # weekday report valid across one missed run (resilience). The bot doesn't trade
 # weekends and Monday's 08:00 timer writes a fresh report before the open, so this

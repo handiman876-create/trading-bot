@@ -175,6 +175,28 @@ def test_more_fearful_combination():
     assert F("defensive", "risk_on") == "defensive"
 
 
+# ── 7b. headline merge/dedup (multi-ticker) ───────────────────────────────────
+def test_dedup_recent_dedups_sorts_caps():
+    raw = [
+        {"title": "A", "article_url": "u1", "published_utc": "2026-07-17T10:00:00Z"},
+        {"title": "A again", "article_url": "u1", "published_utc": "2026-07-17T11:00:00Z"},  # dup URL
+        {"title": "B", "article_url": "u2", "published_utc": "2026-07-17T12:00:00Z"},
+        {"title": "", "article_url": "u3", "published_utc": "2026-07-17T13:00:00Z"},          # titleless
+        {"title": "C", "id": "idC", "published_utc": "2026-07-16T09:00:00Z"},                 # no url → id key
+    ]
+    out = sa._dedup_recent(raw)
+    assert [h["title"] for h in out] == ["B", "A", "C"]   # newest-first, u1 kept once, titleless gone
+    assert len(out) == 3
+
+
+def test_dedup_recent_caps_at_limit():
+    raw = [{"title": f"h{i}", "article_url": f"u{i}",
+            "published_utc": f"2026-07-17T{i:02d}:00:00Z"} for i in range(24)]
+    out = sa._dedup_recent(raw)
+    assert len(out) == config.SENTIMENT_NEWS_LIMIT      # capped at 20
+    assert out[0]["title"] == "h23"                     # most recent first
+
+
 # ── 8. main() fail-safe paths (no network) ────────────────────────────────────
 def test_main_writes_neutral_when_polygon_fails():
     path = _tmp_report_path()
