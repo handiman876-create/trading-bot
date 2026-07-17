@@ -82,14 +82,29 @@ def _neutral_report(reason: str) -> dict:
     }
 
 
+# PR-wire / legal-solicitation spam filter — compiled once from config.
+_SPAM_PUBLISHERS = tuple(p.lower() for p in config.SENTIMENT_SPAM_PUBLISHERS)
+_SPAM_PATTERNS = tuple(re.compile(k, re.I) for k in config.SENTIMENT_SPAM_KEYWORDS)
+
+
+def _is_spam(article: dict) -> bool:
+    """True for PR-wire publishers or law-firm/solicitation titles — noise that floods
+    the general feed daily and biases fear regardless of market conditions."""
+    pub = ((article.get("publisher") or {}).get("name") or "").lower()
+    if any(p in pub for p in _SPAM_PUBLISHERS):
+        return True
+    title = article.get("title") or ""
+    return any(rx.search(title) for rx in _SPAM_PATTERNS)
+
+
 def _dedup_recent(articles: list) -> list:
-    """From raw Polygon articles (pooled across tickers), drop titleless ones, dedup
-    by article_url (→ id → title), sort newest-first, and cap at SENTIMENT_NEWS_LIMIT.
-    Pure (no network) so it's unit-testable."""
+    """From raw Polygon articles (pooled across sources), drop titleless AND spam
+    (PR-wire / legal-solicitation) articles, dedup by article_url (→ id → title), sort
+    newest-first, and cap at SENTIMENT_NEWS_LIMIT. Pure (no network) so it's testable."""
     seen, out = set(), []
     for x in articles:
         title = x.get("title")
-        if not title:
+        if not title or _is_spam(x):
             continue
         key = x.get("article_url") or x.get("id") or title
         if key in seen:
@@ -114,12 +129,10 @@ def _fetch_headlines() -> list | None:
         return None
     since = (datetime.now(timezone.utc)
              - timedelta(hours=config.SENTIMENT_NEWS_HOURS)).strftime("%Y-%m-%dT%H:%M:%SZ")
-    # (label, extra-params): a ticker filter per index symbol, then optional general news.
-    sources = [(t, {"ticker": t}) for t in config.SENTIMENT_NEWS_TICKERS]
-    if config.SENTIMENT_NEWS_INCLUDE_GENERAL:
-        sources.append(("GENERAL", {}))
-    raw = []
-    for label, extra in sources:
+    raw, pulled = [], []
+
+    def pull(label, extra):
+        pulled.append(label)
         try:
             r = requests.get(
                 f"{config.POLYGON_BASE_URL}/v2/reference/news",
@@ -132,13 +145,28 @@ def _fetch_headlines() -> list | None:
             raw.extend(r.json().get("results", []))
         except Exception as exc:
             logger.warning("Polygon news fetch failed for %s: %s", label, exc)
+
+    for ticker in config.SENTIMENT_NEWS_TICKERS:
+        pull(ticker, {"ticker": ticker})
+    if config.SENTIMENT_NEWS_INCLUDE_GENERAL:
+        pull("GENERAL", {})
+
     headlines = _dedup_recent(raw)
+    # Spam filtering can thin the count; top up from mega-caps (cleaner than general).
+    if (len(headlines) < config.SENTIMENT_MIN_HEADLINES
+            and config.SENTIMENT_SUPPLEMENT_TICKERS):
+        logger.info("Only %d headlines after spam filter — supplementing with %s",
+                    len(headlines), config.SENTIMENT_SUPPLEMENT_TICKERS)
+        for ticker in config.SENTIMENT_SUPPLEMENT_TICKERS:
+            pull(ticker, {"ticker": ticker})
+        headlines = _dedup_recent(raw)
+
     if not headlines:
-        logger.warning("Polygon returned no headlines (sources=%s) in the last %dh",
-                       [s[0] for s in sources], config.SENTIMENT_NEWS_HOURS)
+        logger.warning("Polygon returned no usable headlines (sources=%s) in the last %dh",
+                       pulled, config.SENTIMENT_NEWS_HOURS)
         return None
-    logger.info("Fetched %d unique headlines from %s (last %dh)",
-                len(headlines), [s[0] for s in sources], config.SENTIMENT_NEWS_HOURS)
+    logger.info("Fetched %d unique headlines (post-filter) from %s (last %dh)",
+                len(headlines), pulled, config.SENTIMENT_NEWS_HOURS)
     return headlines
 
 

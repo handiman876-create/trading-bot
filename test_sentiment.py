@@ -197,6 +197,30 @@ def test_dedup_recent_caps_at_limit():
     assert out[0]["title"] == "h23"                     # most recent first
 
 
+# ── 7c. PR/legal spam filter ──────────────────────────────────────────────────
+def test_is_spam_filters_pr_and_legal():
+    S = sa._is_spam
+    assert S({"publisher": {"name": "GlobeNewswire Inc."}, "title": "X reports earnings"})
+    assert S({"publisher": {"name": "The Motley Fool"}, "title": "PENTAIR INVESTOR ALERT: ..."})
+    assert S({"publisher": {"name": "Reuters"}, "title": "ROSEN Law Firm encourages Acme investors to act"})
+    assert S({"publisher": {"name": "PRNewswire"}, "title": "anything at all"})
+    assert S({"publisher": {}, "title": "SEC opens INVESTIGATION into fraud"})
+    # genuine market news survives
+    assert not S({"publisher": {"name": "The Motley Fool"},
+                  "title": "Stocks slide as semiconductor rout deepens"})
+    assert not S({"publisher": {"name": "Reuters"}, "title": "Fed holds rates steady"})
+
+
+def test_dedup_recent_drops_spam():
+    raw = [
+        {"title": "Real market news", "article_url": "u1",
+         "published_utc": "2026-07-17T12:00:00Z", "publisher": {"name": "Reuters"}},
+        {"title": "ACME SHAREHOLDER ALERT: class action DEADLINE", "article_url": "u2",
+         "published_utc": "2026-07-17T13:00:00Z", "publisher": {"name": "GlobeNewswire"}},
+    ]
+    assert [h["title"] for h in sa._dedup_recent(raw)] == ["Real market news"]
+
+
 # ── 8. main() fail-safe paths (no network) ────────────────────────────────────
 def test_main_writes_neutral_when_polygon_fails():
     path = _tmp_report_path()

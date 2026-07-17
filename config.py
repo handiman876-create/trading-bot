@@ -219,6 +219,21 @@ SENTIMENT_NEWS_TICKERS  = ["SPY", "QQQ", "DIA"]  # index breadth; one Polygon ca
 SENTIMENT_NEWS_INCLUDE_GENERAL = True
 SENTIMENT_NEWS_LIMIT    = 20       # per-source fetch cap AND final cap (20 most recent)
 SENTIMENT_NEWS_HOURS    = 48       # headline look-back window (catches weekend news)
+# News-quality filter: PR wires and law-firm "investor alert" solicitations flood the
+# general feed every day regardless of market conditions and bias sentiment toward
+# fear (fraud/lawsuit language). Drop by publisher (substring, case-insensitive) or by
+# title matching any keyword (compiled as case-insensitive regex — note "encourages.*
+# investors").
+SENTIMENT_SPAM_PUBLISHERS = ["globenewswire", "prnewswire", "businesswire",
+                             "globe newswire"]
+SENTIMENT_SPAM_KEYWORDS   = ["investor alert", "class action", "deadline",
+                             "encourages.*investors", "inducement grants", "rosen",
+                             "kirby mcinerney", "shareholder alert", "investigation",
+                             "lawsuit", "securities fraud"]
+# If filtering drops the count below this, supplement with mega-cap tickers (well
+# covered, far less PR-wire spam than the general feed).
+SENTIMENT_MIN_HEADLINES      = 10
+SENTIMENT_SUPPLEMENT_TICKERS = ["AAPL", "MSFT"]
 # Staleness: a report older than this is treated as absent → NEUTRAL. 48h keeps a
 # weekday report valid across one missed run (resilience). The bot doesn't trade
 # weekends and Monday's 08:00 timer writes a fresh report before the open, so this
