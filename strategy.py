@@ -270,8 +270,16 @@ def _cost_basis(positions: list[dict], symbol: str) -> Optional[float]:
     return None
 
 
+def _regime_atr_mult(regime: str) -> float:
+    """The ATR multiple to ARM a new stop with, by market regime (risk_on 2.5 →
+    crisis 1.0). Single source of truth for regime→width so the three arming
+    sites don't each re-derive it. Unknown regimes fall back to the default
+    STOP_LOSS_ATR_MULT (risk_on width)."""
+    return config.ATR_MULT_BY_REGIME.get(regime, config.STOP_LOSS_ATR_MULT)
+
+
 def _bootstrap_stop(symbol: str, held: int, sig: dict, positions: list[dict],
-                    price: float) -> Optional[dict]:
+                    price: float, regime: str = "risk_on") -> Optional[dict]:
     """Build a stop record for a pre-existing position we're adopting (no prior
     record). Direction is inferred from the sign of `held` (negative = short).
     Entry is estimated from cost_basis/|qty|; ATR is computed now; the water-mark
@@ -284,34 +292,38 @@ def _bootstrap_stop(symbol: str, held: int, sig: dict, positions: list[dict],
         return None
     basis = _cost_basis(positions, symbol)
     entry = (basis / abs(held)) if (basis and held) else price
+    mult = _regime_atr_mult(regime)
     rec = {
         "entry_price":  round(entry, 4),
         "atr_at_entry": round(atr, 4),
+        "atr_mult":     mult,
         "opened":       date.today().isoformat(),
         "bootstrapped": True,
     }
     if held < 0:                                   # short
         low_water = min(entry, price)
-        stop = low_water + config.STOP_LOSS_ATR_MULT * atr
+        stop = low_water + mult * atr
         rec.update({"direction": "short", "low_water": round(low_water, 4),
                     "stop_price": round(stop, 4)})
     else:                                          # long
         high_water = max(entry, price)
-        stop = high_water - config.STOP_LOSS_ATR_MULT * atr
+        stop = high_water - mult * atr
         rec.update({"direction": "long", "high_water": round(high_water, 4),
                     "stop_price": round(stop, 4)})
-    logger.info("STOP BOOTSTRAP %s %s entry≈%.2f atr=%.2f stop=%.2f "
-                "(adopted pre-existing position)",
-                symbol, rec["direction"], entry, atr, stop)
+    logger.info("STOP BOOTSTRAP %s %s entry≈%.2f atr=%.2f mult=%.1fx stop=%.2f "
+                "(adopted pre-existing position, regime=%s)",
+                symbol, rec["direction"], entry, atr, mult, stop, regime)
     return rec
 
 
 def _arm_stop_on_entry(symbol: str, entry_price: float, atr: Optional[float],
-                       direction: str = "long") -> None:
+                       direction: str = "long", regime: str = "risk_on") -> None:
     """Create a fresh stop record after a BUY (long) or SELLSHORT (short) fills.
-    A short's stop sits ABOVE entry (entry + MULT*atr) and will ratchet DOWN; a
-    long's sits below and ratchets up. No-op with a warning if ATR is unavailable
-    (equities always carry high/low, so this should never fire)."""
+    The stop WIDTH is the regime's ATR multiple (risk_on 2.5 → crisis 1.0),
+    persisted as "atr_mult" and reused for all later trailing so the width is
+    fixed at entry. A short's stop sits ABOVE entry (entry + mult*atr) and will
+    ratchet DOWN; a long's sits below and ratchets up. No-op with a warning if ATR
+    is unavailable (equities always carry high/low, so this should never fire)."""
     # TODO: callers pass the SIGNAL-bar close (sig["close"]), not the actual fill
     # price — the order response carries no fill price to read (a market order is
     # accepted async, and _place_order returns only the OrderID). Market fills
@@ -332,25 +344,27 @@ def _arm_stop_on_entry(symbol: str, entry_price: float, atr: Optional[float],
         logger.warning("Could not arm stop for %s: ATR unavailable — position is "
                        "UNPROTECTED until bootstrap re-arms it.", symbol)
         return
+    mult = _regime_atr_mult(regime)
     rec = {
         "entry_price":  round(entry_price, 4),
         "atr_at_entry": round(atr, 4),
+        "atr_mult":     mult,
         "opened":       date.today().isoformat(),
         "bootstrapped": False,
         "direction":    direction,
     }
     if direction == "short":
-        stop = entry_price + config.STOP_LOSS_ATR_MULT * atr
+        stop = entry_price + mult * atr
         rec["low_water"] = round(entry_price, 4)
     else:
-        stop = entry_price - config.STOP_LOSS_ATR_MULT * atr
+        stop = entry_price - mult * atr
         rec["high_water"] = round(entry_price, 4)
     rec["stop_price"] = round(stop, 4)
     stops = _load_stops()
     stops[symbol] = rec
     _save_stops(stops)
-    logger.info("STOP ARMED %s %s entry=%.2f atr=%.2f stop=%.2f",
-                symbol, direction, entry_price, atr, stop)
+    logger.info("STOP ARMED %s %s entry=%.2f atr=%.2f mult=%.1fx stop=%.2f (regime=%s)",
+                symbol, direction, entry_price, atr, mult, stop, regime)
 
 
 def _clear_stop(symbol: str) -> None:
@@ -397,7 +411,7 @@ def _check_and_trail_stop(symbol: str, held: int, sig: dict,
     stops = _load_stops()
     rec = stops.get(symbol)
     if rec is None:
-        rec = _bootstrap_stop(symbol, held, sig, positions, price)
+        rec = _bootstrap_stop(symbol, held, sig, positions, price, regime)
         if rec is None:
             return False              # no ATR → can't arm a stop this cycle
     stops[symbol] = rec               # ensure present (bootstrap path)
@@ -405,13 +419,18 @@ def _check_and_trail_stop(symbol: str, held: int, sig: dict,
     direction = rec.get("direction", "long")   # legacy records (no key) are longs
     entry = rec.get("entry_price")
 
-    # VIX regime stop adjustments — both hold the monotonic ratchet (they only ever
-    # move a stop favorably, never loosen it) and both are IMMEDIATE: this runs every
-    # cycle for every held position, BEFORE the entry gate, so a mid-day VIX spike
-    # re-stops open positions on the next poll rather than waiting for a new entry.
-    #   defensive → tighten the trail to 1.5x ATR (vs 2.5x) on a >3% loser
+    # Base trail width = the multiple this position was ARMED with (persisted at
+    # entry by regime), NOT the live regime — a position's stop width is fixed at
+    # entry, so a later regime change only affects NEW entries. Legacy records with
+    # no "atr_mult" fall back to STOP_LOSS_ATR_MULT (2.5), unchanged.
+    #
+    # VIX regime stop adjustments layer ON TOP of that base — both hold the monotonic
+    # ratchet (they only ever move a stop favorably, never loosen it) and both are
+    # IMMEDIATE: this runs every cycle for every held position, BEFORE the entry gate,
+    # so a mid-day VIX spike re-stops open positions on the next poll.
+    #   defensive → tighten the trail to 1.5x ATR on a >3% loser (overrides base)
     #   crisis    → floor the stop at breakeven (entry), applied per-branch below
-    mult = config.STOP_LOSS_ATR_MULT
+    mult = rec.get("atr_mult", config.STOP_LOSS_ATR_MULT)
     if regime == "defensive" and entry:
         drawdown = ((price - entry) / entry) if direction == "short" \
                    else ((entry - price) / entry)
@@ -613,7 +632,8 @@ def reconcile_momentum_entries(momentum_symbols, positions: list[dict],
 
 
 def _enter_long(symbol: str, sig: dict, price: float, account_id: str,
-                positions: list[dict], equity: Optional[float], reason: str) -> bool:
+                positions: list[dict], equity: Optional[float], reason: str,
+                regime: str = "risk_on") -> bool:
     """Shared long-entry path for both the fresh-cross and momentum-alignment
     signals: enforce MAX_POSITIONS, size at EQUITY_PER_TRADE_PCT, place the buy,
     and on a filled order mark the symbol signaled, log the trade, and arm the
@@ -637,13 +657,14 @@ def _enter_long(symbol: str, sig: dict, price: float, account_id: str,
         _mark_bought(symbol)
         order_id = result.get("order", {}).get("id")
         log_trade("BUY", symbol, qty, price, "market", order_id, reason)
-        _arm_stop_on_entry(symbol, price, sig.get("atr"))
+        _arm_stop_on_entry(symbol, price, sig.get("atr"), regime=regime)
         return True
     return False
 
 
 def _enter_short(symbol: str, sig: dict, price: float, account_id: str,
-                 positions: list[dict], equity: Optional[float], reason: str) -> bool:
+                 positions: list[dict], equity: Optional[float], reason: str,
+                 regime: str = "risk_on") -> bool:
     """Short-entry path (any effective-watchlist name, fresh death cross): enforce MAX_POSITIONS,
     size like a long at EQUITY_PER_TRADE_PCT, place a SELLSHORT, and on a filled
     order mark the symbol signaled, log the trade, and arm the ABOVE-entry trailing
@@ -667,7 +688,7 @@ def _enter_short(symbol: str, sig: dict, price: float, account_id: str,
         _mark_sold(symbol)
         order_id = result.get("order", {}).get("id")
         log_trade("SELL_SHORT", symbol, qty, price, "market", order_id, reason)
-        _arm_stop_on_entry(symbol, price, sig.get("atr"), direction="short")
+        _arm_stop_on_entry(symbol, price, sig.get("atr"), direction="short", regime=regime)
         return True
     return False
 
@@ -915,7 +936,7 @@ def evaluate_stock(symbol: str, account_id: str, positions: list[dict],
                         "(sentiment) #%d", symbol, _sentiment_sector_blocks)
         else:
             _enter_long(symbol, sig, price, account_id, positions, equity,
-                        reason=f"EMA cross up, RSI={sig['rsi']:.1f}")
+                        reason=f"EMA cross up, RSI={sig['rsi']:.1f}", regime=regime)
 
     # BUY signal — momentum alignment (momentum slot only, one-shot per rotation).
     # Reached only when there was NO fresh cross (elif), so a genuine cross always
@@ -934,7 +955,8 @@ def evaluate_stock(symbol: str, account_id: str, positions: list[dict],
                         "(sentiment) #%d — latch preserved", symbol,
                         _sentiment_sector_blocks)
         elif _enter_long(symbol, sig, price, account_id, positions, equity,
-                         reason=f"momentum alignment entry, RSI={sig['rsi']:.1f}"):
+                         reason=f"momentum alignment entry, RSI={sig['rsi']:.1f}",
+                         regime=regime):
             _momentum_align_entries += 1
             _record_momentum_entry(symbol, momentum_generation)
             logger.info("MOMENTUM ALIGNMENT ENTRY %s (gen=%s) — align entries #%d",
@@ -949,7 +971,8 @@ def evaluate_stock(symbol: str, account_id: str, positions: list[dict],
     elif (sig["bearish_cross"] and sig["rsi"] > config.RSI_OVERSOLD and held == 0
           and config.ENABLE_SHORTING and not block_new_entries):
         if _enter_short(symbol, sig, price, account_id, positions, equity,
-                        reason=f"EMA cross down (short), RSI={sig['rsi']:.1f}"):
+                        reason=f"EMA cross down (short), RSI={sig['rsi']:.1f}",
+                        regime=regime):
             _short_entries += 1
             logger.info("SHORT ENTRY %s — short entries #%d", symbol, _short_entries)
 

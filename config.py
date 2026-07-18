@@ -112,11 +112,33 @@ OPTIONS_CONTRACTS    = 1      # contracts per options trade
 # now; switch to a broker Sell Stop order when we go live. See stop_prices.json
 # for the persisted per-position state (entry, ATR-at-entry, ratcheting stop).
 USE_TRAILING_STOP    = True   # master switch; False = no stop checks at all
-STOP_LOSS_ATR_MULT   = 2.5    # stop sits this many ATRs from the water-mark
+STOP_LOSS_ATR_MULT   = 2.5    # default/fallback ATR multiple (= risk_on width)
 STOP_LOSS_ATR_PERIOD = 14     # ATR lookback (Wilder), computed once at entry
 STOP_PRICE_FILE      = "data/stop_prices.json"   # generated (gitignored)
+
+# Regime-based ATR multiplier — the stop WIDTH a position is armed with depends on
+# the market regime AT ENTRY. The chosen multiple is persisted per position
+# ("atr_mult" in the stop record) and reused for ALL later trailing, so a
+# position's stop width is fixed at entry and does NOT change as the regime moves
+# — only NEW entries feel a regime shift. Legacy records with no "atr_mult" fall
+# back to STOP_LOSS_ATR_MULT (2.5), so pre-existing stops are unaffected. This is
+# SEPARATE from and STACKS WITH the existing defensive >3%-drawdown tightening
+# (VIX_DEFENSIVE_ATR_MULT), which still overrides the trail on losing positions.
+ATR_MULT_RISK_ON   = 2.5      # = STOP_LOSS_ATR_MULT (unchanged behaviour)
+ATR_MULT_CAUTIOUS  = 2.0      # slightly tighter
+ATR_MULT_DEFENSIVE = 1.5      # meaningfully tighter
+ATR_MULT_CRISIS    = 1.0      # very tight
+ATR_MULT_BY_REGIME = {
+    "risk_on":   ATR_MULT_RISK_ON,
+    "cautious":  ATR_MULT_CAUTIOUS,
+    "defensive": ATR_MULT_DEFENSIVE,
+    "crisis":    ATR_MULT_CRISIS,
+}
 # stop_prices.json schema, per symbol:
 #   entry_price, atr_at_entry, stop_price, opened, bootstrapped, direction
+#   + "atr_mult" (float; the ATR multiple this stop was armed with, by entry
+#     regime — missing reads as STOP_LOSS_ATR_MULT (2.5), so pre-atr_mult records
+#     are back-compat)
 #   + "profit_taken" (bool; set once a partial profit-take has fired — missing
 #     reads as False, so records written before profit-taking existed are back-compat)
 #   + "high_water" (longs: max price seen; stop = high_water - MULT*atr, rises)
@@ -124,13 +146,13 @@ STOP_PRICE_FILE      = "data/stop_prices.json"   # generated (gitignored)
 # "direction" is "long" | "short"; records written before shorts existed have no
 # such key and are read as "long" (rec.get("direction", "long")) — fully back-compat.
 
-# ── Short selling (core watchlist only, fresh death-cross entries) ─────────────
-# When enabled, a fresh EMA death cross on a CORE name with no position opens a
-# SHORT (SELLSHORT), sized like a long (EQUITY_PER_TRADE_PCT) and counting toward
-# MAX_POSITIONS. The momentum slot stays long-only (it's screened for long
-# momentum; shorting volatile leaders is too risky for now). Shorts are covered
+# ── Short selling (effective-watchlist names, fresh death-cross entries) ───────
+# When enabled, a fresh EMA death cross on ANY effective-watchlist name (core ∪
+# momentum ∪ held) with no position opens a SHORT (SELLSHORT), sized like a long
+# (EQUITY_PER_TRADE_PCT) and counting toward MAX_POSITIONS. Momentum picks are
+# shortable too (expanded from core-only 2026-07-18). Shorts are covered
 # (BUYTOCOVER) on a bullish cross, and carry a trailing stop that sits ABOVE
-# entry and ratchets DOWN with a low-water mark, reusing STOP_LOSS_ATR_MULT.
+# entry and ratchets DOWN with a low-water mark, using the regime ATR multiple.
 ENABLE_SHORTING = True   # master switch; False = long-only (prior behaviour)
 
 # ── Momentum alignment entry (momentum slot only) ─────────────────────────────

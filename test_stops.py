@@ -213,6 +213,74 @@ def test_arm_stop_on_entry_atr_none_is_noop():
     assert strategy._load_stops() == {}, "no record armed without ATR"
 
 
+# ── Regime-based ATR multiplier at entry ──────────────────────────────────────
+
+def test_arm_regime_risk_on_uses_2p5x():
+    _reset()
+    strategy._arm_stop_on_entry("AAA", 210.0, 4.0, regime="risk_on")
+    rec = strategy._load_stops()["AAA"]
+    assert rec["atr_mult"] == 2.5, rec
+    assert abs(rec["stop_price"] - 200.0) < 1e-6, rec          # 210 - 2.5*4
+
+def test_arm_regime_cautious_uses_2p0x():
+    """User's worked example: entry 204, atr 7.05, cautious -> 2.0x -> stop 189.90."""
+    _reset()
+    strategy._arm_stop_on_entry("NVDA", 204.0, 7.05, regime="cautious")
+    rec = strategy._load_stops()["NVDA"]
+    assert rec["atr_mult"] == 2.0, rec
+    assert abs(rec["stop_price"] - 189.90) < 1e-6, rec         # 204 - 2.0*7.05
+
+def test_arm_regime_defensive_uses_1p5x():
+    _reset()
+    strategy._arm_stop_on_entry("AAA", 200.0, 10.0, regime="defensive")
+    rec = strategy._load_stops()["AAA"]
+    assert rec["atr_mult"] == 1.5, rec
+    assert abs(rec["stop_price"] - 185.0) < 1e-6, rec          # 200 - 1.5*10
+
+def test_arm_regime_crisis_uses_1p0x():
+    _reset()
+    strategy._arm_stop_on_entry("AAA", 200.0, 10.0, regime="crisis")
+    rec = strategy._load_stops()["AAA"]
+    assert rec["atr_mult"] == 1.0, rec
+    assert abs(rec["stop_price"] - 190.0) < 1e-6, rec          # 200 - 1.0*10
+
+def test_arm_regime_unknown_falls_back_to_default():
+    _reset()
+    strategy._arm_stop_on_entry("AAA", 210.0, 4.0, regime="banana")
+    rec = strategy._load_stops()["AAA"]
+    assert rec["atr_mult"] == strategy.config.STOP_LOSS_ATR_MULT, rec   # 2.5 fallback
+
+def test_short_arm_regime_defensive_is_tighter_above():
+    """A short in defensive arms 1.5x ABOVE entry (tighter than 2.5x)."""
+    _reset()
+    strategy._arm_stop_on_entry("AAA", 100.0, 4.0, direction="short", regime="defensive")
+    rec = strategy._load_stops()["AAA"]
+    assert rec["atr_mult"] == 1.5, rec
+    assert abs(rec["stop_price"] - 106.0) < 1e-6, rec          # 100 + 1.5*4
+
+def test_trail_uses_armed_mult_not_live_regime():
+    """A position armed at cautious (2.0x) keeps trailing at 2.0x even when the
+    live regime has since flipped to risk_on — width is fixed at entry."""
+    _reset(quote_price=220.0)
+    strategy._arm_stop_on_entry("AAA", 200.0, 10.0, regime="cautious")   # stop 180, mult 2.0
+    # Trail on a new high with the LIVE regime now risk_on (2.5x). Width must stay 2.0x.
+    strategy._check_and_trail_stop("AAA", 10, {"close": 220.0, "atr": 10.0},
+                                   "ACCT", [], regime="risk_on")
+    rec = strategy._load_stops()["AAA"]
+    assert abs(rec["high_water"] - 220.0) < 1e-6, rec
+    assert abs(rec["stop_price"] - 200.0) < 1e-6, rec          # 220 - 2.0*10 (armed), NOT 195 (2.5)
+
+def test_trail_legacy_record_defaults_to_2p5x():
+    """A pre-existing record with no atr_mult key trails at the 2.5x default."""
+    _reset(quote_price=110.0)
+    strategy._save_stops({"AAA": {
+        "entry_price": 100.0, "atr_at_entry": 4.0, "high_water": 100.0,
+        "stop_price": 90.0, "opened": "2026-07-13", "bootstrapped": False}})
+    strategy._check_and_trail_stop("AAA", 10, {"close": 110.0, "atr": 4.0}, "ACCT", [])
+    rec = strategy._load_stops()["AAA"]
+    assert abs(rec["stop_price"] - 100.0) < 1e-6, rec          # 110 - 2.5*4 (default)
+
+
 def test_clear_stop():
     _reset()
     strategy._save_stops({"AAPL": {"entry_price": 1, "atr_at_entry": 1,

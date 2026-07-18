@@ -238,10 +238,12 @@ def main() -> None:
                     active, len(active))
         logger.info("Options     : %s", config.OPTIONS_WATCHLIST)
         logger.info("Next option exp.: %s", mh.next_monthly_expiration())
-        logger.info("Stop loss   : %s (%.1fx ATR%d trailing, file=%s)",
+        logger.info("Stop loss   : %s (regime ATR mult — risk_on %.1fx/cautious %.1fx/"
+                    "defensive %.1fx/crisis %.1fx; ATR%d, trails at armed width, file=%s)",
                     "ENABLED" if config.USE_TRAILING_STOP else "DISABLED",
-                    config.STOP_LOSS_ATR_MULT, config.STOP_LOSS_ATR_PERIOD,
-                    config.STOP_PRICE_FILE)
+                    config.ATR_MULT_RISK_ON, config.ATR_MULT_CAUTIOUS,
+                    config.ATR_MULT_DEFENSIVE, config.ATR_MULT_CRISIS,
+                    config.STOP_LOSS_ATR_PERIOD, config.STOP_PRICE_FILE)
         logger.info("Mom. align  : %s (one-shot/rotation, RSI<%d, file=%s)",
                     "ENABLED" if config.USE_MOMENTUM_ALIGNMENT else "DISABLED",
                     config.MOMENTUM_ALIGN_RSI_MAX, config.MOMENTUM_ENTRY_FILE)
@@ -303,6 +305,20 @@ def main() -> None:
                     "sentiment 'high' sector → blocks new long entries in that sector")
     else:
         logger.info("Sentiment   : DISABLED")
+
+    # Current arming width: the ATR multiple the NEXT entry would arm its stop at,
+    # by the effective (VIX ⊕ sentiment) regime. Fail-open — a startup VIX glitch
+    # must not abort the banner (or the bot), so this is best-effort only.
+    try:
+        _vix, _vix_reg = strategy.current_regime()
+        _eff_reg = _vix_reg
+        if config.ENABLE_SENTIMENT:
+            _eff_reg = strategy._more_fearful(
+                _vix_reg, sentiment_analyzer.sentiment_regime(_rep))
+        logger.info("Stop mult   : %.1fx (%s) — new entries arm their stop at this width",
+                    strategy._regime_atr_mult(_eff_reg), _eff_reg)
+    except Exception as exc:
+        logger.warning("Stop mult   : could not resolve current regime (%s)", exc)
     logger.info("=" * 60)
 
     if not (config.TS_CLIENT_ID and config.TS_CLIENT_SECRET and config.TS_REFRESH_TOKEN):
