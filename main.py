@@ -248,7 +248,7 @@ def main() -> None:
         logger.info("Latch repair: ON — a held momentum name with no latch is "
                     "rebuilt each cycle from BROKER POSITIONS (not stop records: "
                     "the same wipe takes both)")
-        logger.info("Shorting    : %s (SELLSHORT/BUYTOCOVER, core names only, death-cross entries)",
+        logger.info("Shorting    : %s (effective watchlist, death-cross entries)",
                     "ENABLED" if config.ENABLE_SHORTING else "DISABLED")
         if config.ENABLE_PROFIT_TAKING:
             logger.info("Profit take : ENABLED (>= +%.0f%% & RSI >= %.0f -> sell %.0f%%, one-shot, stop kept on remainder)",

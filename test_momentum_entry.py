@@ -195,12 +195,20 @@ def test_short_enters_core_on_death_cross():
     assert abs(rec["low_water"] - 100.0) < 1e-6, rec
 
 
-def test_momentum_name_does_not_short():
-    """The momentum slot is long-only: a death cross must NOT open a short."""
-    _reset(); _set_sig(bearish_cross=True)
+def test_momentum_name_shorts_on_death_cross():
+    """The short universe is now the full effective watchlist: a momentum-slot
+    name (e.g. DDOG) opens a short on a fresh death cross, sized like a long with
+    a trailing stop armed ABOVE entry — same as a core name."""
+    # A genuine death cross: fast EMA now BELOW slow, so the (earlier) momentum
+    # alignment branch cannot fire and the short branch is reached.
+    _reset(); _set_sig(bearish_cross=True, close=100.0, ema_short=100.0, ema_long=105.0)
     strategy.evaluate_stock("DDOG", "ACCT", [], 100000.0,
                             is_momentum=True, momentum_generation="G1")
-    assert _sides("sell_short") == [], "momentum names never short"
+    assert _sides("sell_short") == [("DDOG", "sell_short", 50)], _orders
+    assert strategy._short_entries == 1, "short-entry counter incremented"
+    rec = strategy._load_stops()["DDOG"]
+    assert rec["direction"] == "short", rec
+    assert abs(rec["stop_price"] - 110.0) < 1e-6, rec        # 100 + 2.5*4, stop ABOVE
 
 
 def test_shorting_disabled_no_short():

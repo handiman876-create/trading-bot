@@ -4,7 +4,7 @@ Signal generation and order execution for stocks and options.
 Stock signals  — EMA crossover + RSI confirmation:
   BUY         when short EMA crosses above long EMA  AND  RSI < overbought
   SELL        when short EMA crosses below long EMA  AND  RSI > oversold (long held)
-  SELL SHORT  on a death cross (core names only, ENABLE_SHORTING) when flat —
+  SELL SHORT  on a death cross (any effective-watchlist name, ENABLE_SHORTING) when flat —
               sized like a long, stop ABOVE entry ratcheting DOWN
   BUY TO COVER on a bullish cross while short (RSI < overbought)
 
@@ -644,7 +644,7 @@ def _enter_long(symbol: str, sig: dict, price: float, account_id: str,
 
 def _enter_short(symbol: str, sig: dict, price: float, account_id: str,
                  positions: list[dict], equity: Optional[float], reason: str) -> bool:
-    """Short-entry path (core names only, fresh death cross): enforce MAX_POSITIONS,
+    """Short-entry path (any effective-watchlist name, fresh death cross): enforce MAX_POSITIONS,
     size like a long at EQUITY_PER_TRADE_PCT, place a SELLSHORT, and on a filled
     order mark the symbol signaled, log the trade, and arm the ABOVE-entry trailing
     stop. Mirrors _enter_long. Returns True iff an order was placed and accepted."""
@@ -940,11 +940,14 @@ def evaluate_stock(symbol: str, account_id: str, positions: list[dict],
             logger.info("MOMENTUM ALIGNMENT ENTRY %s (gen=%s) — align entries #%d",
                         symbol, momentum_generation or "<none>", _momentum_align_entries)
 
-    # SHORT signal — fresh death cross, CORE names only (momentum slot stays
-    # long-only). Mirrors the long BUY: same RSI gate, same held==0 requirement.
+    # SHORT signal — fresh death cross, any name in the effective watchlist
+    # (core ∪ momentum ∪ held). The loop only ever feeds effective-watchlist
+    # symbols, so reaching here already means the bot actively watches this name;
+    # momentum picks are now shortable too. Crisis is still blocked by
+    # block_new_entries. Mirrors the long BUY: same RSI gate, same held==0.
     # Stays EDGE-based: it is an entry. On state it would re-short every poll.
     elif (sig["bearish_cross"] and sig["rsi"] > config.RSI_OVERSOLD and held == 0
-          and not is_momentum and config.ENABLE_SHORTING and not block_new_entries):
+          and config.ENABLE_SHORTING and not block_new_entries):
         if _enter_short(symbol, sig, price, account_id, positions, equity,
                         reason=f"EMA cross down (short), RSI={sig['rsi']:.1f}"):
             _short_entries += 1
