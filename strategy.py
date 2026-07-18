@@ -209,6 +209,7 @@ _short_covers = 0
 _latches_reconstructed = 0
 _crisis_exits = 0
 _sentiment_sector_blocks = 0
+_profit_takes = 0
 
 
 def _load_json(path: str) -> dict:
@@ -471,6 +472,57 @@ def _check_and_trail_stop(symbol: str, held: int, sig: dict,
 
     _save_stops(stops)                # persist ratcheted water/stop progress
     return False
+
+
+# ── Profit taking (scale out of a winner) ─────────────────────────────────────
+
+
+def _maybe_take_profit(symbol: str, held: int, sig: dict, account_id: str) -> bool:
+    """Sell config.PROFIT_TAKE_FRACTION of a winning long once it is up
+    >= PROFIT_TAKE_PCT from entry AND RSI >= PROFIT_TAKE_RSI_MIN. One-shot per
+    position: the `profit_taken` flag in the stop record guards re-firing (a
+    missing flag reads as False — back-compat with records predating this rule).
+    The trailing stop record is deliberately KEPT so the remaining shares stay
+    protected. De-risking, so it runs ungated like the stop and state exits.
+
+    Entry basis comes from the stop record's entry_price; with no record (stops
+    disabled, or a name we can't size the gain for) it is a no-op. Returns True
+    iff a partial-sell order was placed, in which case the caller returns and
+    skips the rest of the cycle for this name (mirrors _check_and_trail_stop)."""
+    global _profit_takes
+    if not config.ENABLE_PROFIT_TAKING or held <= 0:
+        return False
+    stops = _load_stops()
+    rec = stops.get(symbol)
+    if not rec:
+        return False                         # no entry basis -> cannot size the gain
+    entry = rec.get("entry_price")
+    if not entry or entry <= 0:
+        return False
+    if rec.get("profit_taken", False):       # missing flag == not yet taken
+        return False
+    price = sig["close"]
+    gain = (price - entry) / entry
+    if gain < config.PROFIT_TAKE_PCT or sig["rsi"] < config.PROFIT_TAKE_RSI_MIN:
+        return False
+    sell_qty = math.floor(held * config.PROFIT_TAKE_FRACTION)
+    if sell_qty < 1:
+        return False                         # position too small to halve — leave it
+
+    logger.info("PROFIT TAKE %s x%d (+%.1f%% from entry, RSI=%.1f)",
+                symbol, sell_qty, gain * 100, sig["rsi"])
+    result = tc.place_equity_order(account_id, symbol, "sell", sell_qty)
+    if not result:
+        logger.error("PROFIT TAKE %s: sell order failed — retry next cycle", symbol)
+        return False
+    _profit_takes += 1
+    rec["profit_taken"] = True               # latch BEFORE anything else can re-read
+    stops[symbol] = rec
+    _save_stops(stops)                       # record kept -> remainder keeps its stop
+    order_id = result.get("order", {}).get("id")
+    log_trade("SELL", symbol, sell_qty, price, "market", order_id,
+              f"profit take (+{gain * 100:.1f}% from entry, RSI={sig['rsi']:.1f})")
+    return True
 
 
 # ── Momentum alignment latch (one-shot entry per rotation) ────────────────────
@@ -788,6 +840,13 @@ def evaluate_stock(symbol: str, account_id: str, positions: list[dict],
             else:
                 logger.error("CRISIS SELL %s FAILED — retry next cycle", symbol)
             return
+
+    # PROFIT TAKE — scale out of a winning long before the exit/entry logic.
+    # De-risking, so like the stop and state exits it runs ungated by regime and
+    # the entry delay. One-shot per position; the trailing stop stays on the
+    # remainder. Placed after the stop check, before the exit signal.
+    if held > 0 and _maybe_take_profit(symbol, held, sig, account_id):
+        return
 
     # ── EXITS ─────────────────────────────────────────────────────────────────
     # Evaluated BEFORE the entry gate, and on state rather than an edge, so a

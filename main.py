@@ -250,6 +250,14 @@ def main() -> None:
                     "the same wipe takes both)")
         logger.info("Shorting    : %s (SELLSHORT/BUYTOCOVER, core names only, death-cross entries)",
                     "ENABLED" if config.ENABLE_SHORTING else "DISABLED")
+        if config.ENABLE_PROFIT_TAKING:
+            logger.info("Profit take : ENABLED (>= +%.0f%% & RSI >= %.0f -> sell %.0f%%, one-shot, stop kept on remainder)",
+                        config.PROFIT_TAKE_PCT * 100, config.PROFIT_TAKE_RSI_MIN,
+                        config.PROFIT_TAKE_FRACTION * 100)
+        else:
+            logger.info("Profit take : DISABLED (enable via ENABLE_PROFIT_TAKING; would sell %.0f%% at +%.0f%% & RSI >= %.0f)",
+                        config.PROFIT_TAKE_FRACTION * 100, config.PROFIT_TAKE_PCT * 100,
+                        config.PROFIT_TAKE_RSI_MIN)
         try:
             _excl, _univ = momentum_screen.count_excluded_universe()
             logger.info("Sector filter: %d of %d universe excluded %s "

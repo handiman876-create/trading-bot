@@ -89,6 +89,17 @@ RSI_PERIOD       = 14
 RSI_OVERSOLD     = 30
 RSI_OVERBOUGHT   = 70
 
+# ── Profit taking (scale out of a winner) ─────────────────────────────────────
+# Sell PROFIT_TAKE_FRACTION of a long once it is up >= PROFIT_TAKE_PCT from entry
+# AND RSI is extended (>= PROFIT_TAKE_RSI_MIN). One-shot per position, tracked as
+# "profit_taken" in stop_prices.json (a missing flag reads as False — back-compat).
+# The trailing stop stays armed on the remaining shares. Like the stop and state
+# exits it is DE-RISKING, so it runs ungated by regime and the entry delay.
+ENABLE_PROFIT_TAKING = False  # dormant insurance — enable only after live stop data
+PROFIT_TAKE_PCT      = 0.12   # trigger once up this fraction from entry (+12%)
+PROFIT_TAKE_FRACTION = 0.50   # sell this fraction of the held shares (half)
+PROFIT_TAKE_RSI_MIN  = 60.0   # only when RSI is at least this (extended)
+
 # ── Position Sizing ───────────────────────────────────────────────────────────
 EQUITY_PER_TRADE_PCT = 0.05   # fraction of account equity deployed per stock trade
 MAX_POSITIONS        = 20     # skip new stock entries once this many positions are
@@ -106,6 +117,8 @@ STOP_LOSS_ATR_PERIOD = 14     # ATR lookback (Wilder), computed once at entry
 STOP_PRICE_FILE      = "data/stop_prices.json"   # generated (gitignored)
 # stop_prices.json schema, per symbol:
 #   entry_price, atr_at_entry, stop_price, opened, bootstrapped, direction
+#   + "profit_taken" (bool; set once a partial profit-take has fired — missing
+#     reads as False, so records written before profit-taking existed are back-compat)
 #   + "high_water" (longs: max price seen; stop = high_water - MULT*atr, rises)
 #   OR "low_water"  (shorts: min price seen; stop = low_water + MULT*atr, falls)
 # "direction" is "long" | "short"; records written before shorts existed have no
