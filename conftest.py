@@ -33,4 +33,9 @@ def isolate_bot_state(tmp_path, monkeypatch):
     except ImportError:
         pass
 
+    # A/B screen experiment writes (tracker + fundamentals cache) — redirect so a
+    # pytest run can never read or clobber live experiment state.
+    monkeypatch.setattr(config, "SCREEN_AB_TRACKING_FILE", str(tmp_path / "screen_ab_tracking.json"), raising=False)
+    monkeypatch.setattr(config, "FUNDAMENTALS_CACHE_FILE", str(tmp_path / "fundamentals_cache.json"), raising=False)
+
     yield

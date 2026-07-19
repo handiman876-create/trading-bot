@@ -201,6 +201,29 @@ EXCLUDED_SECTORS = [
     "Passenger Airlines", # airlines — GICS sub-industry of Industrials
 ]
 
+# ── A/B screen experiment (observation only — NOT fed to the live bot) ────────
+# screen_ab_tracker.py runs the live screen (Screen A) alongside an experimental
+# profitability-filtered screen (Screen B) each rotation, records both to
+# SCREEN_AB_TRACKING_FILE, and measures each rotation's 2-week forward returns on
+# the NEXT rotation. Screen A here is the SAME 20-day ranking the live bot uses
+# (MOM_LOOKBACK) so the profitability filter is the only variable between A and B.
+# The tracker NEVER writes MOMENTUM_WATCHLIST_FILE — the live path is untouched.
+SCREEN_AB_TRACKING_FILE   = "data/screen_ab_tracking.json"   # generated (gitignored)
+SCREEN_AB_MIN_ROTATIONS   = 4        # don't declare a winner before this many rotations
+# Screen B: from the top SCREEN_B_TOP_N momentum names, keep those with at least
+# SCREEN_B_MIN_PROFITABLE_Q of the last SCREEN_B_QUARTERS_LOOKBACK quarters showing
+# positive net income; take the first MOMENTUM_SLOT_SIZE that survive.
+SCREEN_B_TOP_N            = 30
+SCREEN_B_QUARTERS_LOOKBACK = 5
+SCREEN_B_MIN_PROFITABLE_Q = 4
+# Realized-volatility window (annualized, %) recorded alongside avg_iv as a
+# supplementary premium proxy — populated even when the paid IV feed is not.
+SCREEN_AB_RV_WINDOW       = 20
+# Fundamentals cache: quarterly financials change ~once a quarter, so a long TTL
+# keeps Screen B's profitability lookups off the shared 5-calls/min Polygon key.
+FUNDAMENTALS_CACHE_FILE   = "data/fundamentals_cache.json"   # generated (gitignored)
+FUNDAMENTALS_CACHE_TTL_DAYS = 30
+
 # ── VIX fear gauge (market-regime filter) ─────────────────────────────────────
 # A market-wide risk overlay driven by the CBOE Volatility Index, applied to BOTH
 # equities and futures. One quote per cycle (cached VIX_CACHE_SECONDS) maps to a

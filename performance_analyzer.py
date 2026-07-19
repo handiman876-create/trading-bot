@@ -566,6 +566,81 @@ def _fmt_pct(v) -> str:
     return f"{v*100:+.2f}%" if isinstance(v, (int, float)) else "n/a"
 
 
+def _fmt_iv(v) -> str:
+    return f"{v:.1f}%" if isinstance(v, (int, float)) else "n/a"
+
+
+def _ab_screen_lines(tracking: dict | None = None) -> list[str]:
+    """Render the A/B SCREEN TRACKER section from SCREEN_AB_TRACKING_FILE.
+
+    Read-only: summarizes screen_ab_tracker.py's output (which is produced by a
+    separate timer). `tracking` can be passed in for tests; otherwise it's loaded
+    from disk, and a missing/empty file degrades to a one-line 'no data yet'
+    note rather than an error. No recommendation is shown before
+    SCREEN_AB_MIN_ROTATIONS completed rotations."""
+    if tracking is None:
+        try:
+            with open(os.path.join(_HERE, config.SCREEN_AB_TRACKING_FILE)) as f:
+                tracking = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            tracking = None
+
+    L = ["=== A/B Screen Comparison ==="]
+    rotations = (tracking or {}).get("rotations") or []
+    completed = [r for r in rotations if r.get("two_week_results")]
+    min_rot = config.SCREEN_AB_MIN_ROTATIONS
+    L.append(f"Rotations completed: {len(completed)} (min {min_rot} needed)")
+    if not rotations:
+        L.append("  (no A/B rotations recorded yet — screen_ab_tracker.py has not run)")
+        return L
+
+    def _summarize(screen_key: str, label: str) -> tuple[list[str], float | None]:
+        lines = [f"{label} picks so far:"]
+        all_rets, all_ivs = [], []
+        for r in completed:
+            res = r["two_week_results"]
+            rets = res[f"{screen_key}_returns"]
+            picks = [f"{s} {_fmt_pct(v)}" for s, v in rets.items() if s != "avg"]
+            lines.append(f"  {r['rotation_date']}: "
+                         + (", ".join(picks) if picks else "(no picks)")
+                         + f"   [avg {_fmt_pct(rets.get('avg'))}]")
+            all_rets += [v for s, v in rets.items() if s != "avg" and isinstance(v, (int, float))]
+            all_ivs += [d.get("iv") for d in r[screen_key].get("detail", [])
+                        if isinstance(d.get("iv"), (int, float))]
+        avg_ret = round(sum(all_rets) / len(all_rets), 4) if all_rets else None
+        avg_iv = round(sum(all_ivs) / len(all_ivs), 1) if all_ivs else None
+        lines.append(f"  Avg 2-week return: {_fmt_pct(avg_ret)}")
+        lines.append(f"  Avg IV: {_fmt_iv(avg_iv)}")
+        return lines, avg_ret
+
+    a_lines, a_avg = _summarize("screen_a", "Screen A (current)")
+    b_lines, b_avg = _summarize("screen_b", "Screen B (profitable filter)")
+    L += a_lines + b_lines
+
+    tally = (tracking or {}).get("winner_tally") or {}
+    a_wins, b_wins, ties = tally.get("screen_a", 0), tally.get("screen_b", 0), tally.get("tie", 0)
+    if a_wins > b_wins:
+        leader = "Screen A"
+    elif b_wins > a_wins:
+        leader = "Screen B"
+    else:
+        leader = "TIE"
+    L.append(f"Current leader: {leader}  (A:{a_wins} B:{b_wins} tie:{ties})")
+
+    if len(completed) >= min_rot:
+        if a_avg is not None and b_avg is not None and b_avg > a_avg and b_wins > a_wins:
+            rec = "adopt B (Screen B leads on both avg return and rotations won)"
+        elif a_avg is not None and b_avg is not None and a_avg >= b_avg:
+            rec = "keep A (profitability filter did not improve returns)"
+        else:
+            rec = "wait (signal is mixed — leader and avg-return disagree)"
+        L.append(f"Recommendation: {rec}")
+    else:
+        L.append(f"Recommendation: wait — need {min_rot - len(completed)} more rotation(s) "
+                 f"before drawing a conclusion")
+    return L
+
+
 def render_txt(report: dict) -> str:
     L = []
     L.append("TradeStation Bot — Weekly Performance Report")
@@ -638,6 +713,9 @@ def render_txt(report: dict) -> str:
     for o in dq["orphan_exits_missing_entry"][:5]:
         L.append(f"      - {o['symbol']} {o['action']} @ {o['ts']}")
     L.append(f"  new events added to ledger this run: {dq.get('new_events_added', 0)}")
+    L.append("")
+    L.append("A/B SCREEN TRACKER")
+    L.extend(_ab_screen_lines())
     return "\n".join(L) + "\n"
 
 

@@ -1,0 +1,19 @@
+[Unit]
+Description=A/B momentum screen tracker — observation only, records data/screen_ab_tracking.json
+Documentation=file:/root/trading-bot/deploy/run-screen-ab-tracker.sh
+After=network-online.target momentum-rotation.service
+Wants=network-online.target
+
+[Service]
+# oneshot: run to completion, then exit (the .timer schedules it; not a daemon).
+Type=oneshot
+User=root
+WorkingDirectory=/root/trading-bot
+ExecStart=/root/trading-bot/deploy/run-screen-ab-tracker.sh
+# Same free-tier rate-limit reality as the live screen (~10 min full pull); cap
+# well above it so a Polygon slowdown can't wedge the run.
+TimeoutStartSec=1800
+StandardOutput=append:/root/trading-bot/logs/screen_ab.log
+StandardError=append:/root/trading-bot/logs/screen_ab.log
+
+# No [Install] section: a timer-activated oneshot is pulled in by its .timer.

@@ -32,7 +32,11 @@ from datetime import date, datetime, timedelta, timezone
 
 import pandas as pd
 
+import math
+import statistics
+
 import config
+import fundamentals
 import indicators as ind
 import polygon_client as pc
 
@@ -147,6 +151,53 @@ def evaluate_symbol(symbol: str, closes: list[float], volumes: list[float]) -> d
     return None
 
 
+def realized_vol(closes: list[float], window: int = None) -> float | None:
+    """Annualized realized volatility (%) over the last `window` daily returns.
+
+    Supplementary premium proxy recorded next to the (paid, often-unavailable)
+    implied vol: high-realized-vol names are high-IV names, so this still lets the
+    A/B compare "how volatile are Screen A's picks vs Screen B's" while avg_iv is
+    None. Pure — no I/O — so it's unit-tested directly. Returns None if there
+    aren't enough closes for a 2+ point sample."""
+    window = window or config.SCREEN_AB_RV_WINDOW
+    if not closes or len(closes) < 3:
+        return None
+    tail = closes[-(window + 1):]
+    rets = [math.log(tail[i] / tail[i - 1])
+            for i in range(1, len(tail)) if tail[i - 1] > 0 and tail[i] > 0]
+    if len(rets) < 2:
+        return None
+    return round(statistics.stdev(rets) * math.sqrt(252) * 100.0, 1)
+
+
+def run_screen_b(ranked: list[dict], *, cache: dict | None = None) -> list[dict]:
+    """Screen B: from the top SCREEN_B_TOP_N of the SAME momentum ranking, keep
+    only names that clear the profitability filter, and take the first
+    MOMENTUM_SLOT_SIZE that survive. Returns the same row shape as `screen()`.
+
+    Reaches deeper than Screen A only to backfill slots vacated by unprofitable
+    names — the momentum criteria and ordering are identical, so profitability is
+    the only difference between A and B. A symbol whose financials can't be
+    fetched (is_profitable -> None) is treated as NOT profitable, so a Polygon
+    outage can't smuggle an unvetted name into the filtered set. May return fewer
+    than MOMENTUM_SLOT_SIZE (even zero) if the top-N has too few profitable names;
+    the caller records that rather than backfilling with unvetted picks."""
+    if cache is None:
+        cache = fundamentals._load_cache()
+    picks: list[dict] = []
+    considered = 0
+    for row in ranked[: config.SCREEN_B_TOP_N]:
+        considered += 1
+        if fundamentals.is_profitable(row["symbol"], cache=cache) is True:
+            picks.append(row)
+            if len(picks) >= config.MOMENTUM_SLOT_SIZE:
+                break
+    fundamentals._save_cache(cache)
+    logger.info("Screen B: %d profitable of %d considered (top-%d)",
+                len(picks), considered, config.SCREEN_B_TOP_N)
+    return picks
+
+
 def _excluded_set() -> set[str]:
     """config.EXCLUDED_SECTORS as a casefolded set for case-insensitive matching."""
     return {s.casefold() for s in getattr(config, "EXCLUDED_SECTORS", [])}
@@ -175,9 +226,15 @@ def count_excluded_universe() -> tuple[int, int]:
     return n, len(universe)
 
 
-def screen() -> list[dict]:
-    """Run the screen. Returns ranked survivors (excluding core) as dicts with
-    symbol/return_20d/rsi/rel_volume, best return first."""
+def collect_and_rank() -> tuple[list[dict], dict, list[str]]:
+    """Collect grouped-daily bars once and return the FULL ranked survivor list
+    (best 20-day return first), plus the raw (by_date, dates_asc) so a caller can
+    reuse the same universe-wide bars — e.g. to look up any symbol's latest close
+    without spending more Polygon calls.
+
+    This is `screen()` minus the final slice: extracted so both the live screen
+    (top MOMENTUM_SLOT_SIZE) and the A/B tracker (which needs the deeper ranking
+    for Screen B and the bars for return measurement) draw from ONE computation."""
     global _sector_skips, _sector_unknown
     _sector_skips = _sector_unknown = 0
 
@@ -219,6 +276,14 @@ def screen() -> list[dict]:
                     _sector_skips, _sector_unknown)
     survivors.sort(key=lambda r: r["return_20d"], reverse=True)
     logger.info("%d symbols passed all criteria", len(survivors))
+    return survivors, by_date, dates_asc
+
+
+def screen() -> list[dict]:
+    """Run the screen. Returns the top MOMENTUM_SLOT_SIZE ranked survivors
+    (excluding core) as dicts with symbol/return_20d/rsi/rel_volume, best return
+    first. This is the LIVE Screen A output — its behavior is unchanged."""
+    survivors, _by_date, _dates_asc = collect_and_rank()
     return survivors[: config.MOMENTUM_SLOT_SIZE]
 
 

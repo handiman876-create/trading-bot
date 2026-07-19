@@ -1,0 +1,16 @@
+[Unit]
+Description=Run the A/B screen tracker on the 1st and 15th at 07:00 America/New_York
+
+[Timer]
+# 1st and 15th, 07:00 Eastern — one hour after momentum-rotation.timer (06:00) so
+# the live screen has finished (its timeout is 30 min) and the two never hit the
+# shared free-tier Polygon key concurrently. Same twice-monthly cadence, which is
+# exactly the 2-week horizon the tracker measures forward returns over.
+OnCalendar=*-*-01,15 07:00:00 America/New_York
+# If the machine was off at the scheduled time, run once at next boot rather than
+# skipping the rotation's snapshot.
+Persistent=true
+RandomizedDelaySec=120
+
+[Install]
+WantedBy=timers.target

@@ -17,6 +17,9 @@ data/stop_prices.json
 data/momentum_entries.json
 data/trade_ledger.json
 data/sentiment_report.json
+data/screen_ab_tracking.json
+data/fundamentals_cache.json
+screen_ab.lock
 .venv/
 bot.log.*
 bot.futures.log.*

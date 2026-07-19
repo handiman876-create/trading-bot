@@ -82,3 +82,88 @@ def get_grouped_daily(date_str: str, adjusted: bool = True) -> dict:
             "volume": r.get("v"),
         }
     return out
+
+
+def get_quarterly_financials(symbol: str, limit: int = 5) -> list[dict]:
+    """Most recent `limit` quarterly filings for `symbol`, newest first.
+
+    Returns a list of {"fiscal_period","fiscal_year","end_date","net_income"};
+    `net_income` is None when the filing omits the field (a real data gap — the
+    caller must treat null as "not known to be profitable", never as zero). Used
+    only by fundamentals.py for Screen B's profitability filter — never by the
+    live trading path. This is the SEC-derived /vX/reference/financials endpoint,
+    which is available on the free tier (unlike the options snapshot below)."""
+    data = _get(
+        "vX/reference/financials",
+        {
+            "ticker": symbol.upper(),
+            "timeframe": "quarterly",
+            "limit": limit,
+            "order": "desc",
+            "sort": "period_of_report_date",
+        },
+    )
+    out: list[dict] = []
+    for f in data.get("results") or []:
+        inc = (f.get("financials") or {}).get("income_statement") or {}
+        ni = inc.get("net_income_loss") or {}
+        out.append({
+            "fiscal_period": f.get("fiscal_period"),
+            "fiscal_year":   f.get("fiscal_year"),
+            "end_date":      f.get("end_date"),
+            "net_income":    ni.get("value"),
+        })
+    return out
+
+
+def get_atm_option_iv(symbol: str, underlying_price: float | None = None) -> float | None:
+    """Implied volatility (annualized %) of the ~ATM, nearest-expiry option for
+    `symbol`, or None if it can't be fetched.
+
+    Reads the unified options snapshot (/v3/snapshot/options/<sym>), keeps the
+    soonest non-expired expiry, and within it the strike closest to
+    `underlying_price` (falling back to the snapshot's own underlying quote), then
+    returns that contract's implied_volatility as a percentage (Polygon reports it
+    as a decimal, e.g. 0.652 -> 65.2).
+
+    IV is SUPPLEMENTARY, never a gate: any failure — most notably a tier that is
+    not entitled to options data (Polygon returns NOT_AUTHORIZED) — returns None
+    so the caller records the pick with iv=None and moves on. Confirmed
+    2026-07-19: the free/shared stock key is NOT entitled, so this returns None
+    until an options-entitled key is configured; the code then works unchanged."""
+    try:
+        data = _get(f"v3/snapshot/options/{symbol.upper()}", {"limit": 250})
+    except PolygonError as exc:
+        logger.warning("IV fetch for %s failed: %s", symbol, exc)
+        return None
+    if data.get("status") == "NOT_AUTHORIZED":
+        logger.warning("IV fetch for %s: NOT_AUTHORIZED (tier lacks options data)", symbol)
+        return None
+    results = data.get("results") or []
+    if not results:
+        return None
+
+    def _details(c: dict) -> dict:
+        return c.get("details") or {}
+
+    dated = [c for c in results if _details(c).get("expiration_date")]
+    if not dated:
+        return None
+    nearest_exp = min(_details(c)["expiration_date"] for c in dated)
+    chain = [c for c in dated if _details(c)["expiration_date"] == nearest_exp]
+
+    px = underlying_price
+    if px is None:
+        ua = (chain[0].get("underlying_asset") or {})
+        px = ua.get("price") or ua.get("value")
+    if px is None:
+        return None
+
+    def _strike_dist(c: dict) -> float:
+        return abs((_details(c).get("strike_price") or 0.0) - px)
+
+    atm = min(chain, key=_strike_dist)
+    iv = atm.get("implied_volatility")
+    if iv is None:
+        return None
+    return round(float(iv) * 100.0, 1)
