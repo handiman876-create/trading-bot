@@ -452,3 +452,48 @@ def confirm_order(
                      trade_action, symbol, data.get("Errors") or data)
         return None
     return confirmations[0]
+
+
+def get_order(account_id: str, order_id: str) -> Optional[float]:
+    """Return an order's average FilledPrice, or None if it isn't filled.
+
+    Used to arm trailing stops off the REAL fill instead of the signal-bar close
+    (see strategy._resolve_fill and memory project_stop_armed_at_signal_price).
+    Polls at most twice: market orders on liquid names fill in <1s, so if the
+    order is still working we wait 2s and re-check exactly once, then give up.
+    Returns None (with a WARNING) on a still-pending order, a null/zero
+    FilledPrice, or any API error — the caller falls back to the signal price.
+    """
+    for attempt in (1, 2):
+        try:
+            data = _get(f"brokerage/accounts/{account_id}/orders/{order_id}")
+        except Exception as exc:
+            logger.warning("get_order failed for %s: %s", order_id, exc)
+            return None
+        orders = data.get("Orders", [])
+        if not orders:
+            logger.warning("get_order returned no order for %s: %s",
+                           order_id, data.get("Errors") or data)
+            return None
+        o = orders[0]
+        # FilledPrice is the whole-order average; fall back to the first leg's
+        # ExecutionPrice (equal for a single-leg equity market order).
+        price = _f(o.get("FilledPrice"))
+        if price is None:
+            legs = o.get("Legs") or []
+            if legs:
+                price = _f(legs[0].get("ExecutionPrice"))
+        if price is not None and price > 0:
+            if str(o.get("StatusDescription", "")).lower() == "partial fill":
+                logger.warning("get_order %s only PARTIALLY filled — using partial "
+                               "average fill %.4f", order_id, price)
+            return price
+        # Still working (Received/Sent, no price yet). Retry once, then bail.
+        if attempt == 1:
+            logger.info("Order %s still pending (status=%s) — retrying in 2s",
+                        order_id, o.get("StatusDescription"))
+            time.sleep(2)
+        else:
+            logger.warning("Order %s still pending after 2s (status=%s)",
+                           order_id, o.get("StatusDescription"))
+    return None

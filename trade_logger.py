@@ -25,23 +25,41 @@ def _now_str() -> str:
 
 
 def log_trade(action: str, symbol: str, quantity: int, price: float,
-              order_type: str, order_id=None, notes: str = "") -> None:
-    """Append one trade record to the trade log."""
+              order_type: str, order_id=None, notes: str = "",
+              fill_price=None, signal_price=None, slippage=None) -> None:
+    """Append one trade record to the trade log.
+
+    `price` stays the signal-bar close for backward compatibility (the ledger
+    prices round-trips off it). Entry paths also pass the resolved broker
+    `fill_price`, the `signal_price`, and the signed `slippage` (positive = worse
+    fill than signalled); these are None for exits and on a fill-lookup miss.
+    The three keys are ALWAYS written on new records (null when absent) so the
+    ledger schema is uniform going forward — existing records are never rewritten.
+    """
     record = {
-        "timestamp":  _now_str(),
-        "action":     action,
-        "symbol":     symbol,
-        "quantity":   quantity,
-        "price":      price,
-        "order_type": order_type,
-        "order_id":   order_id,
-        "notes":      notes,
+        "timestamp":    _now_str(),
+        "action":       action,
+        "symbol":       symbol,
+        "quantity":     quantity,
+        "price":        price,
+        "order_type":   order_type,
+        "order_id":     order_id,
+        "notes":        notes,
+        "signal_price": signal_price,
+        "fill_price":   fill_price,
+        "slippage":     slippage,
     }
     with open(config.TRADE_LOG_FILE, "a") as f:
         f.write(json.dumps(record) + "\n")
+    if fill_price is not None:
+        fill_str = f" (fill={fill_price:.4f}, slippage={slippage:+.4f})"
+    elif signal_price is not None:
+        fill_str = " (fill=UNAVAILABLE, using signal)"
+    else:
+        fill_str = ""
     logging.getLogger("trade").info(
-        "%s  %s x%d @ %.4f  [%s]  %s",
-        action, symbol, quantity, price, order_type, notes,
+        "%s  %s x%d @ %.4f  [%s]  %s%s",
+        action, symbol, quantity, price, order_type, notes, fill_str,
     )
 
 

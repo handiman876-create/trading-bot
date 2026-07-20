@@ -317,28 +317,21 @@ def _bootstrap_stop(symbol: str, held: int, sig: dict, positions: list[dict],
 
 
 def _arm_stop_on_entry(symbol: str, entry_price: float, atr: Optional[float],
-                       direction: str = "long", regime: str = "risk_on") -> None:
+                       direction: str = "long", regime: str = "risk_on",
+                       signal_price: Optional[float] = None,
+                       fill_price: Optional[float] = None,
+                       slippage: Optional[float] = None) -> None:
     """Create a fresh stop record after a BUY (long) or SELLSHORT (short) fills.
     The stop WIDTH is the regime's ATR multiple (risk_on 2.5 → crisis 1.0),
     persisted as "atr_mult" and reused for all later trailing so the width is
     fixed at entry. A short's stop sits ABOVE entry (entry + mult*atr) and will
     ratchet DOWN; a long's sits below and ratchets up. No-op with a warning if ATR
     is unavailable (equities always carry high/low, so this should never fire)."""
-    # TODO: callers pass the SIGNAL-bar close (sig["close"]), not the actual fill
-    # price — the order response carries no fill price to read (a market order is
-    # accepted async, and _place_order returns only the OrderID). Market fills
-    # typically arrive at or above sig["close"], so entry_price lands low and the
-    # stop sits slightly lower than intended: under-protective, not over. Measured
-    # 2026-07-15: DDOG 254.64 armed vs 256.34 basis (+1.70/sh), LII 559.87 vs
-    # 568.03 (+8.16/sh).
-    # Fix: reconcile entry_price from cost_basis/qty on a later cycle (the
-    # arithmetic already exists in _bootstrap_stop) WITHOUT lowering an
-    # already-ratcheted stop_price — the ratchet is monotonic by design.
-    # Re-measure first: every stop armed so far predates CROSS_ENTRY_DELAY_MINUTES
-    # going live (2026-07-15 21:26). LII was armed at 09:30:10 ET off a daily bar
-    # holding seconds of data, so its gap is inflated; the 30-min delay should
-    # shrink this on its own. Confirm the size on post-delay entries before
-    # prioritising.
+    # entry_price is now the ACTUAL fill when available: the entry paths resolve
+    # it via _resolve_fill -> tc.get_order before calling here, and pass the
+    # signal_price/fill_price/slippage through for the STOP ARMED log. On a
+    # fill-lookup miss they fall back to sig["close"] (signal_price set, fill_price
+    # None) and this logs a WARNING that the stop was armed at the signal price.
     # See memory: project_stop_armed_at_signal_price
     if atr is None or atr <= 0:
         logger.warning("Could not arm stop for %s: ATR unavailable — position is "
@@ -363,8 +356,18 @@ def _arm_stop_on_entry(symbol: str, entry_price: float, atr: Optional[float],
     stops = _load_stops()
     stops[symbol] = rec
     _save_stops(stops)
-    logger.info("STOP ARMED %s %s entry=%.2f atr=%.2f mult=%.1fx stop=%.2f (regime=%s)",
-                symbol, direction, entry_price, atr, mult, stop, regime)
+    if fill_price is not None:
+        logger.info("STOP ARMED %s %s entry=%.2f atr=%.2f mult=%.1fx stop=%.2f "
+                    "(regime=%s) fill=%.2f signal=%.2f slippage=%+.2f",
+                    symbol, direction, entry_price, atr, mult, stop, regime,
+                    fill_price, signal_price, slippage)
+    elif signal_price is not None:
+        logger.warning("STOP ARMED %s %s entry=%.2f atr=%.2f mult=%.1fx stop=%.2f "
+                       "(regime=%s) fill=UNAVAILABLE — armed at SIGNAL price",
+                       symbol, direction, entry_price, atr, mult, stop, regime)
+    else:
+        logger.info("STOP ARMED %s %s entry=%.2f atr=%.2f mult=%.1fx stop=%.2f (regime=%s)",
+                    symbol, direction, entry_price, atr, mult, stop, regime)
 
 
 def _clear_stop(symbol: str) -> None:
@@ -631,6 +634,30 @@ def reconcile_momentum_entries(momentum_symbols, positions: list[dict],
 # ── Stock Strategy ────────────────────────────────────────────────────────────
 
 
+def _resolve_fill(symbol: str, account_id: str, order_id: Optional[str],
+                  signal_price: float, direction: str) -> tuple:
+    """Resolve the ACTUAL entry price for a just-placed equity order.
+
+    Queries the broker (tc.get_order) for the fill and returns
+    (entry_price, fill_price, slippage):
+      * fill available   -> (fill, fill, slippage)          stop arms off the fill
+      * fill unavailable -> (signal_price, None, None) + WARNING; stop falls back
+        to the signal-bar close (degraded, not disabled).
+
+    Slippage is signed so POSITIVE always means a WORSE fill than signalled:
+      long  buy:  fill - signal   (paid more   = worse)
+      short sell: signal - fill   (sold cheaper = worse; a short wants a HIGH sell)
+    Centralised here so _enter_long and _enter_short compute it identically.
+    """
+    fill = tc.get_order(account_id, order_id) if order_id else None
+    if fill is None:
+        logger.warning("Fill price unavailable for %s — using signal price %.4f "
+                       "for stop (degraded, not disabled).", symbol, signal_price)
+        return signal_price, None, None
+    slippage = (fill - signal_price) if direction == "long" else (signal_price - fill)
+    return fill, fill, round(slippage, 4)
+
+
 def _enter_long(symbol: str, sig: dict, price: float, account_id: str,
                 positions: list[dict], equity: Optional[float], reason: str,
                 regime: str = "risk_on") -> bool:
@@ -656,8 +683,12 @@ def _enter_long(symbol: str, sig: dict, price: float, account_id: str,
     if result:
         _mark_bought(symbol)
         order_id = result.get("order", {}).get("id")
-        log_trade("BUY", symbol, qty, price, "market", order_id, reason)
-        _arm_stop_on_entry(symbol, price, sig.get("atr"), regime=regime)
+        entry_px, fill_px, slippage = _resolve_fill(symbol, account_id, order_id,
+                                                     price, "long")
+        log_trade("BUY", symbol, qty, price, "market", order_id, reason,
+                  fill_price=fill_px, signal_price=price, slippage=slippage)
+        _arm_stop_on_entry(symbol, entry_px, sig.get("atr"), regime=regime,
+                           signal_price=price, fill_price=fill_px, slippage=slippage)
         return True
     return False
 
@@ -687,8 +718,13 @@ def _enter_short(symbol: str, sig: dict, price: float, account_id: str,
     if result:
         _mark_sold(symbol)
         order_id = result.get("order", {}).get("id")
-        log_trade("SELL_SHORT", symbol, qty, price, "market", order_id, reason)
-        _arm_stop_on_entry(symbol, price, sig.get("atr"), direction="short", regime=regime)
+        entry_px, fill_px, slippage = _resolve_fill(symbol, account_id, order_id,
+                                                     price, "short")
+        log_trade("SELL_SHORT", symbol, qty, price, "market", order_id, reason,
+                  fill_price=fill_px, signal_price=price, slippage=slippage)
+        _arm_stop_on_entry(symbol, entry_px, sig.get("atr"), direction="short",
+                           regime=regime, signal_price=price, fill_price=fill_px,
+                           slippage=slippage)
         return True
     return False
 
@@ -1161,8 +1197,14 @@ def evaluate_future(root: str, account_id: str, positions: list[dict],
         if result:
             _mark_bought(trade_symbol)
             order_id = result.get("order", {}).get("id")
+            # Futures carry no bot-managed stop (see note above), so the fill is
+            # not used to arm one — but resolve it anyway to record real fill vs
+            # signal slippage in the trade log, same as the equity entries.
+            _, fill_px, slippage = _resolve_fill(trade_symbol, account_id, order_id,
+                                                 price, "long")
             log_trade("BUY", trade_symbol, qty, price, "market", order_id,
-                      f"{root} EMA cross up, RSI={sig['rsi']:.1f}")
+                      f"{root} EMA cross up, RSI={sig['rsi']:.1f}",
+                      fill_price=fill_px, signal_price=price, slippage=slippage)
 
 
 def _open_option(account_id, occ_symbol, side, price, symbol, exp, strike, opt_type, sig):
