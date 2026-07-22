@@ -63,6 +63,26 @@ MARKET_TZ          = "America/New_York"
 # not miss the signal — it requires the signal to survive the delay.
 CROSS_ENTRY_DELAY_MINUTES = 30
 
+# ── Minimum EMA separation (cross hysteresis) ────────────────────────────────
+# The delay above is a TIME filter; this is the MAGNITUDE filter for the same
+# class of bug. Two EMAs a hair apart are not a trend, they are a rounding
+# artefact: on 2026-07-22 CAH sold a 215-share position (-$1,370) because EMA9
+# sat $0.01 below EMA21 at a price of $228 — a 0.004% separation, one poll after
+# the two were exactly equal. A cross only counts when
+#     abs(ema_short - ema_long) / price >= EMA_CROSS_MIN_GAP_PCT
+#
+# 0.001 (0.1%) is not a delicate choice. Replaying 8 sessions of logs (55,062
+# polls, 27 signals) the distribution is sharply bimodal with an empty band on
+# both sides: entries jump 0.020% -> 0.114%, exits jump 0.042% -> 0.159%. Any
+# value from 0.05% to 0.11% classifies the same 10 noise signals identically.
+#
+# Applied symmetrically to all four signals (long entry/exit, short entry/cover).
+# Exits keep their STATE semantics, so a suppressed exit is DEFERRED, not lost —
+# the predicate is re-derived every poll and fires as soon as the gap widens.
+# Residual risk: a position drifting bearish that NEVER clears 0.1% is held on
+# its trailing stop alone; _cross_gap_blocks makes that visible.
+EMA_CROSS_MIN_GAP_PCT = 0.001    # 0.1% of price
+
 # ── Watchlist (fixed core) ────────────────────────────────────────────────────
 # The live stock list is assembled every cycle by
 # watchlist.effective_stock_watchlist() as:  CORE_WATCHLIST ∪ momentum slot ∪

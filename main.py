@@ -278,6 +278,11 @@ def main() -> None:
                 "exits + stops live from the open)",
                 config.CROSS_ENTRY_DELAY_MINUTES,
                 "CME 18:00 ET" if MODE == "futures" else "9:30 ET")
+    logger.info("Cross gap   : %.2f%% minimum EMA separation on ALL cross signals "
+                "(long entry/exit, short entry/cover, options, futures); a "
+                "suppressed EXIT is deferred, not cancelled — states re-derive "
+                "every poll. Counter: CROSS GAP BLOCK",
+                config.EMA_CROSS_MIN_GAP_PCT * 100)
     logger.info("Pos. guard  : a FAILED positions fetch skips the whole cycle "
                 "(unknown != flat); ERROR after %d consecutive — stops are "
                 "unenforced during an outage",

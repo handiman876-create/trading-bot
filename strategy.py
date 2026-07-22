@@ -80,17 +80,75 @@ def _mark_sold(symbol: str) -> None:
 # position, we are wrong to be there, and why we missed the transition is
 # irrelevant). Entry paths below deliberately keep their edges.
 
-def _bearish_state(sig: dict) -> bool:
-    """Fast EMA below slow — the trend state a long should not be held in."""
-    return sig["ema_short"] < sig["ema_long"]
+# ── Cross hysteresis (minimum EMA separation) ─────────────────────────────────
+# Every EMA comparison in this module — both STATES and EDGES, entries and exits,
+# stocks, options and futures — funnels through the four wrappers below. That is
+# deliberate: the gap rule lives in ONE place, so no site can drift out of sync
+# with the others. Do NOT reintroduce a bare `sig["ema_short"] > sig["ema_long"]`
+# or a bare `sig["bullish_cross"]` at a call site; use these.
+#
+# The raw `bullish_cross`/`bearish_cross` keys stay UNFILTERED in indicators.py
+# on purpose: _note_state_only_exit compares state against the raw edge to
+# justify its counter, and filtering the edge at source would silently inflate
+# _state_only_exits by counting gap-suppressed edges as "missed" ones.
+
+def _valid_ema_cross(ema_short: float, ema_long: float, price: float) -> bool:
+    """True when the EMAs are separated by >= EMA_CROSS_MIN_GAP_PCT of price.
+
+    Pure and side-effect free (the counter lives in _cross_gap_ok). A price of
+    0/None means the gap cannot be normalised, so the answer is False: with no
+    usable denominator we decline to call it a cross rather than guess.
+    """
+    if not price or price <= 0:
+        return False
+    return abs(ema_short - ema_long) / price >= config.EMA_CROSS_MIN_GAP_PCT
 
 
-def _bullish_state(sig: dict) -> bool:
-    """Fast EMA above slow — the trend state a short should not be held in."""
-    return sig["ema_short"] > sig["ema_long"]
+def _cross_gap_ok(sig: dict, symbol: str = "", what: str = "") -> bool:
+    """_valid_ema_cross for a sig dict, counting the suppressions.
+
+    Call ONLY once the raw condition is already true, so a False return means
+    exactly one thing: a would-be signal the gap rule suppressed. That is what
+    makes the counter mean something.
+    """
+    price = sig.get("close")
+    if _valid_ema_cross(sig["ema_short"], sig["ema_long"], price):
+        return True
+    _note_cross_gap_block(symbol, sig, what, price)
+    return False
 
 
-def _exit_long_signal(sig: dict) -> bool:
+def _bearish_state(sig: dict, symbol: str = "") -> bool:
+    """Fast EMA below slow by a meaningful margin — the trend state a long should
+    not be held in."""
+    if sig["ema_short"] >= sig["ema_long"]:
+        return False
+    return _cross_gap_ok(sig, symbol, "bearish state")
+
+
+def _bullish_state(sig: dict, symbol: str = "") -> bool:
+    """Fast EMA above slow by a meaningful margin — the trend state a short
+    should not be held in."""
+    if sig["ema_short"] <= sig["ema_long"]:
+        return False
+    return _cross_gap_ok(sig, symbol, "bullish state")
+
+
+def _bullish_cross_edge(sig: dict, symbol: str = "") -> bool:
+    """Golden-cross EDGE, gap-filtered. Entry paths use this, never the raw key."""
+    if not sig.get("bullish_cross"):
+        return False
+    return _cross_gap_ok(sig, symbol, "bullish cross")
+
+
+def _bearish_cross_edge(sig: dict, symbol: str = "") -> bool:
+    """Death-cross EDGE, gap-filtered. Entry paths use this, never the raw key."""
+    if not sig.get("bearish_cross"):
+        return False
+    return _cross_gap_ok(sig, symbol, "bearish cross")
+
+
+def _exit_long_signal(sig: dict, symbol: str = "") -> bool:
     """True when a long should be flat: bearish state, RSI not oversold.
 
     The RSI floor now DEFERS an exit rather than cancelling it — an edge-based
@@ -103,13 +161,13 @@ def _exit_long_signal(sig: dict) -> bool:
     losing call because RSI < 30 would hold it into theta. Options take the
     primitive; stocks and futures take this policy.
     """
-    return _bearish_state(sig) and sig["rsi"] > config.RSI_OVERSOLD
+    return _bearish_state(sig, symbol) and sig["rsi"] > config.RSI_OVERSOLD
 
 
-def _exit_short_signal(sig: dict) -> bool:
+def _exit_short_signal(sig: dict, symbol: str = "") -> bool:
     """True when a short should be flat: bullish state, RSI not overbought.
     Mirror of _exit_long_signal."""
-    return _bullish_state(sig) and sig["rsi"] < config.RSI_OVERBOUGHT
+    return _bullish_state(sig, symbol) and sig["rsi"] < config.RSI_OVERBOUGHT
 
 
 # One ENTRY DELAYED log/count per name per day. Without this latch the counter
@@ -149,6 +207,39 @@ def _note_state_only_exit(symbol: str, sig: dict, edge_key: str) -> None:
         logger.info("STATE-ONLY EXIT %s — no %s edge on this bar; edge-based "
                     "logic would have missed this exit (state-only exits #%d)",
                     symbol, edge_key, _state_only_exits)
+
+
+# One CROSS GAP BLOCK log/count per symbol per day, for the same reason the
+# entry-delay latch exists: a name can sit inside the deadband for a whole
+# session (~4.2% of all polls in the 8-session replay did), so counting polls
+# would measure the clock, not the rule. One increment = one symbol-day on which
+# the gap rule actually suppressed a signal.
+_cross_gap_logged: dict[str, str] = {}
+
+
+def _note_cross_gap_block(symbol: str, sig: dict, what: str,
+                          price: Optional[float]) -> None:
+    """Count a would-be signal suppressed by the minimum-separation rule.
+
+    Reached only when the raw EMA condition was already true, so every increment
+    is a real suppression. Watch this against _stop_exits: an exit suppressed
+    here is DEFERRED (states are re-derived every poll and fire as soon as the
+    gap widens), but a position that never clears the threshold is left riding
+    its trailing stop alone — if that shows up, it shows up as a stop exit on a
+    name that logged blocks first.
+    """
+    global _cross_gap_blocks
+    key = symbol or "<unnamed>"
+    if _cross_gap_logged.get(key) == date.today().isoformat():
+        return
+    _cross_gap_logged[key] = date.today().isoformat()
+    _cross_gap_blocks += 1
+    gap = abs(sig["ema_short"] - sig["ema_long"])
+    pct = (gap / price * 100) if price else float("nan")
+    logger.info("CROSS GAP BLOCK %s — %s suppressed: EMA gap %.4f on price "
+                "%.2f = %.4f%%, below the %.2f%% minimum (gap blocks #%d)",
+                key, what, gap, price or 0.0, pct,
+                config.EMA_CROSS_MIN_GAP_PCT * 100, _cross_gap_blocks)
 
 
 def _shares_to_buy(price: float, equity: Optional[float]) -> int:
@@ -212,6 +303,8 @@ _sentiment_sector_blocks = 0
 _profit_takes = 0
 _high_vol_stops = 0        # stops armed TIGHTER than normal (ATR/price > 5%)
 _low_vol_stops = 0         # stops armed WIDER  than normal (ATR/price <= 2%)
+_cross_gap_blocks = 0      # would-be signals suppressed by EMA_CROSS_MIN_GAP_PCT
+_stops_trailed = 0         # trailing stops that actually moved (new extreme)
 
 
 def _load_json(path: str) -> dict:
@@ -465,7 +558,7 @@ def _check_and_trail_stop(symbol: str, held: int, sig: dict,
 
     Returns True iff a stop-exit order was placed (caller then returns, skipping
     signal logic for the cycle). False = no exit; continue to EMA-cross logic."""
-    global _stop_exits
+    global _stop_exits, _stops_trailed
 
     price = _live_price(symbol)
     if price is None:
@@ -505,6 +598,10 @@ def _check_and_trail_stop(symbol: str, held: int, sig: dict,
     # Crisis breakeven floor is armed-only (shadow logs the regime, changes nothing).
     crisis_floor = (regime == "crisis" and not config.VIX_CRISIS_SHADOW and bool(entry))
 
+    # Captured ONCE before the branches: both of them mutate rec["stop_price"],
+    # so a log inside each would be the same logic dispatched to two sites.
+    old_stop = rec["stop_price"]
+
     if direction == "short":
         # Ratchet DOWN: low-water and stop only ever fall — never raise the stop.
         rec["low_water"] = round(min(rec["low_water"], price), 4)
@@ -527,6 +624,21 @@ def _check_and_trail_stop(symbol: str, held: int, sig: dict,
         breached = price <= rec["stop_price"]     # price fell into the stop
         exit_side, exit_qty = "sell", held
         exit_action = "SELL"
+
+    # Trail log — fires only when the stop actually MOVED, i.e. on a new extreme.
+    # The unconditional _save_stops below runs every poll for every held name
+    # (~55k polls/8 sessions in the logs), so an unguarded line here would bury
+    # the log rather than illuminate it. The water label names the direction the
+    # trail is tracking: high_water ratchets up under a long, low_water ratchets
+    # down over a short. `mult` is the EFFECTIVE multiple, so a defensive-regime
+    # tighten shows up here as a changed width rather than an unexplained jump.
+    if rec["stop_price"] != old_stop:
+        _stops_trailed += 1
+        logger.info("STOP TRAIL %s %s %.2f → %.2f (%s=%.2f, trail=%.2fx%.2f) "
+                    "— trails #%d",
+                    symbol, direction, old_stop, rec["stop_price"],
+                    "low_water" if direction == "short" else "high_water",
+                    water, mult, rec["atr_at_entry"], _stops_trailed)
 
     if breached:
         logger.warning("STOP-LOSS EXIT %s %s x%d @ %.2f (stop=%.2f entry=%.2f "
@@ -973,7 +1085,7 @@ def evaluate_stock(symbol: str, account_id: str, positions: list[dict],
 
     # SELL — close a long whenever the trend is bearish, not just on the crossing
     # bar. This is the HCA/QQQ fix.
-    if held > 0 and _exit_long_signal(sig) and not _already_sold_today(symbol):
+    if held > 0 and _exit_long_signal(sig, symbol) and not _already_sold_today(symbol):
         logger.info("SIGNAL SELL %s x%d", symbol, held)
         result = tc.place_equity_order(account_id, symbol, "sell", held)
         if result:
@@ -986,7 +1098,7 @@ def evaluate_stock(symbol: str, account_id: str, positions: list[dict],
         return
 
     # COVER — close a short whenever the trend is bullish (mirror of SELL).
-    if held < 0 and _exit_short_signal(sig) and not _already_bought_today(symbol):
+    if held < 0 and _exit_short_signal(sig, symbol) and not _already_bought_today(symbol):
         qty = abs(held)
         logger.info("SIGNAL BUY_TO_COVER %s x%d", symbol, qty)
         result = tc.place_equity_order(account_id, symbol, "buy_to_cover", qty)
@@ -1009,7 +1121,8 @@ def evaluate_stock(symbol: str, account_id: str, positions: list[dict],
     # it: acting on noise costs an early exit, entering on noise costs capital.
     if not mh.entries_allowed():
         _note_entry_delayed(symbol, held == 0 and (
-            sig["bullish_cross"] or (is_momentum and _bullish_state(sig))))
+            _bullish_cross_edge(sig, symbol)
+            or (is_momentum and _bullish_state(sig, symbol))))
         return
 
     # One entry per name per day (what the old single gate actually protected).
@@ -1024,8 +1137,8 @@ def evaluate_stock(symbol: str, account_id: str, positions: list[dict],
     block_new_entries, block_momentum_align = _apply_regime_rules(regime)
 
     # BUY signal — fresh EMA cross (all symbols)
-    if (sig["bullish_cross"] and sig["rsi"] < config.RSI_OVERBOUGHT and held == 0
-            and not block_new_entries):
+    if (_bullish_cross_edge(sig, symbol) and sig["rsi"] < config.RSI_OVERBOUGHT
+            and held == 0 and not block_new_entries):
         if symbol in blocked_symbols:
             _sentiment_sector_blocks += 1
             logger.info("SECTOR RISK: skipping %s long entry — sector rated high "
@@ -1042,7 +1155,7 @@ def evaluate_stock(symbol: str, account_id: str, positions: list[dict],
     # to retry once the bar has formed.
     elif (is_momentum and held == 0 and not block_momentum_align
           and config.USE_MOMENTUM_ALIGNMENT
-          and sig["ema_short"] > sig["ema_long"]
+          and _bullish_state(sig, symbol)
           and config.MOMENTUM_ALIGN_RSI_MIN <= sig["rsi"] <= config.MOMENTUM_ALIGN_RSI_MAX
           and not _momentum_entry_taken(symbol, momentum_generation)):
         if symbol in blocked_symbols:
@@ -1064,8 +1177,8 @@ def evaluate_stock(symbol: str, account_id: str, positions: list[dict],
     # momentum picks are now shortable too. Crisis is still blocked by
     # block_new_entries. Mirrors the long BUY: same RSI gate, same held==0.
     # Stays EDGE-based: it is an entry. On state it would re-short every poll.
-    elif (sig["bearish_cross"] and sig["rsi"] > config.RSI_OVERSOLD and held == 0
-          and config.ENABLE_SHORTING and not block_new_entries):
+    elif (_bearish_cross_edge(sig, symbol) and sig["rsi"] > config.RSI_OVERSOLD
+          and held == 0 and config.ENABLE_SHORTING and not block_new_entries):
         if _enter_short(symbol, sig, price, account_id, positions, equity,
                         reason=f"EMA cross down (short), RSI={sig['rsi']:.1f}",
                         regime=regime):
@@ -1126,16 +1239,19 @@ def evaluate_option(
     # 9:30:05 open would be bought on the same stub EMAs as QQQ was.
     if held == 0:
         if not mh.entries_allowed():
-            _note_entry_delayed(occ_symbol, sig["bullish_cross"] if is_call
-                                else sig["bearish_cross"])
+            _note_entry_delayed(occ_symbol,
+                                _bullish_cross_edge(sig, occ_symbol) if is_call
+                                else _bearish_cross_edge(sig, occ_symbol))
             return
         if _already_bought_today(occ_symbol) or _already_sold_today(occ_symbol):
             return
-        if is_call and sig["bullish_cross"] and sig["rsi"] < config.RSI_OVERBOUGHT:
+        if is_call and _bullish_cross_edge(sig, occ_symbol) \
+                and sig["rsi"] < config.RSI_OVERBOUGHT:
             if _open_option(account_id, occ_symbol, "buy_to_open", opt_price,
                             symbol, expiration, strike, opt_type, sig):
                 _mark_bought(occ_symbol)
-        elif not is_call and sig["bearish_cross"] and sig["rsi"] > config.RSI_OVERSOLD:
+        elif not is_call and _bearish_cross_edge(sig, occ_symbol) \
+                and sig["rsi"] > config.RSI_OVERSOLD:
             if _open_option(account_id, occ_symbol, "buy_to_open", opt_price,
                             symbol, expiration, strike, opt_type, sig):
                 _mark_bought(occ_symbol)
@@ -1145,12 +1261,12 @@ def evaluate_option(
     # expiry. A call is long the underlying, a put is short it, so they take the
     # long/short exit helpers respectively.
     elif held > 0:
-        if is_call and _bearish_state(sig):
+        if is_call and _bearish_state(sig, occ_symbol):
             if _close_option(account_id, occ_symbol, held, opt_price,
                              symbol, expiration, strike, opt_type, sig):
                 _mark_sold(occ_symbol)
                 _note_state_only_exit(occ_symbol, sig, "bearish_cross")
-        elif not is_call and _bullish_state(sig):
+        elif not is_call and _bullish_state(sig, occ_symbol):
             if _close_option(account_id, occ_symbol, held, opt_price,
                              symbol, expiration, strike, opt_type, sig):
                 _mark_sold(occ_symbol)
@@ -1226,7 +1342,8 @@ def evaluate_future(root: str, account_id: str, positions: list[dict],
     # SELL — flatten the long on bearish STATE, before the entry gate, same as
     # equities. Uses the FUTURES clock: the ES daily bar runs 18:00 -> 17:00 ET,
     # so its unformed stub window is the evening reopen, not the 9:30 bell.
-    if held > 0 and _exit_long_signal(sig) and not _already_sold_today(trade_symbol):
+    if held > 0 and _exit_long_signal(sig, trade_symbol) \
+            and not _already_sold_today(trade_symbol):
         logger.info("SIGNAL SELL %s x%d", trade_symbol, held)
         result = tc.place_futures_order(account_id, trade_symbol, "sell", held)
         if result:
@@ -1238,7 +1355,8 @@ def evaluate_future(root: str, account_id: str, positions: list[dict],
         return
 
     if not fmh.entries_allowed():
-        _note_entry_delayed(trade_symbol, held == 0 and sig["bullish_cross"])
+        _note_entry_delayed(trade_symbol,
+                            held == 0 and _bullish_cross_edge(sig, trade_symbol))
         return
 
     if _already_bought_today(trade_symbol) or _already_sold_today(trade_symbol):
@@ -1250,8 +1368,8 @@ def evaluate_future(root: str, account_id: str, positions: list[dict],
     block_new_entries, _ = _apply_regime_rules(regime)
 
     # BUY signal — open long front month (EDGE: it is an entry)
-    if (sig["bullish_cross"] and sig["rsi"] < config.RSI_OVERBOUGHT and held == 0
-            and not block_new_entries):
+    if (_bullish_cross_edge(sig, trade_symbol) and sig["rsi"] < config.RSI_OVERBOUGHT
+            and held == 0 and not block_new_entries):
         logger.info("SIGNAL BUY %s x%d", trade_symbol, qty)
         result = tc.place_futures_order(account_id, trade_symbol, "buy", qty)
         if result:

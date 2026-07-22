@@ -465,6 +465,82 @@ def test_counters_tick_on_off_normal_arms():
     assert strategy._low_vol_stops == lo_before + 1, strategy._low_vol_stops
 
 
+# ── Trail logging + counter ───────────────────────────────────────────────────
+# Added 2026-07-22: NVDA's stop moved 195.53 -> 196.67 with no trace in bot.log,
+# and had to be reconstructed from stop_prices.json plus per-day highs out of the
+# rotated logs. The trail is the primary risk control; it should not be invisible.
+
+def _capture_logs(monkeypatch=None):
+    """Collect strategy.logger.info messages, fully formatted."""
+    msgs = []
+    orig = strategy.logger.info
+    strategy.logger.info = lambda fmt, *a: msgs.append(fmt % a if a else fmt)
+    return msgs, orig
+
+
+def test_trail_logs_and_counts_when_stop_moves():
+    _reset(quote_price=110.0)
+    strategy._stops_trailed = 0
+    strategy._save_stops({"AAA": {
+        "entry_price": 100.0, "atr_at_entry": 4.0, "high_water": 100.0,
+        "stop_price": 90.0, "opened": "2026-07-13", "bootstrapped": False}})
+    msgs, orig = _capture_logs()
+    try:
+        strategy._check_and_trail_stop("AAA", 10, {"close": 110.0, "atr": 4.0},
+                                       "ACCT", [])
+    finally:
+        strategy.logger.info = orig
+
+    trail = [m for m in msgs if "STOP TRAIL" in m]
+    assert len(trail) == 1, f"expected one trail line, got {msgs}"
+    assert "AAA" in trail[0] and "90.00 → 100.00" in trail[0], trail[0]
+    assert "high_water=110.00" in trail[0], "longs report high_water"
+    assert "trail=2.50x4.00" in trail[0], trail[0]
+    assert strategy._stops_trailed == 1, strategy._stops_trailed
+
+
+def test_no_trail_log_when_stop_unchanged():
+    """_save_stops runs every poll for every held name; an unguarded log here
+    would emit ~55k lines a week. Only a real new extreme may log."""
+    _reset(quote_price=104.0)
+    strategy._stops_trailed = 0
+    strategy._save_stops({"AAA": {
+        "entry_price": 100.0, "atr_at_entry": 4.0, "high_water": 110.0,
+        "stop_price": 100.0, "opened": "2026-07-13", "bootstrapped": False}})
+    msgs, orig = _capture_logs()
+    try:
+        strategy._check_and_trail_stop("AAA", 10, {"close": 104.0, "atr": 4.0},
+                                       "ACCT", [])
+    finally:
+        strategy.logger.info = orig
+
+    assert [m for m in msgs if "STOP TRAIL" in m] == [], \
+        "pullback must not log a trail — the stop did not move"
+    assert strategy._stops_trailed == 0
+
+
+def test_short_trail_reports_low_water():
+    """Shorts ratchet the other way; the label must say which water it tracks."""
+    _reset(quote_price=90.0)
+    strategy._stops_trailed = 0
+    strategy._save_stops({"SSS": {
+        "direction": "short", "entry_price": 100.0, "atr_at_entry": 4.0,
+        "low_water": 100.0, "stop_price": 110.0, "opened": "2026-07-13",
+        "bootstrapped": False}})
+    msgs, orig = _capture_logs()
+    try:
+        strategy._check_and_trail_stop("SSS", -10, {"close": 90.0, "atr": 4.0},
+                                       "ACCT", [])
+    finally:
+        strategy.logger.info = orig
+
+    trail = [m for m in msgs if "STOP TRAIL" in m]
+    assert len(trail) == 1, f"expected one trail line, got {msgs}"
+    assert "110.00 → 100.00" in trail[0], trail[0]      # 90 + 2.5*4, ratchet down
+    assert "low_water=90.00" in trail[0], "shorts report low_water"
+    assert strategy._stops_trailed == 1
+
+
 if __name__ == "__main__":
     _tmpdir = tempfile.mkdtemp(prefix="stops_test_")
     strategy._STOPS_PATH = os.path.join(_tmpdir, "stop_prices.json")
