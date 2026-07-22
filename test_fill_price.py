@@ -153,13 +153,17 @@ def test_resolve_fill_unavailable_falls_back_to_signal():
 
 def test_arm_stop_uses_fill_not_signal():
     _testlib.safe_remove(strategy._STOPS_PATH)
-    # short AMD: fill 512.18 (not signal 512.15), risk_on 2.5x, atr 36.91
+    # short AMD: fill 512.18 (not signal 512.15), atr 36.91.
+    # Width is 1.5x, not risk_on's plain 2.5x: 36.91/512.18 = 7.21% puts AMD in the
+    # HIGH volatility band. This case pins WHICH PRICE the stop is armed off (the
+    # fill), so it just carries whatever width the band rules produce.
     strategy._arm_stop_on_entry("AMD", 512.18, 36.91, direction="short",
                                 regime="risk_on", signal_price=512.15,
                                 fill_price=512.18, slippage=-0.03)
     rec = strategy._load_stops()["AMD"]
     assert rec["entry_price"] == 512.18, rec                       # the FILL
-    assert abs(rec["stop_price"] - (512.18 + 2.5 * 36.91)) < 1e-6, rec
+    assert rec["atr_mult"] == 1.5, rec                             # high band
+    assert abs(rec["stop_price"] - (512.18 + 1.5 * 36.91)) < 1e-6, rec
 
 
 def test_arm_stop_fallback_uses_signal_when_no_fill():

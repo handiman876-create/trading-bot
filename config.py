@@ -134,6 +134,48 @@ ATR_MULT_BY_REGIME = {
     "defensive": ATR_MULT_DEFENSIVE,
     "crisis":    ATR_MULT_CRISIS,
 }
+
+# Volatility band — a SECOND axis on the stop width, stacked on the regime axis
+# above. The regime says how afraid the market is; the band says how wide this
+# particular name's daily range is, as ATR/price at entry.
+#
+# Why: a fixed ATR multiple is already volatility-scaled in dollars, but the
+# resulting stop as a PERCENT of price still runs away on high-ATR names. CRWD at
+# ATR/price = 7% arms a 2.0x cautious stop 14% from entry — on a SHORT that is a
+# large loss if the name reverses. The high band pulls that back to 1.25x (8.75%).
+# The low band is the mirror: a 1.5%-ATR name at 2.0x stops out 3% away, inside
+# normal noise, so it gets more room.
+#
+# Bands are measured ONCE AT ENTRY from the same ATR that is persisted as
+# "atr_at_entry", and the resulting multiple is persisted as "atr_mult" — so, like
+# the regime axis, a position's width is FIXED at entry and never re-banded as its
+# ATR/price drifts. A name can be "high vol" on the day it is opened and "normal"
+# a week later; the stop keeps its armed width either way.
+#
+# Boundaries are EXCLUSIVE at the top: ratio <= 0.02 is low, 0.02 < r <= 0.05 is
+# normal, r > 0.05 is high. Note DDOG sat at 4.98% on 2026-07-22 — a hair under
+# the high band — so the cliff at 5% is real and deliberate, not a rounding
+# artifact. Two near-identical names can land in different bands.
+ATR_PCT_LOW_THRESHOLD  = 0.02   # ATR/price <= this  -> low-vol band  (wider stop)
+ATR_PCT_HIGH_THRESHOLD = 0.05   # ATR/price >  this  -> high-vol band (tighter stop)
+
+# regime -> (low_band, normal_band, high_band). The normal column is exactly
+# ATR_MULT_BY_REGIME above, so an unbanded lookup and a normal-band lookup agree.
+# The haircut is NOT a uniform ratio (0.60 / 0.625 / 0.667 / 0.75 high-vs-normal):
+# the tighter the regime, the smaller the extra squeeze, so the crisis row does
+# not collapse to nothing. Encoded as an explicit table rather than a scale factor
+# so each of the 12 cells is a deliberate choice you can read off directly.
+ATR_MULT_BY_REGIME_AND_BAND = {
+    #             low    normal  high
+    "risk_on":   (3.0,   2.5,    1.5),
+    "cautious":  (2.5,   2.0,    1.25),
+    "defensive": (2.0,   1.5,    1.0),
+    "crisis":    (1.5,   1.0,    0.75),
+}
+# CAUTION (flagged at design time, accepted): crisis/high = 0.75x. On a 7%-ATR
+# name that is a 5.25% stop — LESS than one average daily range, so a whipsaw exit
+# is close to arithmetically certain. Kept deliberately; revisit if the
+# _high_vol_stops / _low_vol_stops counters show crisis-band arms actually firing.
 # stop_prices.json schema, per symbol:
 #   entry_price, atr_at_entry, stop_price, opened, bootstrapped, direction
 #   + "atr_mult" (float; the ATR multiple this stop was armed with, by entry

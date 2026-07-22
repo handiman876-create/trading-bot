@@ -210,6 +210,8 @@ _latches_reconstructed = 0
 _crisis_exits = 0
 _sentiment_sector_blocks = 0
 _profit_takes = 0
+_high_vol_stops = 0        # stops armed TIGHTER than normal (ATR/price > 5%)
+_low_vol_stops = 0         # stops armed WIDER  than normal (ATR/price <= 2%)
 
 
 def _load_json(path: str) -> dict:
@@ -271,11 +273,67 @@ def _cost_basis(positions: list[dict], symbol: str) -> Optional[float]:
 
 
 def _regime_atr_mult(regime: str) -> float:
-    """The ATR multiple to ARM a new stop with, by market regime (risk_on 2.5 →
-    crisis 1.0). Single source of truth for regime→width so the three arming
-    sites don't each re-derive it. Unknown regimes fall back to the default
+    """The NORMAL-band ATR multiple for a regime (risk_on 2.5 → crisis 1.0).
+
+    This is the regime axis on its own, with no volatility banding: it is what a
+    name with an ordinary ATR/price ratio arms at. Used for display (the startup
+    banner, which has no symbol and so no ratio) and as the fallback inside
+    _get_atr_mult when ATR or price is unusable. Unknown regimes fall back to
     STOP_LOSS_ATR_MULT (risk_on width)."""
     return config.ATR_MULT_BY_REGIME.get(regime, config.STOP_LOSS_ATR_MULT)
+
+
+def _atr_band(atr: Optional[float], price: Optional[float]) -> Optional[str]:
+    """Classify a name's volatility as "low" / "normal" / "high" from ATR/price.
+
+    Returns None when the ratio cannot be computed (missing/zero/negative ATR or
+    price), which the caller reads as "don't band, use the plain regime width" —
+    a bad ratio must never silently produce a tighter stop than intended.
+    Boundaries are exclusive at the top: <=2% low, >5% high, else normal."""
+    if not atr or not price or atr <= 0 or price <= 0:
+        return None
+    ratio = atr / price
+    if ratio <= config.ATR_PCT_LOW_THRESHOLD:
+        return "low"
+    if ratio > config.ATR_PCT_HIGH_THRESHOLD:
+        return "high"
+    return "normal"
+
+
+def _get_atr_mult(regime: str, atr: Optional[float] = None,
+                  price: Optional[float] = None) -> float:
+    """The ATR multiple to ARM a new stop with, from BOTH axes: market regime and
+    the name's volatility band (ATR/price at entry).
+
+    Single source of truth for width→arming so the arming sites don't each
+    re-derive it. Falls back to the plain regime width (_regime_atr_mult) when the
+    regime is unknown OR the ratio is uncomputable, so a missing ATR can only ever
+    give the previous behaviour, never a surprise-tight stop.
+
+    Counts the off-normal arms so we can tell whether the banding is doing
+    anything: if _high_vol_stops stays at 0 for weeks, the 5% threshold is too
+    high to ever bind and the rule is dead weight."""
+    global _high_vol_stops, _low_vol_stops
+    row = config.ATR_MULT_BY_REGIME_AND_BAND.get(regime)
+    band = _atr_band(atr, price)
+    if row is None or band is None:
+        return _regime_atr_mult(regime)
+    low, normal, high = row
+    if band == "high":
+        _high_vol_stops += 1
+        logger.info("VOL BAND high: ATR/price=%.2f%% > %.0f%% — arming %s stop at "
+                    "%.2fx instead of %.2fx (tighter) #%d",
+                    (atr / price) * 100, config.ATR_PCT_HIGH_THRESHOLD * 100,
+                    regime, high, normal, _high_vol_stops)
+        return high
+    if band == "low":
+        _low_vol_stops += 1
+        logger.info("VOL BAND low: ATR/price=%.2f%% <= %.0f%% — arming %s stop at "
+                    "%.2fx instead of %.2fx (wider) #%d",
+                    (atr / price) * 100, config.ATR_PCT_LOW_THRESHOLD * 100,
+                    regime, low, normal, _low_vol_stops)
+        return low
+    return normal
 
 
 def _bootstrap_stop(symbol: str, held: int, sig: dict, positions: list[dict],
@@ -292,7 +350,9 @@ def _bootstrap_stop(symbol: str, held: int, sig: dict, positions: list[dict],
         return None
     basis = _cost_basis(positions, symbol)
     entry = (basis / abs(held)) if (basis and held) else price
-    mult = _regime_atr_mult(regime)
+    # Band off the ESTIMATED entry, not the live price, so the ratio matches the
+    # entry_price actually written into the record.
+    mult = _get_atr_mult(regime, atr, entry)
     rec = {
         "entry_price":  round(entry, 4),
         "atr_at_entry": round(atr, 4),
@@ -337,7 +397,7 @@ def _arm_stop_on_entry(symbol: str, entry_price: float, atr: Optional[float],
         logger.warning("Could not arm stop for %s: ATR unavailable — position is "
                        "UNPROTECTED until bootstrap re-arms it.", symbol)
         return
-    mult = _regime_atr_mult(regime)
+    mult = _get_atr_mult(regime, atr, entry_price)
     rec = {
         "entry_price":  round(entry_price, 4),
         "atr_at_entry": round(atr, 4),

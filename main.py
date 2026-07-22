@@ -315,8 +315,21 @@ def main() -> None:
         if config.ENABLE_SENTIMENT:
             _eff_reg = strategy._more_fearful(
                 _vix_reg, sentiment_analyzer.sentiment_regime(_rep))
-        logger.info("Stop mult   : %.1fx (%s) — new entries arm their stop at this width",
-                    strategy._regime_atr_mult(_eff_reg), _eff_reg)
+        # No single number any more: width is regime x volatility band, and the
+        # band is per-symbol (ATR/price at entry), which the banner cannot know.
+        # Print the whole row for the effective regime instead of one figure that
+        # would be wrong for every high- or low-ATR name.
+        _row = config.ATR_MULT_BY_REGIME_AND_BAND.get(_eff_reg)
+        if _row:
+            logger.info("Stop mult   : %s — low-vol %.2fx / normal %.2fx / high-vol %.2fx "
+                        "(band = ATR/price at entry: <=%.0f%% / <=%.0f%% / >%.0f%%)",
+                        _eff_reg, _row[0], _row[1], _row[2],
+                        config.ATR_PCT_LOW_THRESHOLD * 100,
+                        config.ATR_PCT_HIGH_THRESHOLD * 100,
+                        config.ATR_PCT_HIGH_THRESHOLD * 100)
+        else:
+            logger.info("Stop mult   : %.1fx (%s) — unknown regime, plain regime width",
+                        strategy._regime_atr_mult(_eff_reg), _eff_reg)
     except Exception as exc:
         logger.warning("Stop mult   : could not resolve current regime (%s)", exc)
     logger.info("=" * 60)

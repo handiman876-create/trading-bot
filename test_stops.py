@@ -199,10 +199,13 @@ def test_daily_close_fallback_when_quote_fails():
 # ── Arm on entry / clear on exit ──────────────────────────────────────────────
 
 def test_arm_stop_on_entry():
+    # ATR widened 4.0 -> 8.0 with the volatility bands: 4.0/210 = 1.90% is now the
+    # LOW band (3.0x). This case is about the record SHAPE, not the width, so it
+    # takes a normal-band ATR (8.0/210 = 3.81%) to keep the default 2.5x.
     _reset()
-    strategy._arm_stop_on_entry("AAPL", 210.0, 4.0)
+    strategy._arm_stop_on_entry("AAPL", 210.0, 8.0)
     rec = strategy._load_stops()["AAPL"]
-    assert abs(rec["stop_price"] - 200.0) < 1e-6, rec           # 210 - 2.5*4
+    assert abs(rec["stop_price"] - 190.0) < 1e-6, rec           # 210 - 2.5*8
     assert abs(rec["high_water"] - 210.0) < 1e-6, rec
     assert rec["bootstrapped"] is False, rec
 
@@ -216,11 +219,16 @@ def test_arm_stop_on_entry_atr_none_is_noop():
 # ── Regime-based ATR multiplier at entry ──────────────────────────────────────
 
 def test_arm_regime_risk_on_uses_2p5x():
+    # ATR widened 4.0 -> 8.0 when the volatility bands landed. The old 4.0/210 =
+    # 1.90% now falls in the LOW band and correctly arms 3.0x, which is the new
+    # rule working, not a regression — see test_low_vol_name_arms_wider_3x. This
+    # case exists to pin the REGIME axis, so it needs a normal-band ATR:
+    # 8.0/210 = 3.81%.
     _reset()
-    strategy._arm_stop_on_entry("AAA", 210.0, 4.0, regime="risk_on")
+    strategy._arm_stop_on_entry("AAA", 210.0, 8.0, regime="risk_on")
     rec = strategy._load_stops()["AAA"]
     assert rec["atr_mult"] == 2.5, rec
-    assert abs(rec["stop_price"] - 200.0) < 1e-6, rec          # 210 - 2.5*4
+    assert abs(rec["stop_price"] - 190.0) < 1e-6, rec          # 210 - 2.5*8
 
 def test_arm_regime_cautious_uses_2p0x():
     """User's worked example: entry 204, atr 7.05, cautious -> 2.0x -> stop 189.90."""
@@ -335,6 +343,126 @@ def test_load_corrupt_file_degrades_to_empty():
     with open(_testlib.assert_disposable(strategy._STOPS_PATH), "w") as f:
         f.write("{not valid json")
     assert strategy._load_stops() == {}, "corrupt file -> empty, no crash"
+
+
+# ── Volatility-band ATR multiplier (ATR/price at entry) ───────────────────────
+# Two axes now: regime (how afraid the market is) x band (how wide this name's
+# daily range is). These lock all 12 cells plus the fallbacks.
+
+def test_atr_band_classification():
+    """<=2% low, 2-5% normal, >5% high; uncomputable -> None (no banding)."""
+    assert strategy._atr_band(1.5, 100.0) == "low"        # 1.5%
+    assert strategy._atr_band(2.0, 100.0) == "low"        # 2.0% — boundary is <=
+    assert strategy._atr_band(2.01, 100.0) == "normal"    # just over low
+    assert strategy._atr_band(5.0, 100.0) == "normal"     # 5.0% — boundary is >
+    assert strategy._atr_band(5.01, 100.0) == "high"      # just over high
+    assert strategy._atr_band(7.0, 100.0) == "high"       # 7%
+    for bad in [(None, 100.0), (5.0, None), (0.0, 100.0), (5.0, 0.0), (-1.0, 100.0)]:
+        assert strategy._atr_band(*bad) is None, bad
+
+
+def test_all_twelve_table_cells():
+    """Every regime x band cell resolves to the approved multiplier."""
+    expected = {
+        # regime:      (low,  normal, high)
+        "risk_on":     (3.0,  2.5,    1.5),
+        "cautious":    (2.5,  2.0,    1.25),
+        "defensive":   (2.0,  1.5,    1.0),
+        "crisis":      (1.5,  1.0,    0.75),
+    }
+    # price 100 -> atr 1.0 = 1% (low), 3.0 = 3% (normal), 7.0 = 7% (high)
+    for regime, (lo, norm, hi) in expected.items():
+        assert strategy._get_atr_mult(regime, 1.0, 100.0) == lo,   (regime, "low")
+        assert strategy._get_atr_mult(regime, 3.0, 100.0) == norm, (regime, "normal")
+        assert strategy._get_atr_mult(regime, 7.0, 100.0) == hi,   (regime, "high")
+
+
+def test_normal_band_equals_plain_regime_mult():
+    """The normal column must agree with the un-banded regime lookup, so the two
+    sources of truth can never drift apart."""
+    for regime in ["risk_on", "cautious", "defensive", "crisis"]:
+        assert (strategy._get_atr_mult(regime, 3.0, 100.0)
+                == strategy._regime_atr_mult(regime)), regime
+
+
+def test_missing_atr_or_price_falls_back_to_regime_width():
+    """An uncomputable ratio must give the OLD behaviour, never a tighter stop."""
+    assert strategy._get_atr_mult("cautious", None, 100.0) == 2.0
+    assert strategy._get_atr_mult("cautious", 7.0, None) == 2.0
+    assert strategy._get_atr_mult("cautious", 0.0, 100.0) == 2.0
+    assert strategy._get_atr_mult("banana", 7.0, 100.0) == strategy.config.STOP_LOSS_ATR_MULT
+
+
+def test_crwd_scenario_high_vol_short_arms_1p25x():
+    """CRWD: ATR 13.42 / price 191 = 7.03% -> high band, cautious -> 1.25x.
+    Short stop sits ABOVE entry: 191 + 1.25*13.42 = 207.775 (not 217.84 at 2.0x)."""
+    _reset()
+    strategy._arm_stop_on_entry("CRWD", 191.0, 13.42, direction="short",
+                                regime="cautious")
+    rec = strategy._load_stops()["CRWD"]
+    assert rec["atr_mult"] == 1.25, rec
+    assert abs(rec["stop_price"] - 207.775) < 1e-6, rec
+    assert rec["stop_price"] > rec["entry_price"], "short stop must be above entry"
+    # the whole point: strictly tighter than the un-banded cautious width
+    assert rec["stop_price"] < 191.0 + 2.0 * 13.42, rec
+
+
+def test_aapl_scenario_normal_vol_arms_regime_width():
+    """AAPL: ATR 7.78 / entry 307.15 = 2.53% -> normal band, risk_on -> 2.5x."""
+    _reset()
+    strategy._arm_stop_on_entry("AAPL", 307.15, 7.78, regime="risk_on")
+    rec = strategy._load_stops()["AAPL"]
+    assert rec["atr_mult"] == 2.5, rec
+    assert abs(rec["stop_price"] - (307.15 - 2.5 * 7.78)) < 1e-6, rec
+
+
+def test_low_vol_name_arms_wider_3x():
+    """A 1.5%-ATR name in risk_on gets MORE room: 3.0x, not 2.5x."""
+    _reset()
+    strategy._arm_stop_on_entry("BND", 100.0, 1.5, regime="risk_on")
+    rec = strategy._load_stops()["BND"]
+    assert rec["atr_mult"] == 3.0, rec
+    assert abs(rec["stop_price"] - 95.5) < 1e-6, rec        # 100 - 3.0*1.5
+
+
+def test_bootstrap_bands_off_estimated_entry():
+    """_bootstrap_stop bands off the cost-basis entry it writes, not live price."""
+    _reset()
+    positions = [{"symbol": "XYZ", "quantity": 10, "cost_basis": 1000.0}]  # entry 100
+    sig = {"atr": 7.0, "close": 100.0}                                     # 7% -> high
+    rec = strategy._bootstrap_stop("XYZ", 10, sig, positions, 100.0, regime="cautious")
+    assert rec["atr_mult"] == 1.25, rec
+    assert abs(rec["stop_price"] - (100.0 - 1.25 * 7.0)) < 1e-6, rec
+
+
+def test_existing_records_are_untouched_by_banding():
+    """The 9 live records have NO atr_mult key. Banding must not reach them: they
+    keep trailing at the 2.5x fallback regardless of their ATR/price ratio."""
+    _reset(quote_price=200.0)
+    strategy._save_stops({"CRWD": {
+        "entry_price": 205.49, "atr_at_entry": 10.61,      # 5.16% -> would be "high"
+        "stop_price": 183.015, "high_water": 209.54,
+        "opened": "2026-07-15", "bootstrapped": False, "direction": "long",
+    }})
+    before = strategy._load_stops()["CRWD"]["stop_price"]
+    sig = {"atr": 10.61, "close": 200.0, "rsi": 50.0}
+    strategy._check_and_trail_stop("CRWD", 242, sig, "acct", [], "cautious")
+    rec = strategy._load_stops()["CRWD"]
+    assert "atr_mult" not in rec, "trailing must not back-fill a width"
+    # high_water unchanged (200 < 209.54) so the stop must be unchanged too
+    assert rec["stop_price"] == before, (rec["stop_price"], before)
+
+
+def test_counters_tick_on_off_normal_arms():
+    """Observability: both off-normal bands must be countable, or we can't tell
+    whether this rule ever binds."""
+    _reset()
+    hi_before, lo_before = strategy._high_vol_stops, strategy._low_vol_stops
+    strategy._get_atr_mult("cautious", 7.0, 100.0)     # high
+    strategy._get_atr_mult("cautious", 1.0, 100.0)     # low
+    strategy._get_atr_mult("cautious", 3.0, 100.0)     # normal — must NOT tick
+    assert strategy._high_vol_stops == hi_before + 1, strategy._high_vol_stops
+    assert strategy._low_vol_stops == lo_before + 1, strategy._low_vol_stops
 
 
 if __name__ == "__main__":
