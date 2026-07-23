@@ -318,6 +318,18 @@ VIX_DEFENSIVE_DRAWDOWN = 0.03
 # breakeven). Shadow ⇒ LOG what it would do and place nothing; flip to False to arm.
 VIX_CRISIS_SHADOW = True
 
+# Breakeven lock — once a position's best excursion (high/low-water) reaches
+# +BREAKEVEN_LOCK_ATR ATR of profit from entry, floor its stop at entry so it can
+# never give back principal. This is the SAME floor operation the crisis regime
+# applies (strategy._check_and_trail_stop), but triggered by realized profit in
+# ANY regime, not by VIX. It is gated on the position being in profit RIGHT NOW
+# (price on the profit side of entry) so the floor can never be armed THROUGH the
+# market and force an immediate exit — which is also what makes it safe to apply
+# retroactively to positions that predate this rule. Strictly protective: it only
+# ever raises a stop toward entry, never loosens one, and never past the market.
+ENABLE_BREAKEVEN_LOCK = True
+BREAKEVEN_LOCK_ATR    = 1.0    # favorable excursion (in entry-ATRs) required to arm
+
 # ── Polygon.io (momentum-screen data source; free tier) ───────────────────────
 POLYGON_API_KEY  = os.environ.get("POLYGON_API_KEY", "")
 POLYGON_BASE_URL = "https://api.polygon.io"

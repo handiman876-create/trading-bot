@@ -305,6 +305,7 @@ _high_vol_stops = 0        # stops armed TIGHTER than normal (ATR/price > 5%)
 _low_vol_stops = 0         # stops armed WIDER  than normal (ATR/price <= 2%)
 _cross_gap_blocks = 0      # would-be signals suppressed by EMA_CROSS_MIN_GAP_PCT
 _stops_trailed = 0         # trailing stops that actually moved (new extreme)
+_breakeven_locks = 0       # stops floored at entry after +1 ATR of profit (principal locked)
 
 
 def _load_json(path: str) -> dict:
@@ -558,7 +559,7 @@ def _check_and_trail_stop(symbol: str, held: int, sig: dict,
 
     Returns True iff a stop-exit order was placed (caller then returns, skipping
     signal logic for the cycle). False = no exit; continue to EMA-cross logic."""
-    global _stop_exits, _stops_trailed
+    global _stop_exits, _stops_trailed, _breakeven_locks
 
     price = _live_price(symbol)
     if price is None:
@@ -598,6 +599,28 @@ def _check_and_trail_stop(symbol: str, held: int, sig: dict,
     # Crisis breakeven floor is armed-only (shadow logs the regime, changes nothing).
     crisis_floor = (regime == "crisis" and not config.VIX_CRISIS_SHADOW and bool(entry))
 
+    # Breakeven lock: once this position's best excursion has reached +1 ATR of
+    # profit AND it is still in profit right now, floor the stop at entry. Same
+    # operation as crisis_floor, different trigger (realized profit, any regime).
+    #   * The excursion test reads the STORED water (pre this cycle's ratchet). A
+    #     name crossing the threshold on a fresh new high locks one cycle later —
+    #     harmless, since on that cycle price is AT a new high, nowhere near the
+    #     stop. high/low-water are monotonic, so once true the trigger stays true;
+    #     no extra persisted flag is needed.
+    #   * The `price > entry` / `price < entry` clamp is what keeps the floor from
+    #     ever being armed through the market (which would force an instant exit).
+    #     It is why retroactive application to pre-rule positions is safe: an
+    #     underwater name (DDOG) gates itself out; an in-profit one (CRL) locks.
+    breakeven_lock = False
+    if config.ENABLE_BREAKEVEN_LOCK and entry:
+        trig = config.BREAKEVEN_LOCK_ATR * rec["atr_at_entry"]
+        if direction == "short":
+            breakeven_lock = rec["low_water"]  <= entry - trig and price < entry
+        else:
+            breakeven_lock = rec["high_water"] >= entry + trig and price > entry
+
+    apply_floor = crisis_floor or breakeven_lock
+
     # Captured ONCE before the branches: both of them mutate rec["stop_price"],
     # so a log inside each would be the same logic dispatched to two sites.
     old_stop = rec["stop_price"]
@@ -605,9 +628,8 @@ def _check_and_trail_stop(symbol: str, held: int, sig: dict,
     if direction == "short":
         # Ratchet DOWN: low-water and stop only ever fall — never raise the stop.
         rec["low_water"] = round(min(rec["low_water"], price), 4)
-        new_stop = rec["low_water"] + mult_atr
-        if crisis_floor:
-            new_stop = min(new_stop, entry)      # crisis: cap short stop at breakeven
+        raw_trail = rec["low_water"] + mult_atr
+        new_stop = min(raw_trail, entry) if apply_floor else raw_trail  # floor: cap short stop at breakeven
         rec["stop_price"] = round(min(rec["stop_price"], new_stop), 4)
         water = rec["low_water"]
         breached = price >= rec["stop_price"]     # price rose into the stop
@@ -616,9 +638,8 @@ def _check_and_trail_stop(symbol: str, held: int, sig: dict,
     else:
         # Ratchet UP: high-water and stop only ever rise — never lower the stop.
         rec["high_water"] = round(max(rec["high_water"], price), 4)
-        new_stop = rec["high_water"] - mult_atr
-        if crisis_floor:
-            new_stop = max(new_stop, entry)      # crisis: floor long stop at breakeven
+        raw_trail = rec["high_water"] - mult_atr
+        new_stop = max(raw_trail, entry) if apply_floor else raw_trail  # floor: floor long stop at breakeven
         rec["stop_price"] = round(max(rec["stop_price"], new_stop), 4)
         water = rec["high_water"]
         breached = price <= rec["stop_price"]     # price fell into the stop
@@ -639,6 +660,20 @@ def _check_and_trail_stop(symbol: str, held: int, sig: dict,
                     symbol, direction, old_stop, rec["stop_price"],
                     "low_water" if direction == "short" else "high_water",
                     water, mult, rec["atr_at_entry"], _stops_trailed)
+
+    # Breakeven-lock event: log + count once, on the cycle the floor first snaps
+    # the stop TO entry (the raw trail would have left it short of breakeven). The
+    # STOP TRAIL line above already recorded the move; this line explains WHY it
+    # jumped to entry. `not crisis_floor` keeps a crisis-regime floor from being
+    # mis-attributed here. Idempotent: once stop_price == entry, old_stop == entry
+    # on later cycles, so the transition test is false and it will not re-fire.
+    entry_r = round(entry, 4) if entry else None
+    if (breakeven_lock and not crisis_floor
+            and old_stop != entry_r and rec["stop_price"] == entry_r):
+        _breakeven_locks += 1
+        logger.info("BREAKEVEN LOCK %s %s: floor raised to entry %.2f "
+                    "(trail would be %.2f) — locks #%d",
+                    symbol, direction, entry, raw_trail, _breakeven_locks)
 
     if breached:
         logger.warning("STOP-LOSS EXIT %s %s x%d @ %.2f (stop=%.2f entry=%.2f "

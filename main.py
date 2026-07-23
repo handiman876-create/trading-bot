@@ -278,6 +278,13 @@ def main() -> None:
                 "exits + stops live from the open)",
                 config.CROSS_ENTRY_DELAY_MINUTES,
                 "CME 18:00 ET" if MODE == "futures" else "9:30 ET")
+    # Both modes: the breakeven lock lives in _check_and_trail_stop, so it reports
+    # outside the mode branch (equities and futures stops both floor at entry).
+    logger.info("Breakeven   : %s",
+                ("ENABLED (%.1fxATR — floor stop at entry once +1 ATR in profit; "
+                 "longs+shorts, retroactive w/ underwater guard)"
+                 % config.BREAKEVEN_LOCK_ATR)
+                if config.ENABLE_BREAKEVEN_LOCK else "DISABLED")
     logger.info("Cross gap   : %.2f%% minimum EMA separation on ALL cross signals "
                 "(long entry/exit, short entry/cover, options, futures); a "
                 "suppressed EXIT is deferred, not cancelled — states re-derive "

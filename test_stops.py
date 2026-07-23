@@ -171,7 +171,13 @@ def test_short_covers_when_price_rises_into_stop():
 
 def test_short_bootstrap_from_negative_held():
     """Adopting a pre-existing short (no record) infers direction from held<0 and
-    seeds the stop ABOVE entry."""
+    seeds the stop ABOVE entry.
+
+    Adoption price 95 is entry 100 - 1.25 ATR: this short is ALREADY >1 ATR in
+    profit at adoption AND below entry, so the breakeven lock caps the stop at
+    entry (100) rather than the raw 2.5x trail (105). That is intended — a
+    position we take on already in real profit should not be allowed to round-trip
+    to a loss; the price<entry gate keeps the cap above the market (no cover)."""
     _reset(quote_price=95.0)
     positions = [{"symbol": "AAA", "quantity": -10, "cost_basis": 1000.0}]  # entry 100
     exited = strategy._check_and_trail_stop(
@@ -181,7 +187,7 @@ def test_short_bootstrap_from_negative_held():
     assert rec["direction"] == "short", rec
     assert abs(rec["entry_price"] - 100.0) < 1e-6, rec        # 1000/|−10|
     assert abs(rec["low_water"] - 95.0) < 1e-6, rec           # min(entry, price)
-    assert abs(rec["stop_price"] - 105.0) < 1e-6, rec         # 95 + 2.5*4
+    assert abs(rec["stop_price"] - 100.0) < 1e-6, rec         # breakeven-locked (raw trail 105)
     assert rec["bootstrapped"] is True, rec
 
 
@@ -539,6 +545,163 @@ def test_short_trail_reports_low_water():
     assert "110.00 → 100.00" in trail[0], trail[0]      # 90 + 2.5*4, ratchet down
     assert "low_water=90.00" in trail[0], "shorts report low_water"
     assert strategy._stops_trailed == 1
+
+
+# ── Breakeven lock (floor a winner's stop at entry after +1 ATR of profit) ────
+# Added 2026-07-23: DDOG rode high_water $273 back down to a $241 stop, giving
+# back every gain. This floors the stop at entry once a position has BOTH proven
+# +1 ATR of profit (high/low-water) AND is still on the profit side of entry, so a
+# winner can't round-trip to a loss. Retroactive-safe: an underwater name gates
+# itself out (arming the floor there would exit through the market).
+
+def test_breakeven_lock_long_floors_at_entry():
+    """CRL, real numbers: high_water 237.61 >= entry 225.68 + 1*8.5252, price
+    229.09 still > entry. Raw 2.5x trail is 216.30 (below entry) -> floor to entry."""
+    _reset(quote_price=229.09)
+    strategy._breakeven_locks = 0
+    strategy._save_stops({"CRL": {
+        "direction": "long", "entry_price": 225.68, "atr_at_entry": 8.5252,
+        "high_water": 237.61, "stop_price": 216.297,
+        "opened": "2026-07-16", "bootstrapped": False}})
+    exited = strategy._check_and_trail_stop(
+        "CRL", 221, {"close": 229.09, "atr": 8.5252}, "ACCT", [])
+    rec = strategy._load_stops()["CRL"]
+    assert exited is False, "must not exit — floor sits below the market"
+    assert abs(rec["stop_price"] - 225.68) < 1e-6, rec          # floored at entry
+    assert strategy._breakeven_locks == 1, strategy._breakeven_locks
+
+
+def test_breakeven_lock_long_blocked_when_underwater():
+    """DDOG: high_water qualifies but price is now BELOW entry. Flooring would arm
+    a stop ABOVE the market and force an instant exit — so it must NOT apply."""
+    _reset(quote_price=244.40)
+    strategy._breakeven_locks = 0
+    strategy._save_stops({"DDOG": {
+        "direction": "long", "entry_price": 254.64, "atr_at_entry": 12.68,
+        "high_water": 273.39, "stop_price": 241.69,
+        "opened": "2026-07-14", "bootstrapped": False}})
+    exited = strategy._check_and_trail_stop(
+        "DDOG", 195, {"close": 244.40, "atr": 12.68}, "ACCT", [])
+    rec = strategy._load_stops()["DDOG"]
+    assert exited is False, "must not exit"
+    assert abs(rec["stop_price"] - 241.69) < 1e-6, rec          # unchanged, no floor
+    assert strategy._breakeven_locks == 0, "underwater name must not lock"
+
+
+def test_breakeven_lock_not_armed_until_one_atr_profit():
+    """NVDA: high_water 214.30 < entry 209.49 + 1*7.05 (216.54) — not qualified yet.
+    Stop trails normally at 2.5x, no floor, no lock event."""
+    _reset(quote_price=208.83)
+    strategy._breakeven_locks = 0
+    strategy._save_stops({"NVDA": {
+        "direction": "long", "entry_price": 209.49, "atr_at_entry": 7.05,
+        "high_water": 214.295, "stop_price": 196.67,
+        "opened": "2026-07-14", "bootstrapped": False}})
+    strategy._check_and_trail_stop(
+        "NVDA", 238, {"close": 208.83, "atr": 7.05}, "ACCT", [])
+    rec = strategy._load_stops()["NVDA"]
+    assert abs(rec["stop_price"] - 196.67) < 1e-6, rec          # untouched
+    assert strategy._breakeven_locks == 0
+
+
+def test_breakeven_lock_short_caps_at_entry():
+    """Short mirror: low_water 115 <= entry 122.99 - 1*6.59 (116.40), price 118
+    still < entry -> stop capped DOWN to entry (raw trail would be 131.48)."""
+    _reset(quote_price=118.0)
+    strategy._breakeven_locks = 0
+    strategy._save_stops({"PLTR": {
+        "direction": "short", "entry_price": 122.99, "atr_at_entry": 6.59,
+        "low_water": 115.0, "stop_price": 131.475,
+        "opened": "2026-07-23", "bootstrapped": False}})
+    exited = strategy._check_and_trail_stop(
+        "PLTR", -392, {"close": 118.0, "atr": 6.59}, "ACCT", [])
+    rec = strategy._load_stops()["PLTR"]
+    assert exited is False, "must not cover — cap sits above the market"
+    assert abs(rec["stop_price"] - 122.99) < 1e-6, rec          # capped at entry
+    assert strategy._breakeven_locks == 1
+
+
+def test_breakeven_lock_short_not_armed_until_one_atr():
+    """Real PLTR today: low_water 120.84 is only ~0.3 ATR of profit -> no cap."""
+    _reset(quote_price=121.0)
+    strategy._breakeven_locks = 0
+    strategy._save_stops({"PLTR": {
+        "direction": "short", "entry_price": 122.99, "atr_at_entry": 6.59,
+        "low_water": 120.84, "stop_price": 130.73,
+        "opened": "2026-07-23", "bootstrapped": False}})
+    strategy._check_and_trail_stop(
+        "PLTR", -392, {"close": 121.0, "atr": 6.59}, "ACCT", [])
+    rec = strategy._load_stops()["PLTR"]
+    assert strategy._breakeven_locks == 0, "0.3 ATR is not +1 ATR"
+    assert rec["stop_price"] > 122.99, rec                       # not capped to entry
+
+
+def test_breakeven_lock_noop_when_trail_already_above_entry():
+    """AAPL: qualified and in profit, but the normal 2.5x trail already sits above
+    entry (315.34 > 307.15). The floor changes nothing and must NOT count a lock."""
+    _reset(quote_price=321.70)
+    strategy._breakeven_locks = 0
+    strategy._save_stops({"AAPL": {
+        "direction": "long", "entry_price": 307.15, "atr_at_entry": 7.78,
+        "high_water": 334.785, "stop_price": 315.335,
+        "opened": "2026-07-14", "bootstrapped": False}})
+    strategy._check_and_trail_stop(
+        "AAPL", 100, {"close": 321.70, "atr": 7.78}, "ACCT", [])
+    rec = strategy._load_stops()["AAPL"]
+    assert abs(rec["stop_price"] - 315.335) < 1e-6, rec          # trail wins, unchanged
+    assert strategy._breakeven_locks == 0, "no lock event when trail already > entry"
+
+
+def test_breakeven_lock_fires_once_then_idempotent():
+    """Once floored at entry, a later poll still in the lock window must NOT re-count."""
+    _reset(quote_price=229.09)
+    strategy._breakeven_locks = 0
+    strategy._save_stops({"CRL": {
+        "direction": "long", "entry_price": 225.68, "atr_at_entry": 8.5252,
+        "high_water": 237.61, "stop_price": 216.297,
+        "opened": "2026-07-16", "bootstrapped": False}})
+    strategy._check_and_trail_stop("CRL", 221, {"close": 229.09, "atr": 8.5252}, "ACCT", [])
+    assert strategy._breakeven_locks == 1
+    strategy._check_and_trail_stop("CRL", 221, {"close": 229.09, "atr": 8.5252}, "ACCT", [])
+    rec = strategy._load_stops()["CRL"]
+    assert strategy._breakeven_locks == 1, "must not re-count once locked"
+    assert abs(rec["stop_price"] - 225.68) < 1e-6, rec          # holds at entry
+
+
+def test_breakeven_lock_not_armed_at_exactly_entry():
+    """At price == entry the floor would equal the market, and the breach check
+    would then exit at breakeven. The strict > / < gate must leave it un-armed."""
+    _reset(quote_price=100.0)
+    strategy._breakeven_locks = 0
+    strategy._save_stops({"AAA": {
+        "direction": "long", "entry_price": 100.0, "atr_at_entry": 4.0,
+        "high_water": 105.0, "stop_price": 95.0,       # raw trail 95, below entry
+        "opened": "2026-07-13", "bootstrapped": False}})
+    exited = strategy._check_and_trail_stop("AAA", 10, {"close": 100.0, "atr": 4.0}, "ACCT", [])
+    rec = strategy._load_stops()["AAA"]
+    assert exited is False, "must not exit at breakeven"
+    assert strategy._breakeven_locks == 0, "price == entry must not arm the lock"
+    assert abs(rec["stop_price"] - 95.0) < 1e-6, rec            # floor NOT applied
+
+
+def test_breakeven_lock_logs_the_event():
+    """The lock emits one BREAKEVEN LOCK line naming entry, the would-be trail, #N."""
+    _reset(quote_price=229.09)
+    strategy._breakeven_locks = 0
+    strategy._save_stops({"CRL": {
+        "direction": "long", "entry_price": 225.68, "atr_at_entry": 8.5252,
+        "high_water": 237.61, "stop_price": 216.297,
+        "opened": "2026-07-16", "bootstrapped": False}})
+    msgs, orig = _capture_logs()
+    try:
+        strategy._check_and_trail_stop("CRL", 221, {"close": 229.09, "atr": 8.5252}, "ACCT", [])
+    finally:
+        strategy.logger.info = orig
+    locks = [m for m in msgs if "BREAKEVEN LOCK" in m]
+    assert len(locks) == 1, f"expected one lock line, got {msgs}"
+    assert "CRL" in locks[0] and "225.68" in locks[0], locks[0]
+    assert "trail would be 216.30" in locks[0], locks[0]
+    assert "locks #1" in locks[0], locks[0]
 
 
 if __name__ == "__main__":
