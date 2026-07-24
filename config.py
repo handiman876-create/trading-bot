@@ -223,7 +223,16 @@ ENABLE_SHORTING = True   # master switch; False = long-only (prior behaviour)
 # momentum bucket a one-shot "enter on alignment" signal instead; core names keep
 # the patient fresh-cross entry. One entry per symbol per rotation, latched in
 # MOMENTUM_ENTRY_FILE so a stop-out can't trigger an immediate re-buy.
-USE_MOMENTUM_ALIGNMENT = True    # master switch; False = fresh-cross only, all names
+# DISABLED 2026-07-24 — no proven edge. Full ledger recompute: momentum_alignment
+# closed 11 round-trips for 1 win (HCA +$2,071.28) and -$23,735.16 total, 65% of
+# all realized losses. A 1-for-11 bucket would not clear the discovery pipeline's
+# own ci_lower > 1.0 promotion gate, so it should not be trading live capital.
+# CAVEAT for whoever re-enables this: all 11 entries were 07-14..07-17 and predate
+# the 07-18 stop rework (af859e5 regime ATR tiers, fa01c36 hysteresis, 19a1d1b
+# breakeven lock). This bucket has NEVER traded with the current machinery, so the
+# losses are not cleanly attributable to the entry rule. Re-evaluate by backtest —
+# not by flipping this back to True and watching live.
+USE_MOMENTUM_ALIGNMENT = False   # master switch; False = fresh-cross only, all names
 # Momentum alignment only when RSI shows healthy momentum (not oversold, not
 # overbought): buy trending names on a healthy pullback, not on a breakdown
 # (RSI < MIN, e.g. HCA @ 35.1) or when already extended (RSI > MAX).
