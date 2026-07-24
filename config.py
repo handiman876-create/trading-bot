@@ -83,6 +83,33 @@ CROSS_ENTRY_DELAY_MINUTES = 30
 # its trailing stop alone; _cross_gap_blocks makes that visible.
 EMA_CROSS_MIN_GAP_PCT = 0.001    # 0.1% of price
 
+# ── Cross persistence (entry signals only) ────────────────────────────────────
+# EMA_CROSS_MIN_GAP_PCT filters a cross by MAGNITUDE. It cannot filter one by
+# PERSISTENCE, and the ledger says persistence is where the money went: of the 25
+# closed round-trips to 2026-07-24, the 8 held under 30 hours lost -$10,953.34
+# with ZERO winners, in BOTH directions. AVGO on 07-23 is the archetype — a clean
+# 0.10%-clearing cross at 10:00, reversed and stopped out 88 minutes later.
+#
+# So require an entry cross to still be a cross N minutes after it first appears.
+# Backtest over those same 25 trips (minute bars, daily-EMA state reconstructed
+# per minute) at 30 minutes: blocks 7 trades worth -$9,525.94, 6 of the 8
+# whipsaws, and ZERO of the 2 winners. 45m tested identical (no trade has a
+# sustain between 30 and 45), 15m captured only -$5,014.80 — so 30 is the
+# shortest setting that gets the full measured benefit.
+#
+# PROVISIONAL — this was fit in-sample on 25 trades with only 2 winners, so
+# "blocks no winners" is evidence from a sample of 2. Re-fit against post-deploy
+# trades before treating 30 as settled; _cross_sustain_blocks is the counter.
+# Set to 0 to disable the rule entirely.
+#
+# ENTRIES ONLY. Exits are deliberately NOT gated: an exit-side version of this
+# idea was backtested on the same trips and LOST money in both forms tried —
+# an age-based gate cost -$3,765.53 and a losing-position gate cost -$6,928.56,
+# because delaying an exit on a bad position just books a bigger loss. Do NOT
+# "improve" this by extending it to exits without re-running that test.
+ENABLE_CROSS_SUSTAIN  = True     # master switch; False = fire on the cross, as before
+CROSS_SUSTAIN_MINUTES = 30
+
 # ── Watchlist (fixed core) ────────────────────────────────────────────────────
 # The live stock list is assembled every cycle by
 # watchlist.effective_stock_watchlist() as:  CORE_WATCHLIST ∪ momentum slot ∪

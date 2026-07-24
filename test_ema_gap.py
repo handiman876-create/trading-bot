@@ -50,6 +50,10 @@ def _reset():
     strategy.config.USE_MOMENTUM_ALIGNMENT = True
     strategy.config.ENABLE_SHORTING = True
     strategy.config.USE_TRAILING_STOP = False   # isolate signal logic from stops
+    # CROSS_SUSTAIN_MINUTES=0 isolates these cases from cross persistence:
+    # they assert on gap/edge/latch behaviour, not on how long a cross has
+    # held, and would otherwise all need a 30-minute clock advance.
+    strategy.config.CROSS_SUSTAIN_MINUTES = 0
     strategy.tc.place_equity_order = _fake_place
     strategy.tc.get_historical = lambda *a, **k: [{"bar": 1}]
     strategy.tc.get_quote = lambda s: {"last": 10_000.0}
@@ -78,6 +82,7 @@ try:
             "trail": strategy.config.USE_TRAILING_STOP,
             "align": strategy.config.USE_MOMENTUM_ALIGNMENT,
             "short": strategy.config.ENABLE_SHORTING,
+            "sus":   strategy.config.CROSS_SUSTAIN_MINUTES,
         }
         strategy.log_trade = lambda *a, **k: None
         yield
@@ -87,6 +92,9 @@ try:
         strategy.ind.compute_indicators = saved["ci"]
         strategy.log_trade              = saved["log"]
         strategy.mh.entries_allowed     = saved["ea"]
+        strategy.config.CROSS_SUSTAIN_MINUTES = saved["sus"]
+        strategy._cross_first_seen.clear()
+        strategy._cross_confirmed.clear()
         strategy.config.USE_TRAILING_STOP     = saved["trail"]
         strategy.config.USE_MOMENTUM_ALIGNMENT = saved["align"]
         strategy.config.ENABLE_SHORTING        = saved["short"]

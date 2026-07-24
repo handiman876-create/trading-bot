@@ -134,18 +134,121 @@ def _bullish_state(sig: dict, symbol: str = "") -> bool:
     return _cross_gap_ok(sig, symbol, "bullish state")
 
 
-def _bullish_cross_edge(sig: dict, symbol: str = "") -> bool:
-    """Golden-cross EDGE, gap-filtered. Entry paths use this, never the raw key."""
-    if not sig.get("bullish_cross"):
+# ── Cross persistence ─────────────────────────────────────────────────────────
+# When a gap-valid entry cross was FIRST observed, per (symbol, direction). The
+# edge key stays true for as long as the prior bar sits on the far side, so this
+# tracks a state, not a one-poll spike: the moment the cross stops being valid the
+# entry is cleared and the clock restarts from zero on the next appearance.
+#
+# In-memory ON PURPOSE. A restart forgets the clock and re-arms it, which delays
+# an entry by up to CROSS_SUSTAIN_MINUTES but can never let an unproven cross
+# through early. Failing toward "wait longer" is the safe direction for a rule
+# whose whole job is waiting.
+_cross_first_seen: dict[tuple[str, str], float] = {}
+_cross_confirmed: set = set()
+
+
+def _sustain_minutes() -> int:
+    """The active persistence requirement, or 0 when the rule is off."""
+    if not getattr(config, "ENABLE_CROSS_SUSTAIN", True):
+        return 0
+    return getattr(config, "CROSS_SUSTAIN_MINUTES", 0) or 0
+
+
+def _cross_sustained(symbol: str, kind: str, what: str) -> bool:
+    """True when a gap-valid entry cross has held CROSS_SUSTAIN_MINUTES.
+
+    Call ONLY after the raw edge and the gap check have both passed, so PENDING
+    and CONFIRMED describe real would-be signals. Mirrors _cross_gap_ok's
+    contract.
+
+    Three states, each logged exactly once per cross episode (not per poll — at a
+    60s cadence a per-poll log would print ~30 lines per deferred entry and the
+    counter would measure the poll rate rather than the rule):
+      PENDING   first sighting; the clock starts
+      CONFIRMED the cross survived the window and the signal is released
+      BLOCK     the cross lapsed before the window closed — see _clear_cross_clock
+    """
+    need = _sustain_minutes()
+    if need <= 0:
+        return True
+
+    key = (symbol or "<unnamed>", kind)
+    now = time.time()
+    first = _cross_first_seen.get(key)
+    if first is None:
+        first = _cross_first_seen[key] = now
+        logger.info("SUSTAIN PENDING %s %s: cross seen, need %d min sustained "
+                    "(0/%d min)", key[0], what, need, need)
         return False
-    return _cross_gap_ok(sig, symbol, "bullish cross")
+
+    held_min = (now - first) / 60.0
+    if held_min >= need:
+        if key not in _cross_confirmed:
+            _cross_confirmed.add(key)
+            logger.info("SUSTAIN CONFIRMED %s %s: held %.1f min (>= %d), "
+                        "firing signal", key[0], what, held_min, need)
+        return True
+    return False
+
+
+def _clear_cross_clock(symbol: str, kind: str, what: str = "") -> None:
+    """Forget a cross that is no longer valid.
+
+    A cross that lapses BEFORE maturing is the thing this rule exists to stop, so
+    that — not "deferred at least once" — is what _cross_sustain_blocks counts.
+    One increment = one cross that appeared, failed to hold, and never fired.
+    A cross cleared AFTER it already fired is just bookkeeping and counts nothing.
+    """
+    global _cross_sustain_blocks
+    key = (symbol or "<unnamed>", kind)
+    first = _cross_first_seen.pop(key, None)
+    confirmed = key in _cross_confirmed
+    _cross_confirmed.discard(key)
+    if first is None or confirmed:
+        return
+    need = _sustain_minutes()
+    if need <= 0:
+        return
+    held_min = (time.time() - first) / 60.0
+    _cross_sustain_blocks += 1
+    logger.info("SUSTAIN BLOCK %s %s: cross reversed after %.1f min, before the "
+                "%d-min minimum — signal never fired (sustain blocks #%d)",
+                key[0], what or kind, held_min, need, _cross_sustain_blocks)
+
+
+def _clear_cross_clocks_for(symbol: str) -> None:
+    """Drop both direction clocks for a symbol once a position exists. Without
+    this a stale pre-entry clock would survive the whole trade and hand the next
+    cross credit for time served before the position was ever opened."""
+    for kind in ("bull", "bear"):
+        key = (symbol or "<unnamed>", kind)
+        _cross_first_seen.pop(key, None)
+        _cross_confirmed.discard(key)
+
+
+def _bullish_cross_edge(sig: dict, symbol: str = "") -> bool:
+    """Golden-cross EDGE, gap-filtered and persistence-filtered. Entry paths use
+    this, never the raw key. Exits take the STATE predicates and stay ungated."""
+    if not sig.get("bullish_cross"):
+        _clear_cross_clock(symbol, "bull", "bullish cross")
+        return False
+    if not _cross_gap_ok(sig, symbol, "bullish cross"):
+        _clear_cross_clock(symbol, "bull", "bullish cross")
+        return False
+    return _cross_sustained(symbol, "bull", "bullish cross")
 
 
 def _bearish_cross_edge(sig: dict, symbol: str = "") -> bool:
-    """Death-cross EDGE, gap-filtered. Entry paths use this, never the raw key."""
+    """Death-cross EDGE, gap-filtered and persistence-filtered. Mirror of
+    _bullish_cross_edge."""
     if not sig.get("bearish_cross"):
+        _clear_cross_clock(symbol, "bear", "bearish cross")
         return False
-    return _cross_gap_ok(sig, symbol, "bearish cross")
+    if not _cross_gap_ok(sig, symbol, "bearish cross"):
+        _clear_cross_clock(symbol, "bear", "bearish cross")
+        return False
+    return _cross_sustained(symbol, "bear", "bearish cross")
 
 
 def _exit_long_signal(sig: dict, symbol: str = "") -> bool:
@@ -304,6 +407,7 @@ _profit_takes = 0
 _high_vol_stops = 0        # stops armed TIGHTER than normal (ATR/price > 5%)
 _low_vol_stops = 0         # stops armed WIDER  than normal (ATR/price <= 2%)
 _cross_gap_blocks = 0      # would-be signals suppressed by EMA_CROSS_MIN_GAP_PCT
+_cross_sustain_blocks = 0  # gap-valid entry crosses deferred by CROSS_SUSTAIN_MINUTES
 _stops_trailed = 0         # trailing stops that actually moved (new extreme)
 _breakeven_locks = 0       # stops floored at entry after +1 ATR of profit (principal locked)
 
@@ -889,6 +993,7 @@ def _enter_long(symbol: str, sig: dict, price: float, account_id: str,
     result = tc.place_equity_order(account_id, symbol, "buy", qty)
     if result:
         _mark_bought(symbol)
+        _clear_cross_clocks_for(symbol)   # position exists; clocks are pre-entry state
         order_id = result.get("order", {}).get("id")
         entry_px, fill_px, slippage = _resolve_fill(symbol, account_id, order_id,
                                                      price, "long")
@@ -924,6 +1029,7 @@ def _enter_short(symbol: str, sig: dict, price: float, account_id: str,
     result = tc.place_equity_order(account_id, symbol, "sell_short", qty)
     if result:
         _mark_sold(symbol)
+        _clear_cross_clocks_for(symbol)   # position exists; clocks are pre-entry state
         order_id = result.get("order", {}).get("id")
         entry_px, fill_px, slippage = _resolve_fill(symbol, account_id, order_id,
                                                      price, "short")

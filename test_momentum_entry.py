@@ -46,6 +46,10 @@ def _reset():
     # covered in test_entry_delay.py.
     strategy.mh.entries_allowed = lambda *a, **k: True
     strategy.config.USE_MOMENTUM_ALIGNMENT = True
+    # CROSS_SUSTAIN_MINUTES=0 isolates these cases from cross persistence:
+    # they assert on gap/edge/latch behaviour, not on how long a cross has
+    # held, and would otherwise all need a 30-minute clock advance.
+    strategy.config.CROSS_SUSTAIN_MINUTES = 0
     strategy.config.USE_TRAILING_STOP = True
     strategy.config.ENABLE_SHORTING = True
     strategy.tc.place_equity_order = _fake_place

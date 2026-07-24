@@ -290,6 +290,14 @@ def main() -> None:
                 "suppressed EXIT is deferred, not cancelled — states re-derive "
                 "every poll. Counter: CROSS GAP BLOCK",
                 config.EMA_CROSS_MIN_GAP_PCT * 100)
+    logger.info("Cross sustain: %s — ENTRY crosses only (long entry, short entry, "
+                "options, futures); exits stay ungated by design (exit-side "
+                "variants backtested NEGATIVE). Clock is in-memory: a restart "
+                "re-arms it, deferring an entry, never rushing one. "
+                "Counter: CROSS SUSTAIN BLOCK",
+                (f"{config.CROSS_SUSTAIN_MINUTES} min minimum cross persistence "
+                 f"(PROVISIONAL — fit in-sample on 25 trips)")
+                if config.CROSS_SUSTAIN_MINUTES > 0 else "DISABLED")
     logger.info("Pos. guard  : a FAILED positions fetch skips the whole cycle "
                 "(unknown != flat); ERROR after %d consecutive — stops are "
                 "unenforced during an outage",
