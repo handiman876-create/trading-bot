@@ -273,6 +273,39 @@ def get_positions(account_id: str) -> Optional[list[dict]]:
         return None
 
 
+def get_historical_orders(account_id: str, since: str) -> Optional[list[dict]]:
+    """Filled/cancelled order history since `since` (YYYY-MM-DD), or None on error.
+
+    READ-ONLY. `since` is inclusive and the broker caps history at 90 days —
+    anything older returns nothing, which is why the backfill reports unmatched
+    order IDs rather than treating them as missing trades.
+
+    Returns one row per LEG (a single-leg equity order yields one row), carrying
+    the execution price. Same None-vs-[] contract as get_positions: None means
+    the fetch failed, [] means there genuinely were no orders."""
+    try:
+        data = _get(f"brokerage/accounts/{account_id}/historicalorders",
+                    {"since": since})
+        out = []
+        for o in data.get("Orders", []):
+            for leg in (o.get("Legs") or []):
+                out.append({
+                    "order_id":  str(o.get("OrderID")),
+                    "symbol":    leg.get("Symbol"),
+                    "action":    leg.get("BuyOrSell"),
+                    "quantity":  _f(leg.get("ExecQuantity")),
+                    # ExecutionPrice is the leg's average; FilledPrice is the
+                    # whole-order average. Equal for single-leg equity orders.
+                    "price":     _f(leg.get("ExecutionPrice")) or _f(o.get("FilledPrice")),
+                    "status":    o.get("StatusDescription") or o.get("Status"),
+                    "opened":    o.get("OpenedDateTime"),
+                })
+        return out
+    except Exception as exc:
+        logger.error("Historical orders fetch failed: %s", exc)
+        return None
+
+
 def get_account_balance(account_id: str) -> Optional[dict]:
     try:
         data = _get(f"brokerage/accounts/{account_id}/balances")

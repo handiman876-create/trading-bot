@@ -429,6 +429,27 @@ def _exit_reason(notes: str) -> str:
     return "signal"
 
 
+def _leg_price(event: dict):
+    """(price, source) for one leg — the REAL fill when we have it, else the
+    signal-bar close.
+
+    WHY THIS MATTERS: pricing a round-trip at the signal close is not a rounding
+    detail. A broker audit on 2026-07-27 re-priced all 25 closed trips at their
+    actual fills and moved total realized P&L from -$36,296.78 to -$39,229.12 —
+    the ledger understated the loss by $2,932.34 (8.1%). 54 of 55 matched orders
+    filled at a price different from the one logged, and the drift is
+    DIRECTIONALLY BIASED rather than random: entries fill worse and exits fill
+    worse, so it accumulates against the account. One LII buy slipped $8.10.
+
+    Falls back to the signal price rather than dropping the trip, because most
+    historical events predate fill capture (5f26dcd, 2026-07-20) — a trip priced
+    at signal is worth reporting with a caveat, not discarding."""
+    fill = event.get("fill_price")
+    if fill is not None:
+        return fill, "fill"
+    return event.get("price"), "signal"
+
+
 def _pair_round_trips(events: list):
     """FIFO-pair entries and exits per (symbol, direction). An exit closes the
     OLDEST open entry of the same symbol+direction. Returns
@@ -450,8 +471,15 @@ def _pair_round_trips(events: list):
             # qty: the entry's, or the exit's when the entry is a synthetic
             # bootstrap (quantity unknown at injection).
             qty = entry.get("quantity") or ev.get("quantity")
-            entry_price = entry.get("price")
-            exit_price  = ev.get("price")
+            entry_price, entry_src = _leg_price(entry)
+            exit_price,  exit_src  = _leg_price(ev)
+            # A trip counts as fill-priced only when BOTH legs are real fills;
+            # one real leg against one signal leg is a mixed basis and is
+            # reported separately rather than being rounded up to "at fill".
+            if entry_src == exit_src:
+                basis = entry_src
+            else:
+                basis = "mixed"
             pnl = _pnl(direction, entry_price, exit_price, qty)
             closed.append({
                 "symbol":          ev["symbol"],
@@ -461,10 +489,13 @@ def _pair_round_trips(events: list):
                 "entry_order_id":  entry.get("order_id"),
                 "entry_ts":        entry.get("timestamp"),
                 "entry_price":     entry_price,
+                "entry_price_src": entry_src,
                 "estimated_entry": entry.get("estimated_entry", False),
                 "exit_order_id":   ev.get("order_id"),
                 "exit_ts":         ev.get("timestamp"),
                 "exit_price":      exit_price,
+                "exit_price_src":  exit_src,
+                "price_basis":     basis,
                 "exit_reason":     _exit_reason(ev.get("notes")),
                 "pnl":             round(pnl, 2),
                 "pnl_pct":         _pnl_pct(direction, entry_price, exit_price),
@@ -794,12 +825,16 @@ def build_report(ledger: dict, stops: dict, data_quality: dict,
             for o in orphans],
         "closed_trips":                 len(closed),
         "open_entries":                 len(open_entries),
+        "priced_at_fill":               sum(1 for t in closed if t.get("price_basis") == "fill"),
+        "priced_at_signal":             sum(1 for t in closed if t.get("price_basis") == "signal"),
+        "priced_mixed":                 sum(1 for t in closed if t.get("price_basis") == "mixed"),
     })
 
     return {
         "generated":    _now_ts(),
-        "scope":        "MVP: realized closed round-trips, signal-time prices, "
-                        "attributed to entry feature",
+        "scope":        "MVP: realized closed round-trips, priced at real broker "
+                        "fills where known (signal-bar close otherwise — see Data "
+                        "Quality), attributed to entry feature",
         "ledger_span":  [events and min(events, key=lambda e: _parse_ts(e["timestamp"]))["timestamp"][:10],
                          events and max(events, key=lambda e: _parse_ts(e["timestamp"]))["timestamp"][:10]]
                         if events else [None, None],
@@ -1004,6 +1039,16 @@ def render_txt(report: dict) -> str:
         L.append(f"      - {e}")
     L.append(f"  estimated (bootstrapped) entries: {dq['estimated_entry_trips_closed']} closed, "
              f"{dq['estimated_entry_open']} open")
+    n_trips = dq["closed_trips"]
+    at_fill, at_signal = dq.get("priced_at_fill", 0), dq.get("priced_at_signal", 0)
+    mixed = dq.get("priced_mixed", 0)
+    L.append(f"  trips priced at fill:   {at_fill}/{n_trips}")
+    L.append(f"  trips priced at signal: {at_signal}/{n_trips}"
+             + ("  ⚠️  signal-priced P&L is understated — real fills are worse "
+                "on both legs" if at_signal else ""))
+    if mixed:
+        L.append(f"  trips priced mixed:     {mixed}/{n_trips} "
+                 f"(one leg filled, one leg signal-only)")
     L.append(f"  correction trips excluded from per-feature stats: "
              f"{dq.get('correction_trips_excluded', 0)} "
              f"(hand-placed repairs; not strategy decisions)")
