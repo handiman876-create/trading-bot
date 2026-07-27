@@ -797,8 +797,9 @@ def _check_and_trail_stop(symbol: str, held: int, sig: dict,
             _mark_bought(symbol)
             _mark_sold(symbol)
             order_id = result.get("order", {}).get("id")
-            log_trade(exit_action, symbol, exit_qty, price, "market", order_id,
-                      f"trailing stop hit @ {rec['stop_price']:.2f}")
+            _log_exit_trade(exit_action, symbol, exit_qty, price, order_id,
+                            f"trailing stop hit @ {rec['stop_price']:.2f}",
+                            account_id)
             return True
         logger.error("STOP-LOSS EXIT %s: %s order failed — retrying next cycle",
                      symbol, exit_side)
@@ -853,8 +854,9 @@ def _maybe_take_profit(symbol: str, held: int, sig: dict, account_id: str) -> bo
     stops[symbol] = rec
     _save_stops(stops)                       # record kept -> remainder keeps its stop
     order_id = result.get("order", {}).get("id")
-    log_trade("SELL", symbol, sell_qty, price, "market", order_id,
-              f"profit take (+{gain * 100:.1f}% from entry, RSI={sig['rsi']:.1f})")
+    _log_exit_trade("SELL", symbol, sell_qty, price, order_id,
+                    f"profit take (+{gain * 100:.1f}% from entry, RSI={sig['rsi']:.1f})",
+                    account_id)
     return True
 
 
@@ -945,28 +947,70 @@ def reconcile_momentum_entries(momentum_symbols, positions: list[dict],
 # ── Stock Strategy ────────────────────────────────────────────────────────────
 
 
+# Whether a WORSE fill is a HIGHER price depends only on which way we are
+# trading, not on whether the position is long or short: buying wants a low fill,
+# selling wants a high one. The legacy entry-direction spellings map cleanly
+# ("long" entry = BUY, "short" entry = SELL_SHORT) and are still accepted.
+_BUYING_SIDE = {"BUY", "BUY_TO_COVER", "BUY_TO_OPEN", "long"}
+_SELLING_SIDE = {"SELL", "SELL_SHORT", "SELL_TO_CLOSE", "short"}
+
+
+def _slippage_sign(action: str) -> float:
+    """+1 when a higher fill is worse (we are buying), -1 when lower is worse.
+
+    Raises on an unrecognised action rather than guessing: a silently wrong sign
+    would invert every slippage reading for that path and, worse, would be
+    invisible — the numbers would still look plausible."""
+    if action in _BUYING_SIDE:
+        return 1.0
+    if action in _SELLING_SIDE:
+        return -1.0
+    raise ValueError(f"_slippage_sign: unrecognised action {action!r}")
+
+
 def _resolve_fill(symbol: str, account_id: str, order_id: Optional[str],
-                  signal_price: float, direction: str) -> tuple:
-    """Resolve the ACTUAL entry price for a just-placed equity order.
+                  signal_price: float, action: str) -> tuple:
+    """Resolve the ACTUAL price for a just-placed equity order (entry OR exit).
 
     Queries the broker (tc.get_order) for the fill and returns
-    (entry_price, fill_price, slippage):
+    (resolved_price, fill_price, slippage):
       * fill available   -> (fill, fill, slippage)          stop arms off the fill
-      * fill unavailable -> (signal_price, None, None) + WARNING; stop falls back
-        to the signal-bar close (degraded, not disabled).
+      * fill unavailable -> (signal_price, None, None) + WARNING; caller falls
+        back to the signal-bar close (degraded, not disabled).
 
     Slippage is signed so POSITIVE always means a WORSE fill than signalled:
-      long  buy:  fill - signal   (paid more   = worse)
-      short sell: signal - fill   (sold cheaper = worse; a short wants a HIGH sell)
-    Centralised here so _enter_long and _enter_short compute it identically.
+      BUY / BUY_TO_COVER        fill - signal   (paid more    = worse)
+      SELL / SELL_SHORT         signal - fill   (sold cheaper = worse)
+
+    WHY EXITS MATTER AS MUCH AS ENTRIES: until 2026-07-27 only entries resolved
+    a fill, so every exit in the ledger was priced at the signal-bar close. A
+    broker audit re-priced all 25 closed trips at real fills and moved realized
+    P&L from -$36,296.78 to -$39,229.12 — 8.1% understated. The error is
+    directionally biased (both legs fill worse), so it accumulates rather than
+    averaging out; pricing only one leg fixed only half of it.
     """
     fill = tc.get_order(account_id, order_id) if order_id else None
     if fill is None:
-        logger.warning("Fill price unavailable for %s — using signal price %.4f "
-                       "for stop (degraded, not disabled).", symbol, signal_price)
+        logger.warning("Fill price unavailable for %s (%s) — using signal price "
+                       "%.4f (degraded, not disabled).", symbol, action, signal_price)
         return signal_price, None, None
-    slippage = (fill - signal_price) if direction == "long" else (signal_price - fill)
+    slippage = _slippage_sign(action) * (fill - signal_price)
     return fill, fill, round(slippage, 4)
+
+
+def _log_exit_trade(action: str, symbol: str, qty, price: float, order_id,
+                    notes: str, account_id: str) -> None:
+    """Resolve the real fill for an EXIT and write the trade record.
+
+    One dispatch point for all eight exit paths (stop-loss, profit take, crisis
+    de-risk, state exit, cover, futures close, option close). They previously
+    called log_trade directly with no fill resolution, which is precisely how
+    every exit leg ended up signal-priced. Adding it per-site would have meant
+    eight chances to forget the argument on the next exit path someone writes.
+    """
+    _, fill_px, slippage = _resolve_fill(symbol, account_id, order_id, price, action)
+    log_trade(action, symbol, qty, price, "market", order_id, notes,
+              fill_price=fill_px, signal_price=price, slippage=slippage)
 
 
 def _enter_long(symbol: str, sig: dict, price: float, account_id: str,
@@ -996,7 +1040,7 @@ def _enter_long(symbol: str, sig: dict, price: float, account_id: str,
         _clear_cross_clocks_for(symbol)   # position exists; clocks are pre-entry state
         order_id = result.get("order", {}).get("id")
         entry_px, fill_px, slippage = _resolve_fill(symbol, account_id, order_id,
-                                                     price, "long")
+                                                     price, "BUY")
         log_trade("BUY", symbol, qty, price, "market", order_id, reason,
                   fill_price=fill_px, signal_price=price, slippage=slippage)
         _arm_stop_on_entry(symbol, entry_px, sig.get("atr"), regime=regime,
@@ -1032,7 +1076,7 @@ def _enter_short(symbol: str, sig: dict, price: float, account_id: str,
         _clear_cross_clocks_for(symbol)   # position exists; clocks are pre-entry state
         order_id = result.get("order", {}).get("id")
         entry_px, fill_px, slippage = _resolve_fill(symbol, account_id, order_id,
-                                                     price, "short")
+                                                     price, "SELL_SHORT")
         log_trade("SELL_SHORT", symbol, qty, price, "market", order_id, reason,
                   fill_price=fill_px, signal_price=price, slippage=slippage)
         _arm_stop_on_entry(symbol, entry_px, sig.get("atr"), direction="short",
@@ -1204,8 +1248,8 @@ def evaluate_stock(symbol: str, account_id: str, positions: list[dict],
                 _crisis_exits += 1
                 _mark_sold(symbol)
                 order_id = result.get("order", {}).get("id")
-                log_trade("SELL", symbol, held, price, "market", order_id,
-                          "VIX crisis de-risk")
+                _log_exit_trade("SELL", symbol, held, price, order_id,
+                                "VIX crisis de-risk", account_id)
                 _clear_stop(symbol)
             else:
                 logger.error("CRISIS SELL %s FAILED — retry next cycle", symbol)
@@ -1232,8 +1276,8 @@ def evaluate_stock(symbol: str, account_id: str, positions: list[dict],
         if result:
             _mark_sold(symbol)
             order_id = result.get("order", {}).get("id")
-            log_trade("SELL", symbol, held, price, "market", order_id,
-                      f"EMA bearish, RSI={sig['rsi']:.1f}")
+            _log_exit_trade("SELL", symbol, held, price, order_id,
+                            f"EMA bearish, RSI={sig['rsi']:.1f}", account_id)
             _note_state_only_exit(symbol, sig, "bearish_cross")
             _clear_stop(symbol)
         return
@@ -1247,8 +1291,8 @@ def evaluate_stock(symbol: str, account_id: str, positions: list[dict],
             _short_covers += 1
             _mark_bought(symbol)
             order_id = result.get("order", {}).get("id")
-            log_trade("BUY_TO_COVER", symbol, qty, price, "market", order_id,
-                      f"EMA bullish (cover), RSI={sig['rsi']:.1f}")
+            _log_exit_trade("BUY_TO_COVER", symbol, qty, price, order_id,
+                            f"EMA bullish (cover), RSI={sig['rsi']:.1f}", account_id)
             _note_state_only_exit(symbol, sig, "bullish_cross")
             _clear_stop(symbol)
         return
@@ -1474,8 +1518,8 @@ def evaluate_future(root: str, account_id: str, positions: list[dict],
         result = tc.place_futures_order(account_id, stale.get("symbol"), "sell", qty)
         if result:
             order_id = result.get("order", {}).get("id")
-            log_trade("SELL", stale.get("symbol"), qty, price, "market", order_id,
-                      f"{root} roll: flatten expiring contract")
+            _log_exit_trade("SELL", stale.get("symbol"), qty, price, order_id,
+                            f"{root} roll: flatten expiring contract", account_id)
         return
 
     qty = config.FUTURES_CONTRACTS
@@ -1490,8 +1534,8 @@ def evaluate_future(root: str, account_id: str, positions: list[dict],
         if result:
             _mark_sold(trade_symbol)
             order_id = result.get("order", {}).get("id")
-            log_trade("SELL", trade_symbol, held, price, "market", order_id,
-                      f"{root} EMA bearish, RSI={sig['rsi']:.1f}")
+            _log_exit_trade("SELL", trade_symbol, held, price, order_id,
+                            f"{root} EMA bearish, RSI={sig['rsi']:.1f}", account_id)
             _note_state_only_exit(trade_symbol, sig, "bearish_cross")
         return
 
@@ -1520,7 +1564,7 @@ def evaluate_future(root: str, account_id: str, positions: list[dict],
             # not used to arm one — but resolve it anyway to record real fill vs
             # signal slippage in the trade log, same as the equity entries.
             _, fill_px, slippage = _resolve_fill(trade_symbol, account_id, order_id,
-                                                 price, "long")
+                                                 price, "BUY")
             log_trade("BUY", trade_symbol, qty, price, "market", order_id,
                       f"{root} EMA cross up, RSI={sig['rsi']:.1f}",
                       fill_price=fill_px, signal_price=price, slippage=slippage)
@@ -1542,6 +1586,7 @@ def _close_option(account_id, occ_symbol, held, price, symbol, exp, strike, opt_
     result = tc.place_option_order(account_id, occ_symbol, "sell_to_close", held)
     if result:
         order_id = result.get("order", {}).get("id")
-        log_trade("SELL_TO_CLOSE", occ_symbol, held, price, "market", order_id,
-                  f"{symbol} reversal, RSI={sig['rsi']:.1f}, strike={strike} {opt_type} exp={exp}")
+        _log_exit_trade("SELL_TO_CLOSE", occ_symbol, held, price, order_id,
+                        f"{symbol} reversal, RSI={sig['rsi']:.1f}, "
+                        f"strike={strike} {opt_type} exp={exp}", account_id)
     return result
