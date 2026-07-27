@@ -49,3 +49,56 @@ DDOG today yields 2.5x = no change. The genuine goal behind it ("winners stop
 giving back gains") is better served by a regime-independent **breakeven-lock**
 (floor stop at entry once high_water >= entry), which cannot place a stop through
 market. Discuss before implementing.
+
+## SHORT_MAX_ATR_PCT: exclude high-ATR names from short entries
+
+**Observed (2026-07-27):** every short entry in the retained window (7, spanning
+2026-07-17..07-27) lost money, total -$10,775. The high-ATR ones lost most:
+blocking `ATR/price >= 5%` at entry would have stopped AMD x3 and PLTR
+(-$8,523 of the -$10,775, 79%). AMD entered at **7.82%** ATR/price, giving a
+1.5x stop **11.73% wide** — so the breakeven lock (which needs +1.0 ATR = a
+7.82% favorable move) is effectively unreachable on that name. AMD's actual
+favorable excursion was 0.04 ATR.
+
+Current watchlist spread (2026-07-27 close, Wilder ATR14): 6 of 20 names sit at
+>= 5% — PLTR 5.04, CRWD 5.35, TSLA 5.96, AMD 7.57, ARM 9.64, CRWV 9.87. So the
+rule is genuinely selective (leaves 10 of 15 core shortable), NOT an off-switch.
+
+**Well-formed but currently unmeasurable — do NOT implement yet. Four reasons:**
+
+1. **The regime filter already blocks all of it.** `SHORT_MIN_REGIME` (shipped
+   `dfcfcca`, 2026-07-27) blocks new shorts below cautious, and all 7 historical
+   shorts were armed in risk_on. Both rules would block the same 4 trades, so
+   shipping this one now makes neither attributable to any outcome.
+2. **The threshold is knife-edge on the trade that motivates it.** PLTR reads
+   **5.04%** — four hundredths above the line. At a 7% cutoff PLTR is waved
+   through and the -$3,120 is not caught; at 5% it is. Picking between those
+   from 7 trades is fitting, not discovery. Compare the DDOG-at-4.98% note in
+   the reconcile_stops entry above: same cliff, already documented once.
+3. **The dollar case is mostly position sizing.** Blocked trades averaged
+   -$2,131 vs -$751 allowed, but every position is 5% of equity, so high-ATR
+   names mechanically swing more in dollars. Normalized by ATR the gap narrows
+   to 0.67 vs 0.39 ATR — and the worst risk-adjusted trade (PLTR, 1.21 ATR) is
+   in the *blocked* group only by that 0.04% margin.
+4. **Zero cautious-regime shorts exist.** risk_on is the only regime observed,
+   so there is no control group and no evidence risk_on (or high ATR%) is
+   *causal* rather than merely coincident. 0-for-7 on one regime is not a
+   comparison.
+
+**Direction:** run death-cross-short through the discovery pipeline with ATR% as
+a **conditioning variable**, and let the existing `ci_lower > 1.0` promotion gate
+choose the cutoff — instead of hand-picking 5% or 7% from live losses. If the
+archetype clears ci_lower only when conditioned on ATR%, that is a real finding
+and worth building; if it fails unconditionally, no entry filter rescues it and
+the right answer is to stop shorting on this signal. Note the survivors under a
+5% filter were still 0-for-3: the filter reduces trade count, it has not been
+shown to find a *profitable* short.
+
+**If it is ever built:** do NOT add a new `SHORT_MAX_ATR_PCT` constant.
+`ATR_PCT_HIGH_THRESHOLD` is already 0.05 and the band is already computed and
+persisted at entry (`atr_mult` / `atr_at_entry`), so the rule states as "do not
+short anything in the high-vol band" and reuses that machinery rather than
+adding a third ATR%-of-price constant beside the two that exist.
+
+**Prerequisite:** let `SHORT_MIN_REGIME` run 2-4 weeks first and gather actual
+cautious-regime short data. Revisit only with pipeline evidence.
