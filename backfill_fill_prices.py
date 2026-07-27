@@ -31,6 +31,7 @@ import sys
 from datetime import datetime, timedelta
 
 import performance_analyzer as pa
+import strategy
 import tradestation_client as tc
 
 logger = logging.getLogger("backfill_fill_prices")
@@ -50,7 +51,8 @@ def backfill(ledger: dict, orders: list[dict]) -> dict:
     the fill via get_order, which is at least as authoritative as history and
     avoids churning the ledger on every run."""
     by_id = {o["order_id"]: o for o in orders if o.get("price") is not None}
-    stats = {"matched": 0, "already_had": 0, "unmatched": [], "no_order_id": 0}
+    stats = {"matched": 0, "already_had": 0, "unmatched": [], "no_order_id": 0,
+             "slippage_rederived": 0}
 
     for event in ledger.get("events", {}).values():
         oid = event.get("order_id")
@@ -59,18 +61,43 @@ def backfill(ledger: dict, orders: list[dict]) -> dict:
             continue
         if event.get("fill_price") is not None:
             stats["already_had"] += 1
-            continue
-        order = by_id.get(str(oid))
-        if order is None:
-            stats["unmatched"].append((str(oid), event.get("symbol"),
-                                       event.get("timestamp")))
-            continue
-        event["fill_price"] = order["price"]
-        signal = event.get("price")
-        if signal is not None:
-            event["slippage"] = round(order["price"] - signal, 4)
-        stats["matched"] += 1
+        else:
+            order = by_id.get(str(oid))
+            if order is None:
+                stats["unmatched"].append((str(oid), event.get("symbol"),
+                                           event.get("timestamp")))
+                continue
+            event["fill_price"] = order["price"]
+            stats["matched"] += 1
+        # Slippage is DERIVED, not observed, so re-derive it every run even for
+        # events whose fill we already had. The first cut of this script stored a
+        # raw (fill - signal), which is inverted for every SELLING action: a sell
+        # filled BELOW the signal is worse, not better. That produced a stored
+        # column that disagreed with strategy._resolve_fill and made exits look
+        # favourable when they were not. A derived value that outlives its
+        # derivation logic is worse than no value.
+        if _rederive_slippage(event):
+            stats["slippage_rederived"] += 1
     return stats
+
+
+def _rederive_slippage(event: dict) -> bool:
+    """Recompute `slippage` from (fill, signal, action). True if it was set.
+
+    Positive ALWAYS means a worse fill than signalled. The sign depends on
+    whether the order bought or sold, not on whether the position is long or
+    short — reuses strategy._slippage_sign so there is exactly one definition."""
+    fill, signal = event.get("fill_price"), event.get("price")
+    if fill is None or signal is None:
+        return False
+    try:
+        sign = strategy._slippage_sign(event.get("action", ""))
+    except ValueError:
+        logger.warning("unrecognised action %r on %s — leaving slippage unset",
+                       event.get("action"), event.get("order_id"))
+        return False
+    event["slippage"] = round(sign * (fill - signal), 4)
+    return True
 
 
 def _realized(ledger: dict) -> tuple[float, int]:
@@ -115,6 +142,7 @@ def main() -> int:
     print(f"  fill prices retrieved and applied : {stats['matched']}")
     print(f"  events that already had a fill    : {stats['already_had']}")
     print(f"  events with no order_id (synthetic): {stats['no_order_id']}")
+    print(f"  slippage re-derived (signed)       : {stats['slippage_rederived']}")
     print(f"  order_ids not found at broker      : {len(stats['unmatched'])}")
     for oid, sym, ts in stats["unmatched"][:10]:
         print(f"      - {oid}  {sym:<6} {ts}")

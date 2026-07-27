@@ -42,11 +42,60 @@ def test_applies_fill_price_from_broker():
     assert led["events"]["111"]["fill_price"] == 476.00
 
 
-def test_records_signed_slippage():
-    """Slippage is fill - signal, so positive means a worse fill on a buy."""
+def test_records_signed_slippage_on_a_buy():
+    """Positive ALWAYS means a worse fill. Buying above the signal is worse."""
     led = _ledger([_event("111", price=476.24)])
+    led["events"]["111"]["action"] = "BUY"
     bf.backfill(led, [_order("111", 476.50)])
     assert led["events"]["111"]["slippage"] == 0.26
+
+
+def test_slippage_sign_is_inverted_for_selling_actions():
+    """The bug this fixes: a raw (fill - signal) reads a SELL filled BELOW the
+    signal as favourable, when selling cheaper is worse. Storing it raw made
+    exits look advantageous while they were costing money — 20 of 24 exit legs
+    filled worse, not better."""
+    led = _ledger([_event("111", price=100.0, role="exit", direction="long")])
+    led["events"]["111"]["action"] = "SELL"
+    bf.backfill(led, [_order("111", 99.50)])
+    assert led["events"]["111"]["slippage"] == 0.50, \
+        "a sell filled 0.50 below signal is 0.50 WORSE, not better"
+
+
+def test_cover_and_sell_slippage_signs_are_opposite():
+    """Same raw drift, opposite verdict — a BUY_TO_COVER is a purchase."""
+    sell = _ledger([_event("1", price=100.0, role="exit")])
+    sell["events"]["1"]["action"] = "SELL"
+    bf.backfill(sell, [_order("1", 101.0)])
+
+    cover = _ledger([_event("2", price=100.0, role="exit", direction="short")])
+    cover["events"]["2"]["action"] = "BUY_TO_COVER"
+    bf.backfill(cover, [_order("2", 101.0)])
+
+    assert sell["events"]["1"]["slippage"] == -1.0     # sold higher = better
+    assert cover["events"]["2"]["slippage"] == 1.0     # bought higher = worse
+
+
+def test_slippage_is_rederived_even_when_fill_already_present():
+    """Slippage is derived, not observed. An event whose fill we already had must
+    still get a corrected sign — otherwise the first run's raw values persist
+    forever behind the never-overwrite rule."""
+    led = _ledger([_event("111", price=100.0, fill=99.50, role="exit")])
+    led["events"]["111"]["action"] = "SELL"
+    led["events"]["111"]["slippage"] = -0.50          # the old, inverted value
+    stats = bf.backfill(led, [])
+    assert stats["already_had"] == 1 and stats["slippage_rederived"] == 1
+    assert led["events"]["111"]["slippage"] == 0.50
+    assert led["events"]["111"]["fill_price"] == 99.50, "fill itself must not change"
+
+
+def test_unrecognised_action_leaves_slippage_unset():
+    led = _ledger([_event("111", price=100.0)])
+    led["events"]["111"]["action"] = "HODL"
+    led["events"]["111"].pop("slippage", None)
+    bf.backfill(led, [_order("111", 101.0)])
+    assert led["events"]["111"].get("slippage") is None
+    assert led["events"]["111"]["fill_price"] == 101.0, "fill still applies"
 
 
 def test_never_overwrites_an_existing_fill():
