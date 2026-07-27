@@ -252,6 +252,17 @@ def main() -> None:
                     "the same wipe takes both)")
         logger.info("Shorting    : %s (effective watchlist, death-cross entries)",
                     "ENABLED" if config.ENABLE_SHORTING else "DISABLED")
+        if config.ENABLE_SHORTING and config.ENABLE_REGIME_SHORT_FILTER:
+            logger.info("Short regime filter: ENABLED (cautious/defensive only) — "
+                        "NEW shorts require regime >= %s; risk_on and unknown "
+                        "blocked. NOTE defensive/crisis are already closed by "
+                        "block_new_entries, so in practice shorts fire ONLY in "
+                        "cautious (20 <= VIX < 25). ENTRY-only: open shorts still "
+                        "trail, stop and cover normally. Counter: REGIME BLOCK",
+                        config.SHORT_MIN_REGIME)
+        elif config.ENABLE_SHORTING:
+            logger.info("Short regime filter: DISABLED (shorts gated only by "
+                        "ENABLE_SHORTING and defensive/crisis)")
         if config.ENABLE_PROFIT_TAKING:
             logger.info("Profit take : ENABLED (>= +%.0f%% & RSI >= %.0f -> sell %.0f%%, one-shot, stop kept on remainder)",
                         config.PROFIT_TAKE_PCT * 100, config.PROFIT_TAKE_RSI_MIN,

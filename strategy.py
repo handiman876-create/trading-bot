@@ -408,6 +408,7 @@ _high_vol_stops = 0        # stops armed TIGHTER than normal (ATR/price > 5%)
 _low_vol_stops = 0         # stops armed WIDER  than normal (ATR/price <= 2%)
 _cross_gap_blocks = 0      # would-be signals suppressed by EMA_CROSS_MIN_GAP_PCT
 _cross_sustain_blocks = 0  # gap-valid entry crosses deferred by CROSS_SUSTAIN_MINUTES
+_regime_short_blocks = 0   # would-be short entries suppressed by SHORT_MIN_REGIME
 _stops_trailed = 0         # trailing stops that actually moved (new extreme)
 _breakeven_locks = 0       # stops floored at entry after +1 ATR of profit (principal locked)
 
@@ -1119,12 +1120,25 @@ def _is_extreme(vix: Optional[float]) -> bool:
 
 
 def _apply_regime_rules(regime: str):
-    """Map a regime to entry gates: (block_new_entries, block_momentum_align).
+    """Map a regime to entry gates:
+    (block_new_entries, block_momentum_align, block_shorts).
     Centralized so evaluate_stock and evaluate_future read identical logic and a
-    rule change lands in exactly one place."""
+    rule change lands in exactly one place.
+
+    block_shorts is the SHORT_MIN_REGIME gate: a regime less fearful than the
+    configured floor blocks NEW shorts. It is deliberately redundant with
+    block_new_entries in defensive/crisis (both block) so that reading either
+    gate alone still gives the right answer for shorts."""
     block_new_entries    = regime in ("defensive", "crisis")
     block_momentum_align = regime in ("cautious", "defensive", "crisis")
-    return block_new_entries, block_momentum_align
+    if getattr(config, "ENABLE_REGIME_SHORT_FILTER", False):
+        floor = getattr(config, "SHORT_MIN_REGIME", "risk_on")
+        # "unknown" ranks with risk_on, so a VIX outage blocks shorts (fail-CLOSED
+        # for shorts, unlike the fail-OPEN longs get) — see the config note.
+        block_shorts = _REGIME_RANK.get(regime, 0) < _REGIME_RANK.get(floor, 0)
+    else:
+        block_shorts = False
+    return block_new_entries, block_momentum_align, block_shorts
 
 
 # Fear ordering for the belt-&-suspenders VIX-vs-sentiment combination.
@@ -1196,7 +1210,7 @@ def evaluate_stock(symbol: str, account_id: str, positions: list[dict],
                    regime: str = "risk_on",
                    blocked_symbols=frozenset()) -> None:
     global _momentum_align_entries, _short_entries, _short_covers, _entries_delayed
-    global _crisis_exits, _sentiment_sector_blocks
+    global _crisis_exits, _sentiment_sector_blocks, _regime_short_blocks
 
     history = tc.get_historical(symbol, days=90)
     if not history:
@@ -1319,7 +1333,7 @@ def evaluate_stock(symbol: str, account_id: str, positions: list[dict],
     # above are deliberately ungated — de-risking is always allowed; only ENTRIES
     # are throttled by fear. cautious blocks only momentum-alignment; defensive and
     # crisis block every new entry (fresh-cross longs, alignment, and shorts).
-    block_new_entries, block_momentum_align = _apply_regime_rules(regime)
+    block_new_entries, block_momentum_align, block_shorts = _apply_regime_rules(regime)
 
     # BUY signal — fresh EMA cross (all symbols)
     if (_bullish_cross_edge(sig, symbol) and sig["rsi"] < config.RSI_OVERBOUGHT
@@ -1364,9 +1378,20 @@ def evaluate_stock(symbol: str, account_id: str, positions: list[dict],
     # Stays EDGE-based: it is an entry. On state it would re-short every poll.
     elif (_bearish_cross_edge(sig, symbol) and sig["rsi"] > config.RSI_OVERSOLD
           and held == 0 and config.ENABLE_SHORTING and not block_new_entries):
-        if _enter_short(symbol, sig, price, account_id, positions, equity,
-                        reason=f"EMA cross down (short), RSI={sig['rsi']:.1f}",
-                        regime=regime):
+        # SHORT_MIN_REGIME gate. Checked INSIDE the branch, not as an extra elif
+        # condition, so a blocked short is counted and logged rather than
+        # silently falling through to nothing — a safety net you cannot see
+        # firing is one you cannot later argue for removing.
+        if block_shorts:
+            _regime_short_blocks += 1
+            logger.info("REGIME BLOCK: skipping short %s — regime=%s below "
+                        "SHORT_MIN_REGIME=%s (market not fearful enough to "
+                        "short) #%d", symbol, regime,
+                        getattr(config, "SHORT_MIN_REGIME", "risk_on"),
+                        _regime_short_blocks)
+        elif _enter_short(symbol, sig, price, account_id, positions, equity,
+                          reason=f"EMA cross down (short), RSI={sig['rsi']:.1f}",
+                          regime=regime):
             _short_entries += 1
             logger.info("SHORT ENTRY %s — short entries #%d", symbol, _short_entries)
 
@@ -1550,7 +1575,8 @@ def evaluate_future(root: str, account_id: str, positions: list[dict],
     # VIX regime gate — futures have no momentum slot or bot-managed stop, so the
     # filter reduces to blocking new entries in defensive/crisis (the roll-flatten
     # and state exit above are de-risking and stay ungated).
-    block_new_entries, _ = _apply_regime_rules(regime)
+    # (futures have no short path, so block_shorts is unused here)
+    block_new_entries, _, _ = _apply_regime_rules(regime)
 
     # BUY signal — open long front month (EDGE: it is an entry)
     if (_bullish_cross_edge(sig, trade_symbol) and sig["rsi"] < config.RSI_OVERBOUGHT

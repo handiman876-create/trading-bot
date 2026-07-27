@@ -170,10 +170,13 @@ def test_short_entry_blocked_then_fires():
     _reset()
     c = _clock()
     _set_sig(99.0, 100.0, bearish_cross=True)
-    strategy.evaluate_stock("BBB", "acct", [], 100_000.0)
+    # regime="cautious": SHORT_MIN_REGIME blocks new shorts in risk_on, so a
+    # short-entry test must run in the one regime where shorts can fire at all,
+    # or it would pass for the wrong reason (regime block, not sustain).
+    strategy.evaluate_stock("BBB", "acct", [], 100_000.0, regime="cautious")
     assert _sides("sell_short") == [], "young death cross must not short"
     c.advance(31)
-    strategy.evaluate_stock("BBB", "acct", [], 100_000.0)
+    strategy.evaluate_stock("BBB", "acct", [], 100_000.0, regime="cautious")
     assert len(_sides("sell_short")) == 1, "mature death cross must short"
 
 

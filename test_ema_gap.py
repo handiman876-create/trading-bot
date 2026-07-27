@@ -40,6 +40,7 @@ def _reset():
     strategy._state_only_exits = 0
     strategy._short_covers = 0
     strategy._short_entries = 0
+    strategy._regime_short_blocks = 0
     strategy._momentum_align_entries = 0
     strategy._entries_delayed = 0
     strategy._cross_gap_logged.clear()
@@ -197,16 +198,28 @@ def test_long_entry_fires_on_wide_gap():
 # ── Signal 4/4: short entry (bearish cross edge) ──────────────────────────────
 
 def test_short_entry_blocked_by_thin_gap():
+    # regime="cautious" throughout the short-entry tests: SHORT_MIN_REGIME blocks
+    # new shorts in risk_on, so running these at the default would make them pass
+    # for the wrong reason — the gap gate under test would never be reached.
     _reset(); _set_sig(191.98, 192.04, price=176.99, bearish_cross=True)
-    strategy.evaluate_stock("DHR", "ACCT", [], 100000.0)
+    strategy.evaluate_stock("DHR", "ACCT", [], 100000.0, regime="cautious")
     assert _orders == [], f"thin death cross must not short, got {_orders}"
     assert strategy._cross_gap_blocks == 1
+    assert strategy._regime_short_blocks == 0, "gap gate must fire first, not regime"
 
 
 def test_short_entry_fires_on_wide_gap():
     _reset(); _set_sig(188.0, 192.04, price=176.99, bearish_cross=True)
-    strategy.evaluate_stock("DHR", "ACCT", [], 100000.0)
+    strategy.evaluate_stock("DHR", "ACCT", [], 100000.0, regime="cautious")
     assert _sides("sell_short"), f"wide death cross must short, got {_orders}"
+
+
+def test_short_entry_blocked_by_regime_even_on_wide_gap():
+    """Same wide gap that fires in cautious must NOT fire in risk_on."""
+    _reset(); _set_sig(188.0, 192.04, price=176.99, bearish_cross=True)
+    strategy.evaluate_stock("DHR", "ACCT", [], 100000.0, regime="risk_on")
+    assert _sides("sell_short") == [], f"risk_on must block the short, got {_orders}"
+    assert strategy._regime_short_blocks == 1
 
 
 # ── 5th site: momentum alignment (was a bare inline EMA comparison) ───────────

@@ -37,6 +37,7 @@ def _reset():
     strategy._momentum_align_entries = 0
     strategy._short_entries = 0
     strategy._short_covers = 0
+    strategy._regime_short_blocks = 0
     strategy._entries_delayed = 0
     strategy._latches_reconstructed = 0
     strategy._signaled_buy_today.clear()
@@ -189,13 +190,17 @@ def test_short_enters_core_on_death_cross():
     """Core name, fresh death cross, flat -> SELLSHORT, sized like a long, with a
     trailing stop armed ABOVE entry."""
     _reset(); _set_sig(bearish_cross=True, close=100.0)
+    # regime="cautious" is now the ONLY regime a new short can open in
+    # (SHORT_MIN_REGIME blocks risk_on; defensive/crisis block all entries), so
+    # the armed width is the cautious 2.0x — a short can no longer arm at 2.5x.
     strategy.evaluate_stock("AAPL", "ACCT", [], 100000.0,
-                            is_momentum=False, momentum_generation="")
+                            is_momentum=False, momentum_generation="",
+                            regime="cautious")
     assert _sides("sell_short") == [("AAPL", "sell_short", 50)], _orders
     assert strategy._short_entries == 1, "short-entry counter incremented"
     rec = strategy._load_stops()["AAPL"]
     assert rec["direction"] == "short", rec
-    assert abs(rec["stop_price"] - 110.0) < 1e-6, rec        # 100 + 2.5*4, stop ABOVE
+    assert abs(rec["stop_price"] - 108.0) < 1e-6, rec        # 100 + 2.0*4, stop ABOVE
     assert abs(rec["low_water"] - 100.0) < 1e-6, rec
 
 
@@ -207,20 +212,25 @@ def test_momentum_name_shorts_on_death_cross():
     # alignment branch cannot fire and the short branch is reached.
     _reset(); _set_sig(bearish_cross=True, close=100.0, ema_short=100.0, ema_long=105.0)
     strategy.evaluate_stock("DDOG", "ACCT", [], 100000.0,
-                            is_momentum=True, momentum_generation="G1")
+                            is_momentum=True, momentum_generation="G1",
+                            regime="cautious")
     assert _sides("sell_short") == [("DDOG", "sell_short", 50)], _orders
     assert strategy._short_entries == 1, "short-entry counter incremented"
     rec = strategy._load_stops()["DDOG"]
     assert rec["direction"] == "short", rec
-    assert abs(rec["stop_price"] - 110.0) < 1e-6, rec        # 100 + 2.5*4, stop ABOVE
+    assert abs(rec["stop_price"] - 108.0) < 1e-6, rec        # 100 + 2.0*4, stop ABOVE
 
 
 def test_shorting_disabled_no_short():
     _reset(); _set_sig(bearish_cross=True)
     strategy.config.ENABLE_SHORTING = False
+    # cautious, so the assertion proves ENABLE_SHORTING did the blocking rather
+    # than SHORT_MIN_REGIME quietly doing it instead.
     strategy.evaluate_stock("AAPL", "ACCT", [], 100000.0,
-                            is_momentum=False, momentum_generation="")
+                            is_momentum=False, momentum_generation="",
+                            regime="cautious")
     assert _sides("sell_short") == [], "ENABLE_SHORTING=False disables shorting"
+    assert strategy._regime_short_blocks == 0, "master switch must block first"
 
 
 def test_short_respects_max_positions():
@@ -228,8 +238,59 @@ def test_short_respects_max_positions():
     full = [{"symbol": f"S{i}", "quantity": 1, "cost_basis": 100.0}
             for i in range(strategy.config.MAX_POSITIONS)]
     strategy.evaluate_stock("AAPL", "ACCT", full, 100000.0,
-                            is_momentum=False, momentum_generation="")
+                            is_momentum=False, momentum_generation="",
+                            regime="cautious")
     assert _sides("sell_short") == [], "max positions blocks a new short"
+
+
+def test_short_blocked_in_risk_on_regime():
+    """The SHORT_MIN_REGIME gate, at the evaluate_stock level: an otherwise
+    perfect death-cross short does not fire in risk_on, increments the counter,
+    and arms no stop record."""
+    _reset(); _set_sig(bearish_cross=True, close=100.0)
+    strategy.evaluate_stock("AAPL", "ACCT", [], 100000.0,
+                            is_momentum=False, momentum_generation="",
+                            regime="risk_on")
+    assert _sides("sell_short") == [], f"risk_on must block the short, got {_orders}"
+    assert strategy._short_entries == 0, "blocked short must not count as an entry"
+    assert strategy._regime_short_blocks == 1, "regime block must be counted"
+    assert "AAPL" not in strategy._load_stops(), "no stop armed for a blocked short"
+
+
+def test_regime_filter_off_allows_risk_on_short():
+    """Master switch OFF ⇒ the same risk_on death cross that is blocked above
+    fires normally, and the block counter stays at zero."""
+    _reset(); _set_sig(bearish_cross=True, close=100.0)
+    orig = strategy.config.ENABLE_REGIME_SHORT_FILTER
+    try:
+        strategy.config.ENABLE_REGIME_SHORT_FILTER = False
+        strategy.evaluate_stock("AAPL", "ACCT", [], 100000.0,
+                                is_momentum=False, momentum_generation="",
+                                regime="risk_on")
+        assert _sides("sell_short") == [("AAPL", "sell_short", 50)], _orders
+        assert strategy._short_entries == 1
+        assert strategy._regime_short_blocks == 0, "filter off ⇒ no blocks counted"
+    finally:
+        strategy.config.ENABLE_REGIME_SHORT_FILTER = orig
+
+
+def test_existing_short_not_an_entry_attempt_under_regime_gate():
+    """The gate is ENTRY-only — it never reaches a held position. With a short
+    already open in risk_on, no NEW short is opened and the block counter stays
+    at zero (held != flat, so the entry branch is not evaluated at all).
+
+    Deliberately does NOT assert on buy_to_cover: this module's mock quote is
+    10000 against a cost basis of 100, so the bootstrapped trailing stop fires
+    immediately. That is the stop machinery behaving correctly and is covered in
+    test_stops.py — asserting it here would test the fixture, not the gate."""
+    _reset(); _set_sig(bearish_cross=True, close=100.0)
+    positions = [{"symbol": "AAPL", "quantity": -50, "cost_basis": 5000.0}]
+    strategy.evaluate_stock("AAPL", "ACCT", positions, 100000.0,
+                            is_momentum=False, momentum_generation="",
+                            regime="risk_on")
+    assert _sides("sell_short") == [], "held short must not be added to"
+    assert strategy._short_entries == 0
+    assert strategy._regime_short_blocks == 0, "held short is not an entry attempt"
 
 
 def test_cover_on_bullish_cross():

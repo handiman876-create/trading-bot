@@ -81,13 +81,68 @@ def test_is_extreme():
 
 # ── 2. entry-gate derivation (the centralized rule table) ─────────────────────
 def test_apply_regime_rules():
-    # (block_new_entries, block_momentum_align)
-    assert strategy._apply_regime_rules("risk_on")   == (False, False)
-    assert strategy._apply_regime_rules("cautious")  == (False, True)
-    assert strategy._apply_regime_rules("defensive") == (True, True)
-    assert strategy._apply_regime_rules("crisis")    == (True, True)
-    # fail-open: an unknown regime blocks nothing (trades as risk_on)
-    assert strategy._apply_regime_rules("unknown")   == (False, False)
+    # (block_new_entries, block_momentum_align, block_shorts) @ SHORT_MIN_REGIME="cautious"
+    assert strategy._apply_regime_rules("risk_on")   == (False, False, True)
+    assert strategy._apply_regime_rules("cautious")  == (False, True,  False)
+    assert strategy._apply_regime_rules("defensive") == (True,  True,  False)
+    assert strategy._apply_regime_rules("crisis")    == (True,  True,  False)
+    # Longs fail-OPEN on unknown (a VIX glitch never blocks a buy); shorts
+    # fail-CLOSED (unknown ranks with risk_on, so it blocks). Asymmetric on
+    # purpose — failing open on a short is how you get short into a rally.
+    assert strategy._apply_regime_rules("unknown")   == (False, False, True)
+
+
+def test_short_min_regime_gate_is_configurable():
+    """SHORT_MIN_REGIME moves the floor; 'risk_on' restores pre-gate behaviour."""
+    orig = config.SHORT_MIN_REGIME
+    try:
+        config.SHORT_MIN_REGIME = "risk_on"
+        for r in ("risk_on", "cautious", "defensive", "crisis", "unknown"):
+            assert strategy._apply_regime_rules(r)[2] is False, r
+
+        config.SHORT_MIN_REGIME = "defensive"
+        assert strategy._apply_regime_rules("cautious")[2] is True
+        assert strategy._apply_regime_rules("defensive")[2] is False
+    finally:
+        config.SHORT_MIN_REGIME = orig
+
+
+def test_regime_short_filter_master_switch_off():
+    """ENABLE_REGIME_SHORT_FILTER=False restores pre-filter behaviour exactly:
+    block_shorts is False in EVERY regime, and the other two gates are untouched."""
+    orig = config.ENABLE_REGIME_SHORT_FILTER
+    try:
+        config.ENABLE_REGIME_SHORT_FILTER = False
+        assert strategy._apply_regime_rules("risk_on")   == (False, False, False)
+        assert strategy._apply_regime_rules("cautious")  == (False, True,  False)
+        assert strategy._apply_regime_rules("defensive") == (True,  True,  False)
+        assert strategy._apply_regime_rules("crisis")    == (True,  True,  False)
+        assert strategy._apply_regime_rules("unknown")   == (False, False, False)
+    finally:
+        config.ENABLE_REGIME_SHORT_FILTER = orig
+
+
+def test_crisis_still_blocks_every_entry_including_shorts():
+    """The pre-existing crisis rule is unchanged: block_new_entries closes crisis
+    to ALL entries, so a crisis short is blocked by the OLD gate, not the new one.
+    block_shorts reads False there — that is correct and not a regression."""
+    block_new, _, block_shorts = strategy._apply_regime_rules("crisis")
+    assert block_new is True, "crisis must still block all new entries"
+    assert block_shorts is False, "crisis shorts are stopped by block_new_entries"
+    block_new, _, block_shorts = strategy._apply_regime_rules("defensive")
+    assert block_new is True, "defensive must still block all new entries"
+    assert block_shorts is False
+
+
+def test_defensive_and_crisis_already_block_all_entries():
+    """The documented consequence: at SHORT_MIN_REGIME='cautious', cautious is the
+    ONLY regime where a new short can actually fire, because defensive/crisis are
+    already closed by block_new_entries. If this ever fails, the config comment
+    claiming 'shorts fire only while 20 <= VIX < 25' has gone stale."""
+    openable = [r for r in ("risk_on", "cautious", "defensive", "crisis", "unknown")
+                if not strategy._apply_regime_rules(r)[0]      # entries allowed
+                and not strategy._apply_regime_rules(r)[2]]    # shorts allowed
+    assert openable == ["cautious"], openable
 
 
 # ── 3. cache: one fetch per VIX_CACHE_SECONDS window ──────────────────────────
@@ -122,8 +177,8 @@ def test_current_regime_fails_open_on_none():
         vix, regime = strategy.current_regime(now=2000.0)
         assert vix is None
         assert regime == "unknown"
-        # and 'unknown' must gate like risk_on (no blocks)
-        assert strategy._apply_regime_rules(regime) == (False, False)
+        # 'unknown' gates like risk_on for LONGS (no blocks) but blocks shorts
+        assert strategy._apply_regime_rules(regime) == (False, False, True)
     finally:
         _reset_regime_state()
 

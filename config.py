@@ -281,6 +281,31 @@ ATR_MULT_BY_REGIME_AND_BAND = {
 # entry and ratchets DOWN with a low-water mark, using the regime ATR multiple.
 ENABLE_SHORTING = True   # master switch; False = long-only (prior behaviour)
 
+# Master switch for the regime short filter below. False restores pre-filter
+# behaviour exactly (shorts gated only by ENABLE_SHORTING and block_new_entries),
+# so this can be flipped off without editing SHORT_MIN_REGIME.
+ENABLE_REGIME_SHORT_FILTER = True
+
+# Minimum fear level required to open a NEW short. Shorting into a bullish tape
+# is what the short book has actually been doing: every short entry in the
+# retained window (7, 2026-07-17..07-27) was armed in risk_on, and the closed
+# short trips are 0-for-5 for -$9,054.34. Existing shorts are NOT touched — this
+# gates entries only, so a position already open still trails and stops normally.
+#
+# Ranked against _REGIME_RANK: a regime ranking BELOW this blocks new shorts.
+# "unknown" ranks with risk_on, so a VIX outage blocks shorts rather than
+# opening them blind — the opposite of the fail-OPEN used for longs, and
+# deliberate: failing open on a short is how you get short into a rally.
+#
+# READ THIS BEFORE CHANGING IT. defensive and crisis already block ALL new
+# entries via _apply_regime_rules, so the only regime this actually opens
+# shorting in is cautious. The effective rule at "cautious" is therefore:
+#   shorts fire only while 20 <= VIX < 25.
+# Setting this to "defensive" or "crisis" does not widen that window — it
+# disables new shorts entirely. There is no value that permits shorting in
+# risk_on; use ENABLE_SHORTING = False if you want the long-only switch.
+SHORT_MIN_REGIME = "cautious"
+
 # ── Momentum alignment entry (momentum slot only) ─────────────────────────────
 # Momentum leaders are already trending when the twice-monthly screen adds them,
 # so they never produce a *fresh* EMA cross for the bot to enter on. Give the

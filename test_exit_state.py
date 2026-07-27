@@ -153,13 +153,15 @@ def test_momentum_name_does_not_reenter_after_state_exit_in_rotation():
 def test_short_entry_still_requires_edge():
     """SELLSHORT is an ENTRY. On state it would re-short on every poll."""
     _reset(); _set_sig()                       # bearish state, NO edge, flat
-    strategy.evaluate_stock("AAPL", "ACCT", [], 100000.0)
+    # regime="cautious": shorts are blocked outright in risk_on by
+    # SHORT_MIN_REGIME, which would mask the edge-vs-state behaviour under test.
+    strategy.evaluate_stock("AAPL", "ACCT", [], 100000.0, regime="cautious")
     assert _sides("sell_short") == [], "no short without a fresh death cross"
 
 
 def test_short_entry_fires_on_edge():
     _reset(); _set_sig(bearish_cross=True)
-    strategy.evaluate_stock("AAPL", "ACCT", [], 100000.0)
+    strategy.evaluate_stock("AAPL", "ACCT", [], 100000.0, regime="cautious")
     assert _sides("sell_short") == [("AAPL", "sell_short", 50)], _orders
 
 
