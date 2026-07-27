@@ -122,11 +122,149 @@ def _partition_stale(events: list, cutoff: datetime):
     NON-entry events are simply dropped."""
     recent, stale_entries = [], []
     for e in events:
+        if e.get("reconciled"):        # already settled against the broker
+            continue
         if _parse_ts(e["timestamp"]) >= cutoff:
             recent.append(e)
         elif e.get("role") == "entry":
             stale_entries.append(e)
     return recent, stale_entries
+
+
+# ── Broker reconciliation ─────────────────────────────────────────────────────
+
+def _broker_positions() -> list[dict] | None:
+    """Current broker positions, or None if we could not find out.
+
+    None and [] are NOT interchangeable — see tradestation_client.get_positions.
+    Every caller here must treat None as "do not touch the ledger"."""
+    try:
+        import tradestation_client as tc
+        account_id = tc.get_account_id()
+        if not account_id:
+            logger.warning("RECONCILE: no account id — skipping reconciliation")
+            return None
+        return tc.get_positions(account_id)
+    except Exception as exc:
+        logger.warning("RECONCILE: positions fetch failed (%s) — skipping", exc)
+        return None
+
+
+# Ledger `direction` -> the sign the broker reports for that exposure. Options
+# are opened with BUY_TO_OPEN, so they are long exposure like a long stock.
+_DIRECTION_SIGN = {"long": 1, "option": 1, "short": -1}
+
+
+def _broker_qty_by_key(positions: list[dict]) -> dict:
+    """(symbol, direction) -> absolute quantity the broker actually holds.
+
+    Broker rows carry a SIGNED quantity (negative = short). A symbol can only be
+    long or short at once, so each row contributes to exactly one direction key —
+    except options, which share the long sign and are keyed separately by the
+    caller matching on the ledger's own direction."""
+    out = {}
+    for p in positions:
+        symbol = p.get("symbol")
+        qty = p.get("quantity") or 0
+        if not symbol or qty == 0:
+            continue
+        direction = "long" if qty > 0 else "short"
+        out[(symbol, direction)] = out.get((symbol, direction), 0) + abs(qty)
+        if qty > 0:                    # an option row is long-signed; key it both ways
+            out[(symbol, "option")] = out.get((symbol, "option"), 0) + abs(qty)
+    return out
+
+
+def _reconcile_open_entries(ledger: dict, open_entries: list, positions: list[dict] | None):
+    """Settle ledger open entries against what the broker actually holds.
+
+    WHY THIS EXISTS: the ledger tracked 10 open entries while the account held 4
+    positions. Entries are PER-FILL and broker positions are PER-SYMBOL
+    aggregates, so the two are not directly comparable: AAPL alone had three open
+    entries totalling 9 shares against a real position of 6. A naive "symbol
+    missing from broker -> close it" would have spared all three AAPL rows and
+    still reported the wrong share count, so this compares AGGREGATE quantity per
+    (symbol, direction) and trims the excess FIFO — oldest entries first, which
+    matches how _pair_round_trips consumes them.
+
+    Reconciled entries are marked, NOT closed: we do not know the exit price, so
+    inventing a round-trip would fabricate P&L. They are excluded from open
+    tracking and never become closed trips.
+
+    Returns (kept_open, reconciled_records), where reconciled_records is None —
+    NOT [] — when the fetch failed, so the report can say "skipped" instead of
+    claiming a clean reconcile. On that path this is a no-op: an unreadable
+    account must never be mistaken for a flat one. That conflation is exactly
+    what caused the 2026-07-16 CRL/LII double-entry, and it is far worse here —
+    a 503 would silently retire every genuinely open entry in the ledger."""
+    if positions is None:
+        logger.warning("RECONCILE: broker positions unavailable — ledger left untouched "
+                       "(unknown != flat)")
+        return list(open_entries), None
+
+    broker = _broker_qty_by_key(positions)
+    by_key = {}
+    for e in open_entries:
+        by_key.setdefault((e["symbol"], e["direction"]), []).append(e)
+
+    kept, reconciled = [], []
+    stamp = _now_ts()
+    for key, entries in by_key.items():
+        entries.sort(key=lambda e: _parse_ts(e["timestamp"]))    # FIFO: oldest first
+        held = broker.get(key, 0)
+        symbol, direction = key
+        ledger_qty = sum(abs(e.get("quantity") or 0) for e in entries)
+        excess = ledger_qty - held
+
+        # Retire from the OLDEST end. An entry is only unpaired because its exit
+        # was never logged, and _pair_round_trips pops the oldest open entry on an
+        # exit — so the entry a missing exit would have consumed is the oldest one.
+        # Trimming the newest instead would retire a position we still hold and
+        # leave the already-closed one on the books.
+        for entry in entries:
+            qty = abs(entry.get("quantity") or 0)
+            if excess <= 0:
+                kept.append(entry)
+                continue
+            if qty > excess:
+                # Partial overlap: this entry is bigger than the leftover excess,
+                # so no whole entry explains the gap. Keep it — over-reporting an
+                # open position is recoverable, retiring a held one is not.
+                logger.warning(
+                    "RECONCILE: %s %s has a %d-share gap that no whole entry "
+                    "explains (next entry is %d) — leaving it open for review",
+                    symbol, direction, excess, qty)
+                excess = 0
+                kept.append(entry)
+                continue
+            reason = ("not in broker positions" if held == 0 else
+                      f"quantity exceeds broker position "
+                      f"({held} held, ledger had {ledger_qty})")
+            entry["reconciled"] = {
+                "at":         stamp,
+                "reason":     reason,
+                "broker_qty": held,
+            }
+            reconciled.append({
+                "symbol":    symbol,
+                "direction": direction,
+                "qty":       entry.get("quantity"),
+                "entry_ts":  entry.get("timestamp"),
+                "reason":    reason,
+            })
+            logger.info("RECONCILE: closed stale ledger entry for %s (%s x%s @ %s) — %s",
+                        symbol, direction, entry.get("quantity"),
+                        entry.get("timestamp"), reason)
+            excess -= qty
+
+    # Persist the marks: `entry` objects are the same dicts held in ledger["events"],
+    # so mutating them above already updated the ledger in place. Assert that
+    # invariant rather than trusting it — a copy here would silently re-reconcile
+    # the same entries on every run.
+    marked = sum(1 for e in ledger.get("events", {}).values() if e.get("reconciled"))
+    if reconciled and marked == 0:
+        logger.error("RECONCILE: marks did not reach the ledger — entries were copies")
+    return kept, reconciled
 
 
 # ── Log reading ───────────────────────────────────────────────────────────────
@@ -511,7 +649,8 @@ def _now_ts() -> str:
     return datetime.now(pytz.timezone(config.MARKET_TZ)).strftime("%Y-%m-%d %H:%M:%S %Z")
 
 
-def build_report(ledger: dict, stops: dict, data_quality: dict) -> dict:
+def build_report(ledger: dict, stops: dict, data_quality: dict,
+                 positions: list[dict] | None = None) -> dict:
     all_events = list(ledger["events"].values())
     cutoff = _reference_now() - timedelta(days=STALE_OPEN_DAYS)
     # Drop pre-analyzer entries (>90d) so they can't sit as phantom opens or
@@ -526,10 +665,17 @@ def build_report(ledger: dict, stops: dict, data_quality: dict) -> dict:
     if injected:
         events, stale_entries = _partition_stale(list(ledger["events"].values()), cutoff)
     closed, orphans, open_entries = _pair_round_trips(events)
+
+    # Settle what is left open against the broker BEFORE the open-side numbers are
+    # reported, so "open entries" means "positions we actually hold". Closed trips
+    # are untouched — reconciliation only ever retires unpaired entries.
+    open_entries, reconciled = _reconcile_open_entries(ledger, open_entries, positions)
+
     ledger["closed_trips"] = closed        # recomputed view, not appended
 
     data_quality = dict(data_quality)
     data_quality["bootstrap_injected"] = injected
+    data_quality["reconciled_entries"] = reconciled
     data_quality["stale_pre_analyzer_entries"] = len(stale_entries)
     agg = _aggregate(closed)
     est_closed = sum(1 for t in closed if t["estimated_entry"])
@@ -715,6 +861,16 @@ def render_txt(report: dict) -> str:
     L.append(f"  exits missing an entry (orphans): {len(dq['orphan_exits_missing_entry'])}")
     for o in dq["orphan_exits_missing_entry"][:5]:
         L.append(f"      - {o['symbol']} {o['action']} @ {o['ts']}")
+    rec = dq.get("reconciled_entries")
+    if rec is None:
+        L.append("  broker reconcile: SKIPPED — positions unavailable; open count "
+                 "is ledger-only and may overstate what is held")
+    else:
+        L.append(f"  stale open entries reconciled against broker this run: {len(rec)} "
+                 f"(retired, not closed — no exit price is known, so no P&L is booked)")
+        for r in rec[:5]:
+            L.append(f"      - {r['symbol']} {r['direction']} x{r['qty']} "
+                     f"@ {r['entry_ts']} — {r['reason']}")
     L.append(f"  new events added to ledger this run: {dq.get('new_events_added', 0)}")
     L.append("")
     L.append("A/B SCREEN TRACKER")
@@ -743,25 +899,32 @@ def _load_stops() -> dict:
         return {}
 
 
-def run(dry_run: bool = False) -> dict:
+def run(dry_run: bool = False, reconcile: bool = True) -> dict:
     ledger = _load_ledger()
     raw_records, files_parsed, parse_errors = _read_jsonl(TRADES_GLOB)
     new_events = _merge_events(ledger, raw_records)
+
+    # A --dry-run still fetches positions: the reconcile result is part of what
+    # the operator is previewing. Nothing is persisted unless dry_run is False.
+    positions = _broker_positions() if reconcile else None
 
     report = build_report(ledger, _load_stops(), {
         "files_parsed":     files_parsed,
         "parse_errors":     parse_errors,
         "new_events_added": new_events,
-    })
+    }, positions=positions)
 
     if not dry_run:
         _save_ledger(ledger)
         _write_reports(report)
         logger.info("Wrote %s and %s", REPORT_JSON, REPORT_TXT)
     dq = report["data_quality"]
-    logger.info("Ledger: %d events (+%d new, +%d bootstrap), %d closed trips",
+    reconciled = dq.get("reconciled_entries")
+    logger.info("Ledger: %d events (+%d new, +%d bootstrap), %d closed trips, "
+                "%d open, reconciled %s",
                 len(ledger["events"]), new_events,
-                dq["bootstrap_injected"], dq["closed_trips"])
+                dq["bootstrap_injected"], dq["closed_trips"], dq["open_entries"],
+                "SKIPPED" if reconciled is None else len(reconciled))
     for w in report["warnings"]:
         logger.warning("PERF WARNING: %s", w)
     return report
@@ -775,9 +938,12 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Weekly performance analyzer")
     parser.add_argument("--dry-run", action="store_true",
                         help="compute and print the report without writing files")
+    parser.add_argument("--no-reconcile", action="store_true",
+                        help="skip the broker position reconcile (offline runs); "
+                             "the open-side count is then ledger-only")
     args = parser.parse_args()
     try:
-        report = run(dry_run=args.dry_run)
+        report = run(dry_run=args.dry_run, reconcile=not args.no_reconcile)
     except Exception as exc:
         logger.error("Performance analysis failed: %s", exc)
         return 1

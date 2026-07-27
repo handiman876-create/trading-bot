@@ -1,4 +1,5 @@
 import os
+import sys
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -10,8 +11,44 @@ load_dotenv()
 # and a futures instance can run side by side without colliding.
 BOT_MODE    = os.environ.get("BOT_MODE", "equities").lower()
 _IS_FUTURES = BOT_MODE == "futures"
-_LOG_PREFIX = "futures_" if _IS_FUTURES else ""
 _PROC_SUFFIX = ".futures" if _IS_FUTURES else ""
+
+
+def _detect_test_run() -> bool:
+    """True when this import is happening inside a test run.
+
+    WHY THIS EXISTS: trade_logger installs a logging.FileHandler on
+    config.APP_LOG_FILE at MODULE IMPORT time. Under pytest that import happens
+    during collection — before any fixture can run — so conftest's autouse
+    redirect was structurally too late and every test's log output landed in the
+    live logs/bot.log. That put 180 lines of AAA/BBB fixture chatter into the
+    production log, including a fabricated "STOP-LOSS EXIT NVDA ... sell order
+    failed" that reads exactly like a live incident, and it poisoned every
+    grep-based counter audit (the CROSS SUSTAIN counters most of all).
+
+    Detection has to cover BOTH entry points, because they differ:
+      * `pytest ...`          -> the pytest module is imported by the runner.
+      * `python3 test_x.py`   -> pytest is NOT in sys.modules (only 2 of 19 test
+                                 modules import it), so fall back to argv[0].
+    PYTEST_CURRENT_TEST is checked too, but note it is set per-test and is
+    absent at collection time, so it can never be the primary signal.
+
+    Deliberately NOT a substring test on the path: a live checkout under e.g.
+    /root/la-test-bot/ would silently flip production into test mode and split
+    the real log in two.
+    """
+    if "pytest" in sys.modules or "PYTEST_CURRENT_TEST" in os.environ:
+        return True
+    argv0 = os.path.basename(sys.argv[0] or "")
+    return argv0.startswith("test_") and argv0.endswith(".py")
+
+
+_IS_TEST = _detect_test_run()
+
+# Test runs get their own prefix so they can never append to a production log.
+# conftest.py additionally redirects these into a tmpdir; this prefix is the
+# floor that holds even when a test is run directly, outside pytest.
+_LOG_PREFIX = "test_" if _IS_TEST else ("futures_" if _IS_FUTURES else "")
 
 # ── TradeStation OAuth Credentials ────────────────────────────────────────────
 TS_CLIENT_ID     = os.environ.get("TS_CLIENT_ID", "")
