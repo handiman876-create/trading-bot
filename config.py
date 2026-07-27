@@ -297,6 +297,27 @@ ENABLE_SHORTING = True   # master switch; False = long-only (prior behaviour)
 # losses are not cleanly attributable to the entry rule. Re-evaluate by backtest —
 # not by flipping this back to True and watching live.
 USE_MOMENTUM_ALIGNMENT = False   # master switch; False = fresh-cross only, all names
+
+# ── Feature retirement metadata (weekly report) ───────────────────────────────
+# The ON/OFF state lives in the flags themselves — these tables only record WHEN
+# and WHY, which nothing else in the codebase knows. Keyed by the
+# performance_analyzer feature-bucket name.
+#
+# WHY THIS IS NOT A HARDCODED P&L FIGURE: the report renders the loss total live
+# from the ledger. A number pasted here would drift the moment a trip is
+# reclassified or a correction trip is re-tagged, and a stale figure in a report
+# that looks authoritative is worse than no figure at all.
+FEATURE_FLAGS = {
+    "momentum_alignment": "USE_MOMENTUM_ALIGNMENT",
+}
+FEATURE_DISABLED_NOTES = {
+    "momentum_alignment": {
+        "since":  "2026-07-24",
+        "commit": "40a34a3",
+        "reason": "no proven edge — would not clear the discovery pipeline's "
+                  "own ci_lower > 1.0 promotion gate",
+    },
+}
 # Momentum alignment only when RSI shows healthy momentum (not oversold, not
 # overbought): buy trending names on a healthy pullback, not on a breakdown
 # (RSI < MIN, e.g. HCA @ 35.1) or when already extended (RSI > MAX).

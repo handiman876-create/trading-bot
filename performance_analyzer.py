@@ -642,6 +642,107 @@ def _save_ledger(ledger: dict) -> None:
     os.replace(tmp, LEDGER_PATH)
 
 
+# ── Open-position mark-to-market ──────────────────────────────────────────────
+
+def _mark_open_entries(open_entries: list) -> dict:
+    """Mark open entries to the latest quote for an unrealized-P&L estimate.
+
+    ESTIMATE, not a booking: it uses last/close (the analyzer runs Sunday
+    00:07 ET, so this is Friday's close), ignores commissions, and prices the
+    signal-time entry rather than the broker fill on older records.
+
+    Partial data is reported as partial. If a quote is missing, that entry is
+    listed under `unpriced` and excluded from the total rather than silently
+    contributing $0 — a quiet zero would understate a loss and make the Total
+    line read better than reality."""
+    if not open_entries:
+        return {"pnl": 0.0, "priced": 0, "unpriced": [], "positions": []}
+
+    try:
+        import tradestation_client as tc
+    except Exception as exc:
+        logger.warning("Open mark-to-market unavailable (%s)", exc)
+        return {"pnl": None, "priced": 0,
+                "unpriced": [e["symbol"] for e in open_entries], "positions": []}
+
+    quotes, total, priced, unpriced, rows = {}, 0.0, 0, [], []
+    for e in open_entries:
+        symbol = e["symbol"]
+        if symbol not in quotes:
+            quotes[symbol] = tc.get_quote(symbol)
+        q = quotes[symbol]
+        price = (q or {}).get("last") or (q or {}).get("close")
+        if price is None:
+            unpriced.append(symbol)
+            continue
+        pnl = _pnl(e["direction"], e.get("price"), price, e.get("quantity"))
+        total += pnl
+        priced += 1
+        rows.append({
+            "symbol":    symbol,
+            "direction": e["direction"],
+            "qty":       e.get("quantity"),
+            "entry":     e.get("price"),
+            "mark":      price,
+            "pnl":       round(pnl, 2),
+        })
+    return {"pnl": round(total, 2) if priced else None,
+            "priced": priced, "unpriced": unpriced, "positions": rows}
+
+
+def _disabled_features(closed_trips: list) -> dict:
+    """Feature bucket -> retirement note + ALL-IN historical stats, for buckets
+    whose flag is currently OFF.
+
+    Reads the LIVE flag rather than a hardcoded list, so a feature re-enabled in
+    config stops being marked disabled without anyone remembering to edit this.
+    A note with no matching flag is ignored (the flag is the source of truth); a
+    flag that is off with no note still gets marked, just without the detail.
+
+    The stats here are ALL-IN — correction trips included — unlike _aggregate,
+    which excludes them so a hand-placed repair can't distort a live feature's
+    win rate. For a retired bucket the question is different: "what did this
+    cost us in total", which is also the number the disabling commit quotes
+    (40a34a3: 1-for-11, -$23,735.16). Both figures are rendered so neither can
+    be mistaken for the other."""
+    out = {}
+    for feature, flag_name in getattr(config, "FEATURE_FLAGS", {}).items():
+        if getattr(config, flag_name, True):
+            continue
+        note = dict(getattr(config, "FEATURE_DISABLED_NOTES", {}).get(feature, {}))
+        trips = [t for t in closed_trips if t["feature"] == feature]
+        corrections = [t for t in trips if t.get("exit_reason") == "correction"]
+        note.update({
+            "trips":            len(trips),
+            "wins":             sum(1 for t in trips if t["win"]),
+            "total_pnl":        round(sum(t["pnl"] for t in trips), 2),
+            "correction_trips": len(corrections),
+        })
+        out[feature] = note
+    return out
+
+
+def _totals(closed_trips: list, open_mark: dict, spy: dict) -> dict:
+    """The headline block: realized + estimated-open + combined, vs SPY.
+
+    Realized is EVERY closed trip, correction trips included — this is the
+    account-level number, unlike the per-feature block below it, which excludes
+    hand-placed repairs because they are not strategy decisions. The two
+    therefore differ on purpose, and the rendered block says so."""
+    realized = sum(t["pnl"] for t in closed_trips)
+    corrections = [t for t in closed_trips if t.get("exit_reason") == "correction"]
+    open_pnl = open_mark.get("pnl")
+    return {
+        "realized":            round(realized, 2),
+        "realized_strategy":   round(realized - sum(t["pnl"] for t in corrections), 2),
+        "correction_pnl":      round(sum(t["pnl"] for t in corrections), 2),
+        "correction_trips":    len(corrections),
+        "open_estimate":       open_pnl,
+        "total":               None if open_pnl is None else round(realized + open_pnl, 2),
+        "vs_spy":              (spy or {}).get("delta_vs_spy"),
+    }
+
+
 # ── Report assembly + rendering ───────────────────────────────────────────────
 
 def _now_ts() -> str:
@@ -680,6 +781,8 @@ def build_report(ledger: dict, stops: dict, data_quality: dict,
     agg = _aggregate(closed)
     est_closed = sum(1 for t in closed if t["estimated_entry"])
     est_open   = sum(1 for e in open_entries if e.get("estimated_entry"))
+    spy = _spy_comparison()
+    open_mark = _mark_open_entries(open_entries)
 
     data_quality.update({
         "correction_trips_excluded":    sum(1 for t in closed
@@ -701,7 +804,10 @@ def build_report(ledger: dict, stops: dict, data_quality: dict,
                          events and max(events, key=lambda e: _parse_ts(e["timestamp"]))["timestamp"][:10]]
                         if events else [None, None],
         "per_feature":  agg,
-        "spy":          _spy_comparison(),
+        "disabled":     _disabled_features(closed),
+        "totals":       _totals(closed, open_mark, spy),
+        "open_mark":    open_mark,
+        "spy":          spy,
         "warnings":     _build_warnings(agg),
         "data_quality": data_quality,
     }
@@ -800,10 +906,55 @@ def render_txt(report: dict) -> str:
     L.append(f"ledger span: {span[0]} .. {span[1]}   |   "
              f"closed trips: {dq['closed_trips']}   |   open: {dq['open_entries']}")
     L.append("")
+
+    t = report.get("totals") or {}
+    mark = report.get("open_mark") or {}
+    L.append("=== TOTAL P&L ===")
+    L.append(f"  Realized:     {_fmt_money(t.get('realized'))}   "
+             f"({dq['closed_trips']} closed trips, all-in)")
+    if t.get("correction_trips"):
+        L.append(f"                {_fmt_money(t.get('realized_strategy'))} strategy-only "
+                 f"— excludes {t['correction_trips']} correction trips "
+                 f"({_fmt_money(t.get('correction_pnl'))}); this is what the "
+                 f"per-feature totals below sum to")
+    if t.get("open_estimate") is None:
+        L.append(f"  Open (est.):  n/a — no quotes for "
+                 f"{', '.join(mark.get('unpriced') or ['open positions'])}")
+    else:
+        note = ""
+        if mark.get("unpriced"):
+            note = f"  [PARTIAL — no quote for {', '.join(mark['unpriced'])}]"
+        L.append(f"  Open (est.):  {_fmt_money(t['open_estimate'])}   "
+                 f"({mark.get('priced', 0)} of {dq['open_entries']} entries "
+                 f"marked to last close){note}")
+    L.append(f"  Total:        {_fmt_money(t.get('total'))}")
+    L.append(f"  vs SPY:       {_fmt_pct(t.get('vs_spy'))}")
+    L.append("  (open leg is an ESTIMATE — last/close, no commissions, signal-time "
+             "entry prices; nothing here is booked until the position closes)")
+    L.append("")
+
     L.append("PER-FEATURE (realized, closed round-trips)")
+    disabled = report.get("disabled") or {}
     for feat in FEATURES:
         a = report["per_feature"][feat]
         label = FEATURE_LABELS[feat]
+        if feat in disabled:
+            note = disabled[feat]
+            L.append(f"  {label.upper()}: DISABLED")
+            L.append(f"      ({note['wins']}-for-{note['trips']}, "
+                     f"{_fmt_money(note.get('total_pnl'))} historical)")
+            if note.get("correction_trips"):
+                L.append(f"      (of which {note['correction_trips']} correction trips; "
+                         f"strategy-only: {a['count']} trips, "
+                         f"{_fmt_money(a.get('total_pnl'))})")
+            since = note.get("since")
+            commit = note.get("commit")
+            if since or commit:
+                L.append(f"      (disabled {since or 'date unknown'}"
+                         + (f", commit {commit}" if commit else "") + ")")
+            if note.get("reason"):
+                L.append(f"      ({note['reason']})")
+            continue
         if a["count"] < MIN_TRADES_FOR_STATS:
             L.append(f"  {label:22} trades={a['count']:<3} "
                      f"INSUFFICIENT DATA (<{MIN_TRADES_FOR_STATS} trades)"
