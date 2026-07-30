@@ -102,3 +102,79 @@ adding a third ATR%-of-price constant beside the two that exist.
 
 **Prerequisite:** let `SHORT_MIN_REGIME` run 2-4 weeks first and gather actual
 cautious-regime short data. Revisit only with pipeline evidence.
+
+## SPY trend confirmation: demote the effective regime when SPY disagrees
+
+**Observed (2026-07-30):** the whole session ran `cautious` on a SENTIMENT
+OVERRIDE (`fear=6`) while VIX itself read `risk_on` at 18.7-18.8 — the combined
+regime was driven entirely by Claude's read, not the fear gauge. Hypothesis: use
+SPY's own EMA trend as a third opinion, demoting back toward `risk_on` when the
+index disagrees with a sentiment-driven demotion.
+
+**Today argues it is NOT needed.** SPY was bearish for the entire session —
+EMA9 740.45 < EMA21 742.76 at the close, spread -0.31%, bearish across all 360
+SPY indicator prints. A confirmation rule would have *agreed* with `cautious`
+and changed no decision. The system was already right without it.
+
+**Direction:** insert at `main.py:141`, after `strategy._more_fearful(...)` and
+before `note_regime(...)`. It must be a **separate demotion step, not another
+argument to `_more_fearful`** — that function is a strict max over
+`_REGIME_RANK` (strategy.py:1145/1148), so it can only ever ratchet fear *up*.
+Anything that reduces fear has to be an explicit second stage, and per the
+project convention it needs its own counter (e.g. `SPY CONFIRM DEMOTE`) so we
+can tell whether it ever earns its keep.
+
+**Prerequisite:** enough cautious-regime sessions to measure the improvement
+against. Same control-group problem as the `SHORT_MAX_ATR_PCT` entry above:
+cautious-regime trading is very new (first cautious-regime shorts were
+2026-07-28), so there is no sample to attribute an improvement to yet. Implement
+only once cautious sessions are numerous enough that "SPY disagreed with a
+sentiment demotion" has actually occurred more than once — today it did not
+occur at all.
+
+## Earnings blackout for short entries
+
+**Observed (2026-07-30):** MSFT gapped **+12.1% overnight on earnings** (390.54
+close 07-29 → 437.90 open 07-30, volume 109.4M vs ~30M baseline). It was a long,
+so the gap ran in our favour — but the same mechanism on a short is an uncapped
+loss, because a bot-managed stop cannot fill inside a gap. The bot currently has
+**no earnings awareness of any kind**: no calendar source, no blackout, no
+per-symbol event flag.
+
+**Risk quantified (CRWD, open tonight):** 272 shares short from 175.59, stop
+187.5351, no broker-native order. A stop-out fills around **-$3,249**; a gap
+straight through it does not. From tonight's 185.28:
+
+| overnight gap | fill | realized |
+|---|---|---|
+| +10% | ~203.81 | **-$7,676** |
+| +15% | ~213.07 | **-$10,195** |
+
+So the -$3,249 "cap" is a floor, not a ceiling — 2.4-3.1x worse in a routine
+earnings gap. (This is larger than the -$5,000..-$8,000 first estimated; the
+figures above are computed from the live stop record.) CRWD's own Q2 FY2027
+quarter ends 2026-07-31 with a release expected ~2026-08-26, so this specific
+position is **not** exposed tomorrow — but it will be inside ~4 weeks if held.
+
+**Direction:** block NEW short entries within N days of a known earnings date.
+For positions already open, either cover before the release or require a
+broker-native stop first.
+
+**Prerequisites — both are real blockers:**
+
+1. **A data source, which the project does not have.** Polygon's
+   `/vX/reference/financials` (already wired as
+   `polygon_client.get_quarterly_financials`) returns *fiscal periods and filing
+   lag*, not forward release dates — it can only infer a date from historical
+   cadence, which is how the ~08-26 estimate above was reached. A real calendar
+   needs a dedicated endpoint: Alpha Vantage `EARNINGS`, Financial Modeling Prep's
+   earnings calendar, or a Polygon tier that exposes one. (Polygon's legacy
+   `/v1/meta/symbols/{ticker}/company` is deprecated — do not build on it.) Note
+   the shared-key constraint: Polygon is one free key split across the momentum
+   screen and autodiscover, so a new poller needs a non-overlapping schedule.
+2. **Broker-native stops should land first.** They protect against gaps
+   regardless of cause — earnings, macro, halts, anything — whereas an earnings
+   blackout only covers the subset of gaps we can predict. Building the narrow
+   fix before the general one gets the ordering backwards. See the deferred
+   broker-native-stop item (bot-managed stops are paper-only and give no
+   overnight-gap protection).
