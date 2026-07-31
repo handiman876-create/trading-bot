@@ -242,3 +242,83 @@ The long-only docstring is accurate, not stale. Enabling the feature for longs
 state is needed. Note this is the same dispatched-logic shape seen three times
 before in this project: put `(gain, rsi_ok, action)` in one direction-aware
 helper on day one rather than duplicating a long path and a short path.
+
+## Shadow options tracker
+
+**Purpose:** parallel-track hypothetical options trades alongside real stock
+trades, on identical signals, to compare performance without risking capital.
+The equities book is 2-for-30 and the short leg is 0-for-7; buying a put on a
+death cross has the same entry timing as shorting it, so a shadow run measures
+whether the instrument change helps before any capital moves.
+
+**Infrastructure confirmed working (2026-07-31, live API):**
+
+| Piece | Where | Verified |
+|---|---|---|
+| `build_option_symbol()` | tradestation_client.py:113 | `NVDA 260821P200` accepted |
+| `get_option_quote()` | tradestation_client.py:199 | returns last/bid/ask |
+| `next_monthly_expiration()` | market_hours.py | → `2026-08-21` |
+| `_atm_strike()` | strategy.py | nearest $5, already used live |
+
+Real quotes pulled during the check:
+
+```
+NVDA 260821P200          last=6.79 bid=6.7  ask=6.8
+NVDA 260821P205          last=8.93 bid=9.25 ask=9.45
+NVDA 260814P200          last=5.5  bid=5.4  ask=5.6
+NVDA 260814P205          last=7.56 bid=8.05 ask=8.2
+```
+
+Weeklies (260814) resolve as well as monthlies — not limited to the third Friday.
+
+**Design — read-only, places no orders:**
+
+- Hook the death cross: open a shadow put
+- Hook the cover signal: close the shadow
+- Persist to `data/options_shadow.json`
+- Add a report section in `performance_analyzer.py`
+
+**Critical implementation notes:**
+
+1. **Use the ASK for entry, not `last`.** `last` can be stale and printed
+   outside the spread — in the sample above `NVDA 260821P205` shows `last=8.93`
+   against `bid=9.25`, a stale print from a closed market. The ask is what you
+   would actually pay. Note `evaluate_option` (strategy.py:1433) currently reads
+   `last` first and falls back to `bid`; the shadow tracker should NOT copy that
+   ordering, and the live path arguably needs the same correction before it ever
+   places a real order.
+
+2. **The bid/ask spread is the real cost, and it is large.** `NVDA 260821P205`
+   quotes bid 9.25 / ask 9.45 — a $0.20 spread on a ~$9.35 mid, ≈**2.1%
+   round-trip**. Measured equity slippage for comparison: CRWD's cover cost
+   $0.08 on $188.98, ≈**0.04%**. Options cost roughly **50× more to trade**.
+   That ratio, measured empirically across real signals, is the number that
+   decides whether options are viable here — it is the single most valuable
+   output of the tracker.
+
+3. **Use `next_monthly_expiration()`, never a hand-written calendar date.** The
+   check initially failed with `FAILED, INVALID SYMBOL` on `2026-08-15` because
+   that is a **Saturday**. Options expire Friday; the monthly is the third
+   Friday, `2026-08-21`.
+
+4. **ATM strike comes from `_atm_strike()`** — already implemented and in use.
+
+5. **None of the live-trading gaps apply to a shadow run.** No stop arming, no
+   regime gates, no fill resolution, no expiry management. Those four are real
+   blockers for *placing* option orders (see the options scoping discussion) but
+   are irrelevant to a read-only tracker. This is what makes the build small.
+
+**Build estimate:** 1–2 hours when ready.
+**Files:** `shadow_options.py` (new), `strategy.py` (2 hook lines),
+`performance_analyzer.py` (report section).
+
+**Prerequisite:** enough shadow data to compare — at least 5–10 signal events.
+Build when the next cautious regime produces death crosses.
+
+**Open question on that prerequisite:** short *entries* are gated to cautious
+(`SHORT_MIN_REGIME`), but death *crosses* fire in any regime — and a shadow
+tracker places no orders, so it need not inherit the regime gate at all. Letting
+it record every death cross regardless of regime would reach 5–10 events far
+faster, and would also capture the risk_on crosses the live book is currently
+forbidden from taking. Decide this before building; it changes how long the data
+takes to accumulate.
