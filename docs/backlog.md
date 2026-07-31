@@ -178,3 +178,67 @@ broker-native stop first.
    fix before the general one gets the ordering backwards. See the deferred
    broker-native-stop item (bot-managed stops are paper-only and give no
    overnight-gap protection).
+
+## Short profit taking: formula fix required before the long-only guard is relaxed
+
+**Observed (2026-07-31):** `_maybe_take_profit` (strategy.py:815) sizes the gain
+with a single direction-blind formula:
+
+```python
+gain = (price - entry) / entry
+```
+
+This **fails for shorts, and it fails dangerously** — a *losing* short produces a
+*positive* gain, so the rule reads it as a winner:
+
+- NVDA, live at the time of writing: entry $194.34, price $201.78
+- `(201.78 - 194.34) / 194.34` = **+3.83%** — on a position that is **down $1,830**
+- At the 12% threshold this fires once a short has moved **12% against** you
+- Line 848 then places a plain `"sell"`, which **adds to the short** rather than
+  covering it
+
+It does not fail safe. The formula never goes negative for shorts; it goes
+positive precisely when the position is losing, so nothing downstream catches it.
+
+**Current protection (both must be maintained):**
+
+1. `if not config.ENABLE_PROFIT_TAKING or held <= 0` — strategy.py:828
+2. `if held > 0 and _maybe_take_profit(...)` — the call site, strategy.py:1276
+
+A short carries `held < 0`, so both reject it before any gain or RSI check runs.
+The long-only docstring is accurate, not stale. Enabling the feature for longs
+(2026-07-31) does not change this — shorts remain excluded by both guards.
+
+**Direction — all three fixes land together before either guard is relaxed:**
+
+1. **Direction-aware gain:**
+   ```python
+   if direction == 'short':
+       gain = (entry - price) / entry
+   else:
+       gain = (price - entry) / entry
+   ```
+2. **Direction-aware order side:**
+   ```python
+   if direction == 'short':
+       action = 'buytocover'
+   else:
+       action = 'sell'
+   ```
+3. **Direction-aware RSI bound.** RSI >= 60 means *extended*, which is the
+   scale-out signal for a long. A short that is up 12% has driven the underlying
+   down, so its RSI will be *low* — requiring RSI >= 60 on a profitable short is
+   close to self-contradictory and would almost never fire. The mirror is:
+   ```python
+   if direction == 'short':
+       rsi_ok = rsi <= RSI_MAX   # e.g. 40
+   else:
+       rsi_ok = rsi >= RSI_MIN   # e.g. 60
+   ```
+   Use a separate config constant rather than deriving `100 - RSI_MIN`; the two
+   bounds need not stay mirror images.
+
+`direction` is already persisted per position in `stop_prices.json`, so no new
+state is needed. Note this is the same dispatched-logic shape seen three times
+before in this project: put `(gain, rsi_ok, action)` in one direction-aware
+helper on day one rather than duplicating a long path and a short path.

@@ -179,7 +179,9 @@ RSI_OVERBOUGHT   = 70
 # "profit_taken" in stop_prices.json (a missing flag reads as False — back-compat).
 # The trailing stop stays armed on the remaining shares. Like the stop and state
 # exits it is DE-RISKING, so it runs ungated by regime and the entry delay.
-ENABLE_PROFIT_TAKING = False  # dormant insurance — enable only after live stop data
+ENABLE_PROFIT_TAKING = True   # enabled 2026-07-31; LONGS ONLY — see docs/backlog.md
+                              # "Short profit taking: formula fix required" before
+                              # relaxing the held<=0 guard (strategy.py:828)
 PROFIT_TAKE_PCT      = 0.12   # trigger once up this fraction from entry (+12%)
 PROFIT_TAKE_FRACTION = 0.50   # sell this fraction of the held shares (half)
 PROFIT_TAKE_RSI_MIN  = 60.0   # only when RSI is at least this (extended)
