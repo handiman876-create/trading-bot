@@ -19,6 +19,7 @@ data/trade_ledger.json
 data/sentiment_report.json
 data/screen_ab_tracking.json
 data/fundamentals_cache.json
+data/options_positions.json
 screen_ab.lock
 .venv/
 bot.log.*

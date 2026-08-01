@@ -166,6 +166,29 @@ OPTIONS_WATCHLIST = [
     ("AAPL", "put"),
 ]
 
+# Open-contract store for the options path (generated, gitignored). Keyed by
+# "<underlying>_<opt_type>" — one open contract per OPTIONS_WATCHLIST pair, which
+# matches OPTIONS_CONTRACTS=1 and the single-pair loop in main.py.
+#
+#   {
+#     "SPY_call": {
+#       "occ_symbol":       "SPY 260821C540",   # EXACT symbol we transact on
+#       "entry_price":      8.50,               # ask at entry (what we paid)
+#       "entry_date":       "2026-08-03",
+#       "expiration":       "2026-08-21",
+#       "opt_type":         "call",
+#       "strike":           540,
+#       "contracts":        1,
+#       "underlying_entry": 541.20
+#     }
+#   }
+#
+# WHY IT EXISTS: exits used to look the position up under an occ_symbol
+# RECOMPUTED each cycle from _atm_strike(current price), so a move of more than
+# half a strike increment silently orphaned the contract. See the block comment
+# above strategy._option_key for the full failure story.
+OPTIONS_POSITION_FILE = "data/options_positions.json"   # generated (gitignored)
+
 # ── Strategy Parameters ───────────────────────────────────────────────────────
 MA_SHORT_PERIOD  = 9     # fast EMA
 MA_LONG_PERIOD   = 21    # slow EMA

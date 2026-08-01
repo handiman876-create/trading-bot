@@ -391,6 +391,8 @@ _STOPS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                            config.STOP_PRICE_FILE)
 _MOM_ENTRIES_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                  config.MOMENTUM_ENTRY_FILE)
+_OPT_POSITIONS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                   config.OPTIONS_POSITION_FILE)
 
 # Observability: safety-net / signal counters this process lifetime. Every safety
 # net gets a counter so we can tell whether it's still earning its keep.
@@ -411,6 +413,10 @@ _cross_sustain_blocks = 0  # gap-valid entry crosses deferred by CROSS_SUSTAIN_M
 _regime_short_blocks = 0   # would-be short entries suppressed by SHORT_MIN_REGIME
 _stops_trailed = 0         # trailing stops that actually moved (new extreme)
 _breakeven_locks = 0       # stops floored at entry after +1 ATR of profit (principal locked)
+_option_stale_recovered = 0  # exits routed to a STORED occ_symbol a recompute would have missed
+_option_expiry_drops    = 0  # stored contracts cleared because their expiration passed
+_option_orphan_drops    = 0  # stored contracts the broker no longer reports
+_option_adoptions       = 0  # live broker contracts folded into the store (pre-fix legacy)
 
 
 def _load_json(path: str) -> dict:
@@ -1398,6 +1404,112 @@ def evaluate_stock(symbol: str, account_id: str, positions: list[dict],
 
 # ── Options Strategy ──────────────────────────────────────────────────────────
 
+# ── Options position store ────────────────────────────────────────────────────
+# WHY THIS EXISTS: the exit branch used to resolve `held` against an occ_symbol
+# RECOMPUTED every cycle from _atm_strike(current underlying). Once the
+# underlying drifted more than half a strike increment off the entry, that key
+# stopped naming the contract we actually owned, _current_position returned 0,
+# and the `elif held > 0` branch became unreachable — the position rode to
+# expiration completely unmanaged. SPY260717C00540000 (opened 2026-07-01) was
+# reconciled away on 2026-07-26 as "not in broker positions" without a single
+# SELL_TO_CLOSE ever being attempted. That is the only options trade this bot has
+# ever placed, and it failed this way.
+#
+# The futures path already solved this exact class of bug with
+# _stale_futures_position (a live position whose symbol no longer matches the
+# computed one). Options take the other route, mirroring equities: persist the
+# contract at entry and drive every exit off the STORED symbol, the same way
+# stop_prices.json anchors stops to entry data rather than to anything rederived
+# from the current price.
+
+def _option_key(symbol: str, opt_type: str) -> str:
+    """Store key for a watchlist pair — one open contract per (underlying, type)."""
+    return f"{symbol}_{opt_type.lower()}"
+
+
+def _load_option_positions() -> dict:
+    return _load_json(_OPT_POSITIONS_PATH)
+
+
+def _save_option_positions(store: dict) -> None:
+    _save_json(_OPT_POSITIONS_PATH, store)
+
+
+def _save_option_position(key: str, record: dict) -> None:
+    """Persist one open contract, leaving the other watchlist pairs untouched."""
+    store = _load_option_positions()
+    store[key] = record
+    _save_option_positions(store)
+
+
+def _close_option_position(key: str) -> None:
+    """Remove one contract from the store. A no-op if it was never there."""
+    store = _load_option_positions()
+    if store.pop(key, None) is not None:
+        _save_option_positions(store)
+
+
+def _drop_option_position(key: str, occ_symbol: str, reason: str) -> None:
+    """Clear a stored contract we can no longer act on, and say why. Three paths
+    reach this (expiry, broker orphan, malformed record), so the removal and the
+    log line live here; each caller owns its own counter."""
+    _close_option_position(key)
+    logger.info("OPTION POSITION CLEARED %s (%s) — %s", key, occ_symbol, reason)
+
+
+def _option_record(occ_symbol: str, entry_price: float, expiration: str,
+                   opt_type: str, strike: float, underlying: float) -> dict:
+    """Build a store record. Two callers (fresh entry, legacy adoption), so the
+    schema is defined once — config.OPTIONS_POSITION_FILE documents it."""
+    return {
+        "occ_symbol":       occ_symbol,
+        "entry_price":      entry_price,
+        "entry_date":       date.today().isoformat(),
+        "expiration":       expiration,
+        "opt_type":         opt_type.lower(),
+        "strike":           strike,
+        "contracts":        config.OPTIONS_CONTRACTS,
+        "underlying_entry": underlying,
+    }
+
+
+def _option_expired(expiration: str) -> bool:
+    """True once the expiration date has PASSED. Equality is deliberately not
+    expiry — a contract trades through the close on its expiration date, so
+    dropping it that morning would abandon a still-sellable position."""
+    try:
+        return date.fromisoformat(str(expiration)) < date.today()
+    except (TypeError, ValueError):
+        # Unparseable date: fail OPEN and keep managing the contract. Dropping it
+        # here would strand a real position on a cosmetic data problem.
+        return False
+
+
+def _option_fill_price(quote: Optional[dict], side: str) -> float:
+    """Marketable price from the side of the book we actually trade against: an
+    ENTRY lifts the ASK, an EXIT hits the BID.
+
+    The old code read `last or bid` for BOTH sides (the line docs/backlog.md
+    flags as strategy.py:1433). `last` can be a stale print from outside the
+    current spread — the backlog's own sample has NVDA 260821P205 at last=8.93
+    against bid=9.25 — so on entry it understates cost by roughly the full
+    spread. These are market orders, so this does not change WHAT we send; it
+    changes what the ledger records, and every realized-P&L figure downstream is
+    computed from that. Options spreads run ~2.1% round-trip vs ~0.04% on
+    equities, so mispricing the entry is ~50x more costly here than it is there.
+    """
+    if not quote:
+        return 0.0
+    for field in (("ask", "last", "bid") if side == "entry" else ("bid", "last", "ask")):
+        val = quote.get(field)
+        if val:
+            try:
+                return float(val)
+            except (TypeError, ValueError):
+                continue
+    return 0.0
+
+
 def evaluate_option(
     symbol:     str,
     expiration: str,
@@ -1405,7 +1517,8 @@ def evaluate_option(
     account_id: str,
     positions:  list[dict],
 ) -> None:
-    global _entries_delayed
+    global _entries_delayed, _option_stale_recovered, _option_expiry_drops
+    global _option_orphan_drops, _option_adoptions
 
     history = tc.get_historical(symbol, days=90)
     if not history:
@@ -1420,29 +1533,92 @@ def evaluate_option(
     if not sig:
         return
 
-    # ATM strike is chosen at signal time from the underlying price (nearest $5),
-    # so it tracks the market instead of drifting from a hardcoded config value.
-    strike = _atm_strike(sig["close"])
+    is_call = opt_type.lower() == "call"
+    key = _option_key(symbol, opt_type)
+    stored = _load_option_positions().get(key)
 
-    occ_symbol = tc.find_option_symbol(symbol, expiration, strike, opt_type)
-    if not occ_symbol:
-        return
+    if stored:
+        # ── Held: EVERY field comes from the store, nothing is recomputed. This
+        # is the whole point of the fix — the contract we own does not change
+        # identity just because the underlying moved.
+        occ_symbol = stored.get("occ_symbol")
+        exp_used   = stored.get("expiration") or expiration
+        strike     = stored.get("strike") or 0.0
 
-    held = _current_position(positions, occ_symbol)
-    opt_quote = tc.get_option_quote(occ_symbol)
-    opt_price = float(opt_quote.get("last") or opt_quote.get("bid") or 0) if opt_quote else 0.0
+        if not occ_symbol:
+            _option_orphan_drops += 1
+            _drop_option_position(key, "<none>", "stored record carries no occ_symbol "
+                                  f"(orphan drops #{_option_orphan_drops})")
+            return
+
+        if _option_expired(exp_used):
+            # Nothing to sell — the contract stopped existing. An ITM long was
+            # auto-exercised by the broker, an OTM one expired worthless; either
+            # way the store must let go or it blocks the pair forever.
+            _option_expiry_drops += 1
+            _drop_option_position(key, occ_symbol, f"expiration {exp_used} has passed "
+                                  f"(expiry drops #{_option_expiry_drops})")
+            return
+
+        held = _current_position(positions, occ_symbol)
+        if held <= 0:
+            # Closed or assigned outside the bot. Clear it so the pair can trade
+            # again rather than pinning on a contract nobody holds.
+            _option_orphan_drops += 1
+            _drop_option_position(key, occ_symbol, "broker no longer reports this "
+                                  f"contract (orphan drops #{_option_orphan_drops})")
+            return
+
+        # Observability: would the OLD recompute path still have found this
+        # contract? Every increment is a position the pre-fix code had already
+        # lost track of and could never have exited.
+        recomputed = tc.find_option_symbol(symbol, exp_used,
+                                           _atm_strike(sig["close"]), opt_type)
+        if recomputed and recomputed != occ_symbol:
+            _option_stale_recovered += 1
+            logger.info("STALE OPTION RECOVERED %s — holding %s, but a recompute at "
+                        "the current underlying (%.2f) resolves to %s; the pre-fix "
+                        "path would have read held=0 and never exited "
+                        "(stale recoveries #%d)",
+                        key, occ_symbol, sig["close"], recomputed,
+                        _option_stale_recovered)
+    else:
+        # ── Flat per the store: the ATM contract we WOULD open. Strike is chosen
+        # at signal time from the underlying (nearest $5) so entries track the
+        # market instead of a hardcoded config value.
+        strike     = _atm_strike(sig["close"])
+        exp_used   = expiration
+        occ_symbol = tc.find_option_symbol(symbol, expiration, strike, opt_type)
+        if not occ_symbol:
+            return
+
+        held = _current_position(positions, occ_symbol)
+        if held > 0:
+            # A live contract the store does not know about — opened before this
+            # file existed. Adopt it so the exit path can manage it from here on.
+            # entry_price is unknown at this point; the ledger remains the record
+            # of what was actually paid.
+            _option_adoptions += 1
+            _save_option_position(key, _option_record(occ_symbol, 0.0, exp_used,
+                                                      opt_type, strike, sig["close"]))
+            logger.info("OPTION POSITION ADOPTED %s (%s) — held at the broker but "
+                        "absent from the store; exits now key off the stored symbol "
+                        "(adoptions #%d)", key, occ_symbol, _option_adoptions)
+
+    opt_quote   = tc.get_option_quote(occ_symbol)
+    entry_price = _option_fill_price(opt_quote, "entry")   # ASK — what a buy pays
+    exit_price  = _option_fill_price(opt_quote, "exit")    # BID — what a sell gets
 
     logger.info(
-        "OPTION %s %s %.2f %s | underlying=%.2f  RSI=%.1f  opt_price=%.2f  held=%d",
-        symbol, expiration, strike, opt_type,
-        sig["close"], sig["rsi"], opt_price, held,
+        "OPTION %s %s %.2f %s | underlying=%.2f  RSI=%.1f  bid=%.2f  ask=%.2f  held=%d",
+        symbol, exp_used, strike, opt_type,
+        sig["close"], sig["rsi"], exit_price, entry_price, held,
     )
 
     # NOTE: the old single gate sat here, above BOTH branches, so a contract
     # opened today could not be closed today — the same defect as the equities
     # path. The gate now lives inside the open branch only; closes below are
     # never gated on it.
-    is_call = opt_type.lower() == "call"
 
     # Open new position — an entry, so it waits for the bar to form like every
     # other entry path. Options run off the same underlying's daily bar, so a
@@ -1455,32 +1631,38 @@ def evaluate_option(
             return
         if _already_bought_today(occ_symbol) or _already_sold_today(occ_symbol):
             return
-        if is_call and _bullish_cross_edge(sig, occ_symbol) \
-                and sig["rsi"] < config.RSI_OVERBOUGHT:
-            if _open_option(account_id, occ_symbol, "buy_to_open", opt_price,
-                            symbol, expiration, strike, opt_type, sig):
-                _mark_bought(occ_symbol)
-        elif not is_call and _bearish_cross_edge(sig, occ_symbol) \
-                and sig["rsi"] > config.RSI_OVERSOLD:
-            if _open_option(account_id, occ_symbol, "buy_to_open", opt_price,
-                            symbol, expiration, strike, opt_type, sig):
-                _mark_bought(occ_symbol)
+        # One open path for both sides. The call/put asymmetry is only WHICH edge
+        # and WHICH RSI bound apply, so it is two predicates rather than two
+        # duplicated _open_option blocks (the duplication is how the stored-symbol
+        # write below could have been added to one branch and missed on the other).
+        if is_call:
+            entry_ok = (_bullish_cross_edge(sig, occ_symbol)
+                        and sig["rsi"] < config.RSI_OVERBOUGHT)
+        else:
+            entry_ok = (_bearish_cross_edge(sig, occ_symbol)
+                        and sig["rsi"] > config.RSI_OVERSOLD)
+        if entry_ok and _open_option(account_id, occ_symbol, "buy_to_open",
+                                     entry_price, symbol, exp_used, strike,
+                                     opt_type, sig):
+            _mark_bought(occ_symbol)
+            # Persist immediately: from here every exit keys off THIS symbol, so
+            # the underlying is free to move without orphaning the contract.
+            _save_option_position(key, _option_record(
+                occ_symbol, entry_price, exp_used, opt_type, strike, sig["close"]))
 
     # Close existing position on the opposite STATE (not edge) — same fix as the
     # equities exits: a long call stranded by a missed bearish edge would ride to
     # expiry. A call is long the underlying, a put is short it, so they take the
     # long/short exit helpers respectively.
     elif held > 0:
-        if is_call and _bearish_state(sig, occ_symbol):
-            if _close_option(account_id, occ_symbol, held, opt_price,
-                             symbol, expiration, strike, opt_type, sig):
-                _mark_sold(occ_symbol)
-                _note_state_only_exit(occ_symbol, sig, "bearish_cross")
-        elif not is_call and _bullish_state(sig, occ_symbol):
-            if _close_option(account_id, occ_symbol, held, opt_price,
-                             symbol, expiration, strike, opt_type, sig):
-                _mark_sold(occ_symbol)
-                _note_state_only_exit(occ_symbol, sig, "bullish_cross")
+        exit_state = (_bearish_state(sig, occ_symbol) if is_call
+                      else _bullish_state(sig, occ_symbol))
+        edge_key = "bearish_cross" if is_call else "bullish_cross"
+        if exit_state and _close_option(account_id, occ_symbol, held, exit_price,
+                                        symbol, exp_used, strike, opt_type, sig):
+            _mark_sold(occ_symbol)
+            _close_option_position(key)
+            _note_state_only_exit(occ_symbol, sig, edge_key)
 
 
 # ── Futures Strategy ──────────────────────────────────────────────────────────

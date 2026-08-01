@@ -99,6 +99,7 @@ def isolate_bot_state(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "PERF_LOG_FILE",  str(tmp_path / "performance.log"), raising=False)
     monkeypatch.setattr(strategy, "_STOPS_PATH",       str(tmp_path / "stop_prices.json"), raising=False)
     monkeypatch.setattr(strategy, "_MOM_ENTRIES_PATH", str(tmp_path / "momentum_entries.json"), raising=False)
+    monkeypatch.setattr(strategy, "_OPT_POSITIONS_PATH", str(tmp_path / "options_positions.json"), raising=False)
 
     # performance_analyzer, if a test drives its file-writing paths.
     try:
