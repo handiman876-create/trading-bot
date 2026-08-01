@@ -322,3 +322,64 @@ it record every death cross regardless of regime would reach 5–10 events far
 faster, and would also capture the risk_on crosses the live book is currently
 forbidden from taking. Decide this before building; it changes how long the data
 takes to accumulate.
+
+## 5-minute scalping bot
+
+**Motivation (2026-08-01):** the daily EMA9/EMA21 crossover strategy has a
+**6.7% win rate** — 2 wins in 30 closed trips, −$49,110.33 cumulative
+(`data/trade_ledger.json`). The concept may not be wrong so much as sampled too
+coarsely: a daily bar resolves one signal per session, so an intraday move that
+runs and reverses inside a single candle is invisible to it. Same concept on
+5-minute bars would see those moves.
+
+**The AMD case that prompted this.** The live daily bot's AMD trip: 99 shares
+SHORT, entered 2026-07-27 10:44:23 EDT @ $479.50, stopped out 2026-07-30
+09:55:05 EDT @ $480.00 — **−$49.50**, a scratch after three days of exposure.
+A hypothetical 5-minute version of the same logic over that window is estimated
+at **+$3,069**.
+
+> **The +$3,069 is an estimate, not a backtest.** It has not been produced by a
+> replay against real 5-minute bars, and it is a single hand-picked episode on a
+> strategy whose measured win rate is 6.7%. Cherry-picking one favourable window
+> is exactly the error that put profit-taking on hold (see "Short profit taking"
+> above, and the DDOG episode). Treat it as the reason to *measure*, never as
+> evidence the edge exists. The shadow phase below is what would make it real.
+
+**Design:**
+
+- New service `trading-bot-scalping.service`, separate process/lock/logs
+  alongside equities and futures (same pattern as `--mode futures`).
+- Same EMA9/EMA21 concept, 5-minute bars.
+- Tight stops — 5-min ATR runs ~$0.50–2.00 on these names.
+- **Mandatory flat at 15:55 ET.** No overnight exposure, so no gap risk.
+- Watchlist: SPY, QQQ, AMD, NVDA, TSLA, META.
+- **Shadow mode first** — logs what it would do, places nothing.
+- `CROSS_SUSTAIN_MINUTES=30` almost certainly does not transfer. On daily bars it
+  spans a fraction of one candle; on 5-min bars it is 6 candles. The equivalent
+  is likely 3–5 candles (15–25 min), but it should be re-fit on 5-min data, not
+  converted arithmetically — the 30-min value is itself flagged PROVISIONAL
+  (fit in-sample on 25 trips).
+
+**Data availability:** TradeStation almost certainly serves 5-min bars —
+`tradestation_client._UNIT_MAP` already carries a `"minute"` unit, so
+`get_historical` likely needs only an interval argument rather than new
+plumbing. **Verify before scoping further**, along with the rate limits: a
+6-symbol watchlist on 5-min bars is a much higher call rate than the current
+daily fetch, and the free Polygon key is already shared between the momentum
+screen and autodiscover (non-overlapping schedules).
+
+**Build prerequisites, in order:**
+
+1. Verify the 5-min bar API and its rate limits.
+2. Shadow test 2–4 weeks.
+3. Compare against the daily bot on the same names over the same window.
+4. Only then consider options scalping (0–3 DTE puts/calls).
+
+**Why this connects to the options work.** The options position store shipped
+2026-08-01 (`e5e18b9`) makes options exits reachable at all — before it, a
+contract was orphaned as soon as the underlying moved half a strike, which is
+routine intraday. 5-minute signals on 0–3 DTE contracts is gamma scalping, the
+stated end goal. Note the ordering: 0–3 DTE options decay fastest and carry the
+widest spreads (~2.1% round-trip vs ~0.04% on equities), so they punish a weak
+signal far harder than shares do. The equity version has to prove an edge first;
+options scalping cannot rescue a signal that does not work on stock.
