@@ -233,6 +233,32 @@ def test_shorting_disabled_no_short():
     assert strategy._regime_short_blocks == 0, "master switch must block first"
 
 
+def test_shorting_disabled_still_covers_an_open_short():
+    """ENABLE_SHORTING is an ENTRY gate, never a management gate.
+
+    When it was flipped to False on 2026-08-03 there was a live AVGO short
+    (held=-125). If the master switch had also sat on the cover branch, that
+    position would have been stranded — no exit signal, riding indefinitely on a
+    trailing stop nobody could close out. Same class of bug as the options
+    occ_symbol regression that killed the only options trade ever placed.
+
+    Bullish state + RSI below overbought = cover, with shorting disabled.
+    """
+    _reset(); _set_sig(rsi=55.0)                    # ema_short > ema_long => bullish
+    strategy.config.ENABLE_SHORTING = False
+    # _reset pins get_quote at 10_000 so a LONG stop never breaches; for a SHORT
+    # the stop sits ABOVE entry, so that same price trips it and the stop path
+    # covers before the signal path is reached. Turn the stop off to isolate the
+    # branch under test — that stops are also ungated is covered in test_stops.py.
+    strategy.config.USE_TRAILING_STOP = False
+    positions = [{"symbol": "AVGO", "quantity": -125, "cost_basis": 390.0}]
+    strategy.evaluate_stock("AVGO", "ACCT", positions, 100000.0,
+                            is_momentum=False, momentum_generation="",
+                            regime="risk_on")
+    assert _sides("buy_to_cover") == [("AVGO", "buy_to_cover", 125)], _orders
+    assert strategy._short_covers == 1, "cover counter must still increment"
+
+
 def test_short_respects_max_positions():
     _reset(); _set_sig(bearish_cross=True)
     full = [{"symbol": f"S{i}", "quantity": 1, "cost_basis": 100.0}

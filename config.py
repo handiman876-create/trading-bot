@@ -304,7 +304,27 @@ ATR_MULT_BY_REGIME_AND_BAND = {
 # shortable too (expanded from core-only 2026-07-18). Shorts are covered
 # (BUYTOCOVER) on a bullish cross, and carry a trailing stop that sits ABOVE
 # entry and ratchets DOWN with a low-water mark, using the regime ATR multiple.
-ENABLE_SHORTING = True   # master switch; False = long-only (prior behaviour)
+# DISABLED 2026-08-03 — no demonstrated edge. The closed short book is 0-for-7
+# for -$12,745.92 in the reconciled ledger; adding the two covers from 08-03 that
+# have not reconciled yet (META +$1,505.60, NVDA -$2,651.88) makes it 1-for-9 for
+# about -$13,892. The single short opened AFTER the regime filter shipped on
+# 07-27 was CRWD (07-28, -$3,642.08), and it was armed by the sentiment override
+# at fear=4 while the VIX regime read risk_on — so sentiment's only demonstrated
+# effect on entries has been one losing short.
+#
+# This is deliberately the EXPLICIT switch rather than a regime-logic change.
+# SHORT_MIN_REGIME="cautious" already meant shorts only fire while 20 <= VIX < 25,
+# and VIX has not left 15-16 in the retained logs, so raising the sentiment
+# override threshold would have disabled shorting in practice while dressing it
+# up as a regime decision. Say what is meant instead.
+#
+# ENTRY-only, like every other gate here: this is read at strategy.py's short
+# ENTRY branch and nowhere else, so open shorts still trail, stop, breakeven-lock
+# and cover normally. There was a live AVGO short when this was flipped.
+#
+# RE-ENABLE WHEN: strategy discovery produces a short-side edge that survives
+# canonical, or the closed short win rate improves on its own.
+ENABLE_SHORTING = False  # master switch; False = long-only (prior behaviour)
 
 # Master switch for the regime short filter below. False restores pre-filter
 # behaviour exactly (shorts gated only by ENABLE_SHORTING and block_new_entries),
