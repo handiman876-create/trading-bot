@@ -11,9 +11,14 @@ wins) plus per-sector entry gating (a "high"-risk sector blocks NEW long entries
 into its symbols).
 
 DESIGN — this NEVER blocks trading on its own failure:
-  * main() always exits 0 and always leaves a VALID report behind; any failure
-    (Polygon down, Claude down, bad JSON, cost overrun) writes a NEUTRAL report
-    (risk_on / all sectors low / fallback=true) instead of crashing or omitting.
+  * main() always leaves a VALID report behind; any failure (Polygon down, Claude
+    down, bad JSON, cost overrun) writes a NEUTRAL report (risk_on / all sectors
+    low / fallback=true) instead of crashing or omitting.
+  * It does NOT exit 0 in that case — a fallback exits 1 so the systemd timer
+    reports FAILED. These are separate concerns and used to be conflated: writing
+    the report keeps the BOT running, while the exit code tells the OPERATOR the
+    overlay is dead. From 2026-08-03 the Anthropic credit balance was exhausted,
+    every run wrote a hardcoded fear=1 report, and the timer stayed green.
   * current_sentiment() treats a missing / stale / corrupt report as NEUTRAL too.
     "Stale" = older than config.SENTIMENT_MAX_AGE_HOURS. Because the timer is
     weekdays-only, Friday's report ages ~72h by Monday's pre-open — well past the
@@ -330,6 +335,20 @@ def main() -> int:
         logger.exception("sentiment run crashed: %s", exc)
         report = _neutral_report("unexpected error")
     _write(report)
+
+    # The report is ALWAYS written, including the fallback — the bot must keep
+    # trading on VIX alone rather than block on a dead overlay, and that part was
+    # never the bug. The bug was exiting 0 afterwards: on 2026-08-03 the Anthropic
+    # credit balance ran out, every run since produced a hardcoded fear=1 report,
+    # and `systemctl list-timers` stayed green the whole time because a swallowed
+    # failure is indistinguishable from a calm market at the exit-code level.
+    # Writing the fallback is the fail-SAFE; reporting success for it is the lie.
+    if report.get("fallback"):
+        logger.error("SENTIMENT DEGRADED: wrote the neutral fallback (%s) — the "
+                     "overlay contributed nothing this run and the effective "
+                     "regime is VIX-only. Exiting 1 so the timer shows FAILED.",
+                     report.get("summary"))
+        return 1
     return 0
 
 

@@ -304,6 +304,114 @@ def test_evaluate_stock_allows_unblocked_symbol():
     assert any(o[0] == "SPY" and o[1] == "buy" for o in orders), orders
 
 
+# ── 10. main() EXIT CODE — a swallowed failure must not look like success ─────
+# On 2026-08-03 the Anthropic credit balance ran out. Polygon still returned 10
+# headlines, the Claude call 400'd, main() wrote the hardcoded fear=1 fallback and
+# returned 0 — so `systemctl list-timers` showed the job green while the overlay
+# produced nothing. The report must still be WRITTEN (VIX-only is the intended
+# degraded mode); it is the exit code that has to tell the truth.
+def test_main_exits_1_when_claude_api_fails():
+    """The 400/credits case: headlines fetched fine, Claude call fails."""
+    path = _tmp_report_path()
+    sa._fetch_headlines = lambda: [{"title": "t", "published_utc": "z"}]
+
+    def _boom(system, user):
+        raise RuntimeError(
+            "Error code: 400 - {'type': 'error', 'error': {'type': "
+            "'invalid_request_error', 'message': 'Your credit balance is too low "
+            "to access the Anthropic API.'}}")
+    sa._call_claude = _boom
+
+    rc = sa.main()
+    assert rc == 1, f"API failure must exit 1 so the timer shows FAILED, got {rc}"
+    # ...and the fallback report is still on disk — degraded, not blocked.
+    rep = json.load(open(path))
+    assert rep["fallback"] is True and rep["regime"] == "risk_on"
+
+
+def test_main_exits_1_when_claude_returns_unparseable():
+    """The other fallback path: call succeeds, JSON does not parse."""
+    _tmp_report_path()
+    sa._fetch_headlines = lambda: [{"title": "t", "published_utc": "z"}]
+    sa._call_claude = lambda system, user: (None, 0.0)
+    assert sa.main() == 1
+
+
+def test_main_exits_1_when_polygon_fails():
+    _tmp_report_path()
+    sa._fetch_headlines = lambda: None
+    assert sa.main() == 1
+
+
+def test_main_exits_0_on_happy_path():
+    """The control: a real reading must NOT trip the alarm, or the signal is noise."""
+    _tmp_report_path()
+    sa._fetch_headlines = lambda: [{"title": "t", "published_utc": "z"}] * 20
+    sa._call_claude = lambda system, user: (
+        {"fear_score": 3, "top_risks": [], "summary": "calm", "sector_risks": {}}, 0.01)
+    assert sa.main() == 0
+
+
+def test_main_logs_degraded_error_on_fallback():
+    _tmp_report_path()
+    sa._fetch_headlines = lambda: None
+    with _LogCap() as cap:
+        sa.main()
+    assert "SENTIMENT DEGRADED" in cap.text
+
+
+# ── 11. Startup banner warns loudly on a fallback report ──────────────────────
+class _BannerCap:
+    """Capture main's banner logger with levels — the fallback must be WARNING,
+    not INFO buried among 30 other startup lines."""
+    def __enter__(self):
+        self.records = []
+        self._h = logging.Handler()
+        self._h.emit = lambda r: self.records.append((r.levelname, r.getMessage()))
+        logging.getLogger("bot").addHandler(self._h)
+        logging.getLogger("bot").setLevel(logging.DEBUG)
+        return self
+
+    def __exit__(self, *exc):
+        logging.getLogger("bot").removeHandler(self._h)
+
+    @property
+    def warnings(self):
+        return "\n".join(m for lvl, m in self.records if lvl == "WARNING")
+
+    @property
+    def text(self):
+        return "\n".join(m for _, m in self.records)
+
+
+def test_banner_warns_when_sentiment_is_fallback():
+    import main as bot_main
+    with _BannerCap() as cap:
+        bot_main._log_sentiment_banner(sa._neutral_report("claude call failed"))
+    assert "FALLBACK (API unavailable)" in cap.warnings
+    assert "VIX-only regime active" in cap.warnings
+
+
+def test_banner_fallback_does_not_print_the_fake_fear_score():
+    """fear=1 is a hardcoded constant, not a measurement. Printing it next to
+    'regime=risk_on' is what made a dead overlay read like a calm market."""
+    import main as bot_main
+    with _BannerCap() as cap:
+        bot_main._log_sentiment_banner(sa._neutral_report("claude call failed"))
+    assert "fear=1/10" not in cap.text
+
+
+def test_banner_normal_report_is_not_a_warning():
+    import main as bot_main
+    live = {"fear_score": 4, "regime": "cautious", "top_risks": ["oil"],
+            "sector_risks": {}, "fallback": False}
+    with _BannerCap() as cap:
+        bot_main._log_sentiment_banner(live)
+    assert "FALLBACK" not in cap.text
+    assert cap.warnings == "", f"live reading must not warn: {cap.warnings}"
+    assert "fear=4/10" in cap.text
+
+
 if __name__ == "__main__":
     _orig = {"fetch": sa._fetch_headlines, "call": sa._call_claude,
              "report_file": config.SENTIMENT_REPORT_FILE}

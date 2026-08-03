@@ -206,6 +206,33 @@ def _wait_for_market_open() -> None:
                 break
 
 
+def _log_sentiment_banner(rep: dict) -> None:
+    """Startup banner for the sentiment overlay. A function rather than inline
+    banner code so the fallback branch is testable without booting the bot (main()
+    takes the singleton lock and starts trading)."""
+    if rep.get("fallback"):
+        # The old banner buried this as a " [FALLBACK]" suffix at the end of a line
+        # whose headline numbers (fear=1/10 regime=risk_on) read exactly like a calm
+        # live reading — the most reassuring output the overlay can produce is also
+        # what it emits when it is completely dead. fear=1 is a hardcoded constant in
+        # _neutral_report, not a measurement, so lead with the failure and drop the
+        # fake score entirely rather than printing a number nobody measured.
+        logger.warning("Sentiment   : FALLBACK (API unavailable) — %s",
+                       rep.get("summary") or "no live report")
+        logger.warning("              ⚠️  VIX-only regime active: the overlay cannot "
+                       "raise the regime to cautious and every sector reads 'low', "
+                       "so NO sector can block a long entry.")
+    else:
+        logger.info("Sentiment   : fear=%s/10 regime=%s risks=%s (model=%s, "
+                    "weekdays 08:00 ET, stale>%dh, cap=$%.2f)",
+                    rep.get("fear_score"), rep.get("regime"),
+                    rep.get("top_risks") or [],
+                    config.SENTIMENT_MODEL, config.SENTIMENT_MAX_AGE_HOURS,
+                    config.SENTIMENT_MAX_COST_USD)
+    logger.info("Combine     : effective regime = MORE FEARFUL of (VIX, sentiment); "
+                "sentiment 'high' sector → blocks new long entries in that sector")
+
+
 def main() -> None:
     _acquire_singleton_lock()          # hard-stop a second instance before any API calls
     signal.signal(signal.SIGINT,  _handle_signal)
@@ -325,15 +352,7 @@ def main() -> None:
         logger.info("VIX filter  : DISABLED (always risk_on)")
     if config.ENABLE_SENTIMENT:
         _rep = sentiment_analyzer.current_sentiment()
-        logger.info("Sentiment   : fear=%s/10 regime=%s risks=%s%s (model=%s, "
-                    "weekdays 08:00 ET, stale>%dh, cap=$%.2f)",
-                    _rep.get("fear_score"), _rep.get("regime"),
-                    _rep.get("top_risks") or [],
-                    " [FALLBACK]" if _rep.get("fallback") else "",
-                    config.SENTIMENT_MODEL, config.SENTIMENT_MAX_AGE_HOURS,
-                    config.SENTIMENT_MAX_COST_USD)
-        logger.info("Combine     : effective regime = MORE FEARFUL of (VIX, sentiment); "
-                    "sentiment 'high' sector → blocks new long entries in that sector")
+        _log_sentiment_banner(_rep)
     else:
         logger.info("Sentiment   : DISABLED")
 
