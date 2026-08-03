@@ -304,27 +304,29 @@ ATR_MULT_BY_REGIME_AND_BAND = {
 # shortable too (expanded from core-only 2026-07-18). Shorts are covered
 # (BUYTOCOVER) on a bullish cross, and carry a trailing stop that sits ABOVE
 # entry and ratchets DOWN with a low-water mark, using the regime ATR multiple.
-# DISABLED 2026-08-03 — no demonstrated edge. The closed short book is 0-for-7
-# for -$12,745.92 in the reconciled ledger; adding the two covers from 08-03 that
-# have not reconciled yet (META +$1,505.60, NVDA -$2,651.88) makes it 1-for-9 for
-# about -$13,892. The single short opened AFTER the regime filter shipped on
-# 07-27 was CRWD (07-28, -$3,642.08), and it was armed by the sentiment override
-# at fear=4 while the VIX regime read risk_on — so sentiment's only demonstrated
-# effect on entries has been one losing short.
+# HISTORY — read before touching this pair (see also SHORT_MIN_REGIME below).
+#   2026-08-03 early: DISABLED. Closed short book 0-for-7 / -$12,745.92 in the
+#     reconciled ledger; with the two 08-03 covers that had not reconciled
+#     (META +$1,505.60, NVDA -$2,651.88) that is 1-for-9 / about -$13,892.
+#     The only short opened after the regime filter shipped (07-27) was CRWD
+#     (07-28, -$3,642.08), armed by the sentiment override at fear=4.
+#   2026-08-03 later: RE-ENABLED, deliberately, together with
+#     SHORT_MIN_REGIME="risk_on" and ENABLE_SENTIMENT_OVERRIDE=False. This is an
+#     intentional experiment on a SANDBOX account, not a claim that an edge was
+#     found. It restores the pre-07-27 configuration — the one under which all 7
+#     shorts in the retained window were armed in risk_on for 0-for-5 /
+#     -$9,054.34 — so the null hypothesis is that shorts keep losing.
 #
-# This is deliberately the EXPLICIT switch rather than a regime-logic change.
-# SHORT_MIN_REGIME="cautious" already meant shorts only fire while 20 <= VIX < 25,
-# and VIX has not left 15-16 in the retained logs, so raising the sentiment
-# override threshold would have disabled shorting in practice while dressing it
-# up as a regime decision. Say what is meant instead.
+# WHAT TO WATCH: short trips per week and their win rate. If the next batch of
+# closed shorts repeats the risk_on pattern, the filter was doing its job and the
+# right response is SHORT_MIN_REGIME="cautious" again (not a wider stop or a
+# different oracle). REGIME BLOCK will now stay at 0 by construction, so it is no
+# longer evidence of anything.
 #
-# ENTRY-only, like every other gate here: this is read at strategy.py's short
-# ENTRY branch and nowhere else, so open shorts still trail, stop, breakeven-lock
-# and cover normally. There was a live AVGO short when this was flipped.
-#
-# RE-ENABLE WHEN: strategy discovery produces a short-side edge that survives
-# canonical, or the closed short win rate improves on its own.
-ENABLE_SHORTING = False  # master switch; False = long-only (prior behaviour)
+# ENTRY-only, like every other gate here: read at strategy.py's short ENTRY
+# branch and nowhere else, so open shorts always trail, stop, breakeven-lock and
+# cover regardless of this switch.
+ENABLE_SHORTING = True   # master switch; False = long-only (prior behaviour)
 
 # Master switch for the regime short filter below. False restores pre-filter
 # behaviour exactly (shorts gated only by ENABLE_SHORTING and block_new_entries),
@@ -343,13 +345,22 @@ ENABLE_REGIME_SHORT_FILTER = True
 # deliberate: failing open on a short is how you get short into a rally.
 #
 # READ THIS BEFORE CHANGING IT. defensive and crisis already block ALL new
-# entries via _apply_regime_rules, so the only regime this actually opens
-# shorting in is cautious. The effective rule at "cautious" is therefore:
-#   shorts fire only while 20 <= VIX < 25.
-# Setting this to "defensive" or "crisis" does not widen that window — it
-# disables new shorts entirely. There is no value that permits shorting in
-# risk_on; use ENABLE_SHORTING = False if you want the long-only switch.
-SHORT_MIN_REGIME = "cautious"
+# entries via _apply_regime_rules, so the only regime "cautious" actually opens
+# shorting in is cautious itself — i.e. only while 20 <= VIX < 25. Setting this
+# to "defensive" or "crisis" does not widen that window, it disables new shorts
+# entirely.
+#
+# "risk_on" is the OTHER end: because risk_on and unknown both rank 0, the gate
+# `rank(regime) < rank(floor)` is never true, so this value makes the filter a
+# NO-OP — behaviourally identical to ENABLE_REGIME_SHORT_FILTER=False. It is set
+# that way deliberately as of 2026-08-03 to allow shorts in risk_on again; keep
+# ENABLE_REGIME_SHORT_FILTER=True so the machinery stays wired and tightening the
+# floor later is a one-word change.
+#
+# Note the cost of a no-op filter: "unknown" also ranks 0, so a VIX outage now
+# permits shorts rather than blocking them. The fail-CLOSED behaviour described
+# above only exists while the floor is above risk_on.
+SHORT_MIN_REGIME = "risk_on"
 
 # ── Momentum alignment entry (momentum slot only) ─────────────────────────────
 # Momentum leaders are already trending when the twice-monthly screen adds them,
@@ -502,9 +513,25 @@ POLYGON_MAX_CALLS_PER_MIN = 5    # free-tier rate limit; the screen self-throttl
 # ── Claude sentiment analysis (Feature 2 of the VIX + sentiment overlay) ──────
 # sentiment_analyzer.py (run weekdays 08:00 ET by systemd) scores market fear from
 # Polygon SPY headlines via Claude and writes SENTIMENT_REPORT_FILE. The bot reads
-# it each cycle and takes the MORE FEARFUL of {VIX regime, sentiment regime}, plus
-# per-sector entry gating. OFF ⇒ the bot ignores sentiment entirely (VIX-only).
+# it each cycle for per-sector entry gating, the banner and the historical record.
+# OFF ⇒ the bot ignores sentiment entirely (VIX-only, no sector gate, no banner).
 ENABLE_SENTIMENT        = True
+
+# Does the sentiment regime participate in the effective regime? When True the
+# effective regime is the MORE FEARFUL of {VIX regime, sentiment regime}; when
+# False the regime is the VIX regime alone and sentiment is INFORMATIONAL only.
+#
+# Set False 2026-08-03. Sentiment's only demonstrated effect on entries was to
+# override risk_on -> cautious on 07-28/29/30 (fear 4/4/6) while VIX read
+# risk_on, and the one entry that produced was CRWD, -$3,642.08. Three sessions
+# is not enough to call it wrong, but it is enough to stop it steering position
+# entry while the VIX ladder is the thing being evaluated.
+#
+# This is the ONLY switch that gates the override. Everything else about the
+# overlay is unaffected: the daily run, sector blocking via sectors_blocked(),
+# the banner and the report all behave exactly as before. Turning it back on is
+# a one-word change with no other edits.
+ENABLE_SENTIMENT_OVERRIDE = False
 SENTIMENT_REPORT_FILE   = "data/sentiment_report.json"   # generated (gitignored)
 SENTIMENT_MODEL         = "claude-sonnet-4-6"
 SENTIMENT_MAX_TOKENS    = 500

@@ -175,6 +175,81 @@ def test_more_fearful_combination():
     assert F("defensive", "risk_on") == "defensive"
 
 
+# ── 7a2. effective_regime — the ENABLE_SENTIMENT_OVERRIDE switch ──────────────
+# Set False on 2026-08-03: sentiment runs for sector risks, banner and history,
+# but no longer steers the regime. The switch has two callers (the live path in
+# main._run_cycle and the banner's arming-width preview), which is why it lives
+# in one helper — a banner advertising a regime the bot does not trade is the
+# failure mode this guards.
+def _with_override(value):
+    saved = getattr(config, "ENABLE_SENTIMENT_OVERRIDE", True)
+    config.ENABLE_SENTIMENT_OVERRIDE = value
+    return saved
+
+
+def test_effective_regime_ignores_sentiment_when_override_off():
+    saved = _with_override(False)
+    try:
+        # The exact 07-28/29/30 shape: VIX calm, Claude fearful.
+        assert strategy.effective_regime("risk_on", "cautious") == "risk_on"
+        assert strategy.effective_regime("risk_on", "crisis") == "risk_on"
+        # VIX still escalates on its own — this switch only mutes sentiment.
+        assert strategy.effective_regime("defensive", "risk_on") == "defensive"
+    finally:
+        config.ENABLE_SENTIMENT_OVERRIDE = saved
+
+
+def test_effective_regime_combines_when_override_on():
+    saved = _with_override(True)
+    try:
+        assert strategy.effective_regime("risk_on", "cautious") == "cautious"
+        assert strategy.effective_regime("crisis", "cautious") == "crisis"
+    finally:
+        config.ENABLE_SENTIMENT_OVERRIDE = saved
+
+
+def test_effective_regime_tolerates_missing_sentiment():
+    """current_sentiment() can hand back a report with no regime key."""
+    saved = _with_override(True)
+    try:
+        assert strategy.effective_regime("cautious", None) == "cautious"
+        assert strategy.effective_regime("risk_on", None) == "risk_on"
+    finally:
+        config.ENABLE_SENTIMENT_OVERRIDE = saved
+
+
+def test_note_regime_logs_advisory_not_override_when_off():
+    """The condition is unchanged, the wording is not: with the override off,
+    calling it an OVERRIDE reports an action that did not happen — every cycle."""
+    saved = _with_override(False)
+    try:
+        with _LogCap() as cap:
+            logging.getLogger("strategy").addHandler(cap._h)
+            logging.getLogger("strategy").setLevel(logging.DEBUG)
+            strategy.note_regime(16.0, "risk_on", vix_regime="risk_on",
+                                 sent_regime="cautious", fear=4, risks=["r"])
+            logging.getLogger("strategy").removeHandler(cap._h)
+        assert "SENTIMENT ADVISORY (no override)" in cap.text
+        assert "SENTIMENT OVERRIDE" not in cap.text
+        assert "regime stays risk_on" in cap.text
+    finally:
+        config.ENABLE_SENTIMENT_OVERRIDE = saved
+
+
+def test_note_regime_still_logs_override_when_on():
+    saved = _with_override(True)
+    try:
+        with _LogCap() as cap:
+            logging.getLogger("strategy").addHandler(cap._h)
+            logging.getLogger("strategy").setLevel(logging.DEBUG)
+            strategy.note_regime(16.0, "cautious", vix_regime="risk_on",
+                                 sent_regime="cautious", fear=4, risks=["r"])
+            logging.getLogger("strategy").removeHandler(cap._h)
+        assert "SENTIMENT OVERRIDE" in cap.text
+    finally:
+        config.ENABLE_SENTIMENT_OVERRIDE = saved
+
+
 # ── 7b. headline merge/dedup (multi-ticker) ───────────────────────────────────
 def test_dedup_recent_dedups_sorts_caps():
     raw = [
@@ -389,7 +464,31 @@ def test_banner_warns_when_sentiment_is_fallback():
     with _BannerCap() as cap:
         bot_main._log_sentiment_banner(sa._neutral_report("claude call failed"))
     assert "FALLBACK (API unavailable)" in cap.warnings
-    assert "VIX-only regime active" in cap.warnings
+    # The sector-gate loss is the one consequence that holds in BOTH override
+    # states, so it is what this asserts regardless of the current config.
+    assert "NO sector can block a long entry" in cap.warnings
+
+
+def test_banner_fallback_names_the_regime_loss_only_when_override_is_live():
+    import main as bot_main
+    rep = sa._neutral_report("claude call failed")
+    saved = _with_override(True)
+    try:
+        with _BannerCap() as cap:
+            bot_main._log_sentiment_banner(rep)
+        assert "VIX-only regime active" in cap.warnings
+    finally:
+        config.ENABLE_SENTIMENT_OVERRIDE = saved
+
+    saved = _with_override(False)
+    try:
+        with _BannerCap() as cap:
+            bot_main._log_sentiment_banner(rep)
+        # Regime was never listening, so calling it a degradation would be wrong.
+        assert "VIX-only regime active" not in cap.warnings
+        assert "VIX-only by config anyway" in cap.warnings
+    finally:
+        config.ENABLE_SENTIMENT_OVERRIDE = saved
 
 
 def test_banner_fallback_does_not_print_the_fake_fear_score():
@@ -399,6 +498,37 @@ def test_banner_fallback_does_not_print_the_fake_fear_score():
     with _BannerCap() as cap:
         bot_main._log_sentiment_banner(sa._neutral_report("claude call failed"))
     assert "fear=1/10" not in cap.text
+
+
+def test_banner_combine_line_states_the_rule_in_force():
+    """The Combine line described the MORE-FEARFUL combine unconditionally, which
+    becomes a lie about the live regime the moment the override is switched off."""
+    import main as bot_main
+    live = {"fear_score": 4, "regime": "cautious", "top_risks": [],
+            "sector_risks": {}, "fallback": False}
+    saved = _with_override(False)
+    try:
+        with _BannerCap() as cap:
+            bot_main._log_sentiment_banner(live)
+        assert "INFO ONLY" in cap.text and "VIX alone" in cap.text
+        assert "MORE FEARFUL" not in cap.text
+        # Sector gating is a separate mechanism and must not be implied dead.
+        assert "Sector gating is UNAFFECTED" in cap.text
+    finally:
+        config.ENABLE_SENTIMENT_OVERRIDE = saved
+
+
+def test_banner_combine_line_when_override_on():
+    import main as bot_main
+    live = {"fear_score": 4, "regime": "cautious", "top_risks": [],
+            "sector_risks": {}, "fallback": False}
+    saved = _with_override(True)
+    try:
+        with _BannerCap() as cap:
+            bot_main._log_sentiment_banner(live)
+        assert "MORE FEARFUL" in cap.text and "INFO ONLY" not in cap.text
+    finally:
+        config.ENABLE_SENTIMENT_OVERRIDE = saved
 
 
 def test_banner_normal_report_is_not_a_warning():

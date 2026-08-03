@@ -1158,6 +1158,21 @@ def _more_fearful(a: str, b: str) -> str:
     return a if _REGIME_RANK.get(a, 0) >= _REGIME_RANK.get(b, 0) else b
 
 
+def effective_regime(vix_regime: str, sent_regime: Optional[str]) -> str:
+    """The regime every gate should read: VIX combined with sentiment, or VIX
+    alone when config.ENABLE_SENTIMENT_OVERRIDE is False.
+
+    A helper rather than an inline conditional because the combine has two
+    callers — the live path in main._run_cycle and the startup banner's
+    "what width would the next entry arm at" preview. Those drifting apart would
+    mean the banner advertises a regime the bot does not actually trade, which is
+    the kind of divergence nobody notices until it matters. One switch, one place.
+    """
+    if not getattr(config, "ENABLE_SENTIMENT_OVERRIDE", True):
+        return vix_regime
+    return _more_fearful(vix_regime, sent_regime or "risk_on")
+
+
 def current_regime(now: Optional[float] = None):
     """(vix, regime) for this cycle, refetching config.VIX_SYMBOL at most every
     VIX_CACHE_SECONDS.  Fail-OPEN: a failed/absent quote yields 'unknown', which
@@ -1196,9 +1211,21 @@ def note_regime(vix: Optional[float], regime: str, vix_regime: Optional[str] = N
     logger.info("VIX=%s regime=%s%s", vtxt, regime, extreme)
     if (sent_regime and vix_regime
             and _REGIME_RANK.get(sent_regime, 0) > _REGIME_RANK.get(vix_regime, 0)):
-        logger.warning("SENTIMENT OVERRIDE: %s mode from Claude analysis "
-                       "(fear=%s, VIX-regime=%s, risks: %s)", sent_regime, fear,
-                       vix_regime, ", ".join(risks or []) or "n/a")
+        # Same condition, two different messages. With the override off, sentiment
+        # being more fearful than VIX changes NOTHING, so calling it an OVERRIDE
+        # would report an action that did not happen — and this line is logged
+        # every cycle, so a wrong one becomes hundreds of wrong lines a session.
+        # It still logs: the divergence is the whole reason to keep running the
+        # overlay, and it is what a later "should we switch it back on?" is judged on.
+        if getattr(config, "ENABLE_SENTIMENT_OVERRIDE", True):
+            logger.warning("SENTIMENT OVERRIDE: %s mode from Claude analysis "
+                           "(fear=%s, VIX-regime=%s, risks: %s)", sent_regime, fear,
+                           vix_regime, ", ".join(risks or []) or "n/a")
+        else:
+            logger.info("SENTIMENT ADVISORY (no override): Claude reads %s vs "
+                        "VIX-regime %s (fear=%s) — regime stays %s. risks: %s",
+                        sent_regime, vix_regime, fear, regime,
+                        ", ".join(risks or []) or "n/a")
     if regime == "cautious":
         logger.info("CAUTIOUS MODE - skipping momentum alignment (VIX=%s)", vtxt)
     elif regime == "defensive":

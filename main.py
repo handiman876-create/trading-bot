@@ -138,7 +138,7 @@ def _run_cycle(account_id: str) -> None:
     vix, vix_regime = strategy.current_regime()
     sentiment = sentiment_analyzer.current_sentiment()
     sent_regime = sentiment_analyzer.sentiment_regime(sentiment)
-    regime = strategy._more_fearful(vix_regime, sent_regime)
+    regime = strategy.effective_regime(vix_regime, sent_regime)
     blocked = sentiment_analyzer.sectors_blocked(sentiment)
     if config.ENABLE_VIX_FILTER or config.ENABLE_SENTIMENT:
         strategy.note_regime(vix, regime, vix_regime=vix_regime, sent_regime=sent_regime,
@@ -219,9 +219,19 @@ def _log_sentiment_banner(rep: dict) -> None:
         # fake score entirely rather than printing a number nobody measured.
         logger.warning("Sentiment   : FALLBACK (API unavailable) — %s",
                        rep.get("summary") or "no live report")
-        logger.warning("              ⚠️  VIX-only regime active: the overlay cannot "
-                       "raise the regime to cautious and every sector reads 'low', "
-                       "so NO sector can block a long entry.")
+        # What a fallback actually costs depends on whether the override is live.
+        # With it ON, the overlay losing its voice on the regime is the headline;
+        # with it OFF the regime was never listening, so the only real loss is the
+        # sector gate. Saying "VIX-only regime active" in the second case would
+        # describe a degradation that is just the configured behaviour.
+        if getattr(config, "ENABLE_SENTIMENT_OVERRIDE", True):
+            logger.warning("              ⚠️  VIX-only regime active: the overlay cannot "
+                           "raise the regime to cautious, and every sector reads 'low', "
+                           "so NO sector can block a long entry.")
+        else:
+            logger.warning("              ⚠️  Regime is VIX-only by config anyway; the "
+                           "loss here is the sector gate — every sector reads 'low', "
+                           "so NO sector can block a long entry.")
     else:
         logger.info("Sentiment   : fear=%s/10 regime=%s risks=%s (model=%s, "
                     "weekdays 08:00 ET, stale>%dh, cap=$%.2f)",
@@ -229,8 +239,17 @@ def _log_sentiment_banner(rep: dict) -> None:
                     rep.get("top_risks") or [],
                     config.SENTIMENT_MODEL, config.SENTIMENT_MAX_AGE_HOURS,
                     config.SENTIMENT_MAX_COST_USD)
-    logger.info("Combine     : effective regime = MORE FEARFUL of (VIX, sentiment); "
-                "sentiment 'high' sector → blocks new long entries in that sector")
+    # The Combine line states the rule actually in force. It described the
+    # MORE-FEARFUL combine unconditionally, which would be a lie about the live
+    # regime the moment ENABLE_SENTIMENT_OVERRIDE went False.
+    if getattr(config, "ENABLE_SENTIMENT_OVERRIDE", True):
+        logger.info("Combine     : effective regime = MORE FEARFUL of (VIX, sentiment); "
+                    "sentiment 'high' sector → blocks new long entries in that sector")
+    else:
+        logger.info("Combine     : INFO ONLY — effective regime = VIX alone "
+                    "(ENABLE_SENTIMENT_OVERRIDE=False; sentiment never raises the "
+                    "regime). Sector gating is UNAFFECTED: a 'high' sector still "
+                    "blocks new long entries in that sector. Counter: SENTIMENT ADVISORY")
 
 
 def main() -> None:
@@ -371,7 +390,7 @@ def main() -> None:
         _vix, _vix_reg = strategy.current_regime()
         _eff_reg = _vix_reg
         if config.ENABLE_SENTIMENT:
-            _eff_reg = strategy._more_fearful(
+            _eff_reg = strategy.effective_regime(
                 _vix_reg, sentiment_analyzer.sentiment_regime(_rep))
         # No single number any more: width is regime x volatility band, and the
         # band is per-symbol (ATR/price at entry), which the banner cannot know.

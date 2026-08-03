@@ -215,11 +215,20 @@ def test_short_entry_fires_on_wide_gap():
 
 
 def test_short_entry_blocked_by_regime_even_on_wide_gap():
-    """Same wide gap that fires in cautious must NOT fire in risk_on."""
-    _reset(); _set_sig(188.0, 192.04, price=176.99, bearish_cross=True)
-    strategy.evaluate_stock("DHR", "ACCT", [], 100000.0, regime="risk_on")
-    assert _sides("sell_short") == [], f"risk_on must block the short, got {_orders}"
-    assert strategy._regime_short_blocks == 1
+    """Same wide gap that fires in cautious must NOT fire in risk_on — the point
+    being that the regime gate is independent of gap width.
+
+    Floor pinned to "cautious": this asserts gate INDEPENDENCE, not the deployed
+    policy, and the deployed SHORT_MIN_REGIME moved to "risk_on" on 2026-08-03."""
+    orig = strategy.config.SHORT_MIN_REGIME
+    try:
+        strategy.config.SHORT_MIN_REGIME = "cautious"
+        _reset(); _set_sig(188.0, 192.04, price=176.99, bearish_cross=True)
+        strategy.evaluate_stock("DHR", "ACCT", [], 100000.0, regime="risk_on")
+        assert _sides("sell_short") == [], f"risk_on must block the short, got {_orders}"
+        assert strategy._regime_short_blocks == 1
+    finally:
+        strategy.config.SHORT_MIN_REGIME = orig
 
 
 # ── 5th site: momentum alignment (was a bare inline EMA comparison) ───────────

@@ -272,15 +272,44 @@ def test_short_respects_max_positions():
 def test_short_blocked_in_risk_on_regime():
     """The SHORT_MIN_REGIME gate, at the evaluate_stock level: an otherwise
     perfect death-cross short does not fire in risk_on, increments the counter,
-    and arms no stop record."""
-    _reset(); _set_sig(bearish_cross=True, close=100.0)
-    strategy.evaluate_stock("AAPL", "ACCT", [], 100000.0,
-                            is_momentum=False, momentum_generation="",
-                            regime="risk_on")
-    assert _sides("sell_short") == [], f"risk_on must block the short, got {_orders}"
-    assert strategy._short_entries == 0, "blocked short must not count as an entry"
-    assert strategy._regime_short_blocks == 1, "regime block must be counted"
-    assert "AAPL" not in strategy._load_stops(), "no stop armed for a blocked short"
+    and arms no stop record.
+
+    Pins SHORT_MIN_REGIME="cautious" rather than reading the live config. This
+    test describes the MECHANISM of a floor above risk_on; the deployed floor is
+    a policy that moves (it went to "risk_on" on 2026-08-03, which made this fail).
+    A test that silently changes meaning when a config value is retuned is not
+    testing anything.
+    """
+    orig = strategy.config.SHORT_MIN_REGIME
+    try:
+        strategy.config.SHORT_MIN_REGIME = "cautious"
+        _reset(); _set_sig(bearish_cross=True, close=100.0)
+        strategy.evaluate_stock("AAPL", "ACCT", [], 100000.0,
+                                is_momentum=False, momentum_generation="",
+                                regime="risk_on")
+        assert _sides("sell_short") == [], f"risk_on must block the short, got {_orders}"
+        assert strategy._short_entries == 0, "blocked short must not count as an entry"
+        assert strategy._regime_short_blocks == 1, "regime block must be counted"
+        assert "AAPL" not in strategy._load_stops(), "no stop armed for a blocked short"
+    finally:
+        strategy.config.SHORT_MIN_REGIME = orig
+
+
+def test_short_fires_in_risk_on_when_floor_is_risk_on():
+    """The deployed policy as of 2026-08-03: floor "risk_on" makes the filter a
+    no-op, so the same death cross that is blocked above now fires."""
+    orig = strategy.config.SHORT_MIN_REGIME
+    try:
+        strategy.config.SHORT_MIN_REGIME = "risk_on"
+        _reset(); _set_sig(bearish_cross=True, close=100.0)
+        strategy.evaluate_stock("AAPL", "ACCT", [], 100000.0,
+                                is_momentum=False, momentum_generation="",
+                                regime="risk_on")
+        assert _sides("sell_short") == [("AAPL", "sell_short", 50)], _orders
+        assert strategy._short_entries == 1
+        assert strategy._regime_short_blocks == 0, "no block at a risk_on floor"
+    finally:
+        strategy.config.SHORT_MIN_REGIME = orig
 
 
 def test_regime_filter_off_allows_risk_on_short():
