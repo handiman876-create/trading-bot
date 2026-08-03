@@ -1139,9 +1139,14 @@ def _apply_regime_rules(regime: str):
     block_momentum_align = regime in ("cautious", "defensive", "crisis")
     if getattr(config, "ENABLE_REGIME_SHORT_FILTER", False):
         floor = getattr(config, "SHORT_MIN_REGIME", "risk_on")
-        # "unknown" ranks with risk_on, so a VIX outage blocks shorts (fail-CLOSED
-        # for shorts, unlike the fail-OPEN longs get) — see the config note.
-        block_shorts = _REGIME_RANK.get(regime, 0) < _REGIME_RANK.get(floor, 0)
+        # "unknown" = the VIX quote failed. Blocked UNCONDITIONALLY, not via the
+        # rank comparison: unknown ranks 0 alongside risk_on, so once the floor was
+        # lowered to "risk_on" (2026-08-03) the rank test stopped blocking it and a
+        # VIX outage silently started permitting shorts. Longs fail-OPEN on a data
+        # glitch, shorts fail-CLOSED — failing open on a short is how you get short
+        # into a rally, and an outage is exactly when you cannot see the rally.
+        block_shorts = (regime == "unknown"
+                        or _REGIME_RANK.get(regime, 0) < _REGIME_RANK.get(floor, 0))
     else:
         block_shorts = False
     return block_new_entries, block_momentum_align, block_shorts

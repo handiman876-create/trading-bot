@@ -101,26 +101,32 @@ def test_apply_regime_rules():
 
 
 def test_apply_regime_rules_at_the_deployed_risk_on_floor():
-    """The 2026-08-03 policy: floor "risk_on" makes the short filter a no-op, and
-    with it the fail-CLOSED-on-unknown property above. Documented here so the
-    trade-off is visible rather than implicit in a config edit."""
+    """The deployed 2026-08-03 policy: floor "risk_on" opens shorts in risk_on,
+    but 'unknown' stays blocked. The rank comparison alone could not express this
+    — unknown ranks 0 alongside risk_on, so lowering the floor had silently opened
+    shorts during a VIX outage until the unconditional check was added."""
     orig = config.SHORT_MIN_REGIME
     try:
         config.SHORT_MIN_REGIME = "risk_on"
         assert strategy._apply_regime_rules("risk_on")[2] is False
-        # unknown now PERMITS shorts — a VIX outage no longer blocks them.
-        assert strategy._apply_regime_rules("unknown")[2] is False
+        assert strategy._apply_regime_rules("cautious")[2] is False
+        assert strategy._apply_regime_rules("unknown")[2] is True
     finally:
         config.SHORT_MIN_REGIME = orig
 
 
 def test_short_min_regime_gate_is_configurable():
-    """SHORT_MIN_REGIME moves the floor; 'risk_on' restores pre-gate behaviour."""
+    """SHORT_MIN_REGIME moves the floor; 'risk_on' drops it to the bottom.
+
+    'unknown' is the one exception and is asserted separately below: it is blocked
+    unconditionally, so a risk_on floor no longer means "shorts everywhere"."""
     orig = config.SHORT_MIN_REGIME
     try:
         config.SHORT_MIN_REGIME = "risk_on"
-        for r in ("risk_on", "cautious", "defensive", "crisis", "unknown"):
+        for r in ("risk_on", "cautious", "defensive", "crisis"):
             assert strategy._apply_regime_rules(r)[2] is False, r
+        assert strategy._apply_regime_rules("unknown")[2] is True, \
+            "a VIX outage must block shorts at ANY floor"
 
         config.SHORT_MIN_REGIME = "defensive"
         assert strategy._apply_regime_rules("cautious")[2] is True
@@ -178,15 +184,31 @@ def test_defensive_and_crisis_already_block_all_entries():
         config.SHORT_MIN_REGIME = orig
 
 
-def test_risk_on_floor_opens_shorts_in_risk_on_and_unknown():
+def test_risk_on_floor_opens_shorts_in_risk_on_and_cautious_only():
     """The deployed 2026-08-03 policy, stated explicitly: dropping the floor to
-    risk_on widens the short window from {cautious} to {risk_on, cautious,
-    unknown} — including 'unknown', i.e. shorts now fire during a VIX outage."""
+    risk_on widens the short window from {cautious} to {risk_on, cautious} — and
+    NOT to 'unknown'. This list is the single source of truth for the banner,
+    which derives the same set from _apply_regime_rules."""
     orig = config.SHORT_MIN_REGIME
     try:
         config.SHORT_MIN_REGIME = "risk_on"
-        assert _short_openable_regimes() == ["risk_on", "cautious", "unknown"], \
+        assert _short_openable_regimes() == ["risk_on", "cautious"], \
             _short_openable_regimes()
+    finally:
+        config.SHORT_MIN_REGIME = orig
+
+
+def test_vix_outage_blocks_shorts_at_every_floor():
+    """The property, swept across floors rather than asserted at one: no
+    configuration of SHORT_MIN_REGIME may open a short while the VIX quote is
+    unavailable. Longs are deliberately fail-OPEN in the same situation."""
+    orig = config.SHORT_MIN_REGIME
+    try:
+        for floor in ("risk_on", "cautious", "defensive", "crisis"):
+            config.SHORT_MIN_REGIME = floor
+            blocks_new, _, blocks_shorts = strategy._apply_regime_rules("unknown")
+            assert blocks_shorts is True, f"unknown must block shorts at floor={floor}"
+            assert blocks_new is False, f"longs stay fail-OPEN at floor={floor}"
     finally:
         config.SHORT_MIN_REGIME = orig
 

@@ -317,15 +317,17 @@ def main() -> None:
                                      "unknown")
                          if not strategy._apply_regime_rules(r)[0]
                          and not strategy._apply_regime_rules(r)[2]]
+            # "Counter: REGIME BLOCK" dropped from this line 2026-08-03. It was
+            # advertising a counter that had just become unreachable at a risk_on
+            # floor. The counter itself is UNCHANGED in strategy.py and still emits
+            # its REGIME BLOCK log line whenever it fires — only the banner
+            # advertisement is gone, so nothing observable was lost.
             logger.info("Short regime filter: ENABLED — NEW shorts require regime "
-                        ">= %s. Regimes a short can actually OPEN in: %s "
-                        "(defensive/crisis are already closed by block_new_entries, "
-                        "so they never appear).%s ENTRY-only: open shorts still "
-                        "trail, stop and cover normally. Counter: REGIME BLOCK",
-                        config.SHORT_MIN_REGIME, _openable or "NONE",
-                        "  NOTE floor=risk_on ⇒ this filter is a NO-OP and a VIX "
-                        "outage ('unknown') PERMITS shorts."
-                        if config.SHORT_MIN_REGIME == "risk_on" else "")
+                        ">= %s, and 'unknown' (VIX outage) always blocks. Regimes a "
+                        "short can actually OPEN in: %s (defensive/crisis are already "
+                        "closed by block_new_entries, so they never appear). "
+                        "ENTRY-only: open shorts still trail, stop and cover normally.",
+                        config.SHORT_MIN_REGIME, _openable or "NONE")
         elif config.ENABLE_SHORTING:
             logger.info("Short regime filter: DISABLED (shorts gated only by "
                         "ENABLE_SHORTING and defensive/crisis)")
