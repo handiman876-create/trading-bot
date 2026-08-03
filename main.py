@@ -277,8 +277,16 @@ def main() -> None:
         logger.info("Latch repair: ON — a held momentum name with no latch is "
                     "rebuilt each cycle from BROKER POSITIONS (not stop records: "
                     "the same wipe takes both)")
-        logger.info("Shorting    : %s (effective watchlist, death-cross entries)",
-                    "ENABLED" if config.ENABLE_SHORTING else "DISABLED")
+        # The parenthetical has to describe the ACTIVE state, not the feature. It
+        # read "DISABLED (effective watchlist, death-cross entries)" on 2026-08-03,
+        # which describes what shorting would do if it were on — and the banner is
+        # what gets read as the source of truth for what the bot is doing.
+        if config.ENABLE_SHORTING:
+            logger.info("Shorting    : ENABLED (effective watchlist, death-cross entries)")
+        else:
+            logger.info("Shorting    : DISABLED — long-only; no NEW short entries. "
+                        "ENTRY-only gate: open shorts still trail, stop and cover "
+                        "normally.")
         if config.ENABLE_SHORTING and config.ENABLE_REGIME_SHORT_FILTER:
             logger.info("Short regime filter: ENABLED (cautious/defensive only) — "
                         "NEW shorts require regime >= %s; risk_on and unknown "
