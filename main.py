@@ -307,13 +307,25 @@ def main() -> None:
                         "ENTRY-only gate: open shorts still trail, stop and cover "
                         "normally.")
         if config.ENABLE_SHORTING and config.ENABLE_REGIME_SHORT_FILTER:
-            logger.info("Short regime filter: ENABLED (cautious/defensive only) — "
-                        "NEW shorts require regime >= %s; risk_on and unknown "
-                        "blocked. NOTE defensive/crisis are already closed by "
-                        "block_new_entries, so in practice shorts fire ONLY in "
-                        "cautious (20 <= VIX < 25). ENTRY-only: open shorts still "
+            # DERIVED, not described. This line used to hardcode "(cautious/
+            # defensive only) ... risk_on and unknown blocked ... shorts fire ONLY
+            # in cautious", which silently became false the moment
+            # SHORT_MIN_REGIME moved to "risk_on" on 2026-08-03 — the banner then
+            # contradicted itself in a single sentence. Ask the real gate instead,
+            # so the banner cannot drift from the code again.
+            _openable = [r for r in ("risk_on", "cautious", "defensive", "crisis",
+                                     "unknown")
+                         if not strategy._apply_regime_rules(r)[0]
+                         and not strategy._apply_regime_rules(r)[2]]
+            logger.info("Short regime filter: ENABLED — NEW shorts require regime "
+                        ">= %s. Regimes a short can actually OPEN in: %s "
+                        "(defensive/crisis are already closed by block_new_entries, "
+                        "so they never appear).%s ENTRY-only: open shorts still "
                         "trail, stop and cover normally. Counter: REGIME BLOCK",
-                        config.SHORT_MIN_REGIME)
+                        config.SHORT_MIN_REGIME, _openable or "NONE",
+                        "  NOTE floor=risk_on ⇒ this filter is a NO-OP and a VIX "
+                        "outage ('unknown') PERMITS shorts."
+                        if config.SHORT_MIN_REGIME == "risk_on" else "")
         elif config.ENABLE_SHORTING:
             logger.info("Short regime filter: DISABLED (shorts gated only by "
                         "ENABLE_SHORTING and defensive/crisis)")
