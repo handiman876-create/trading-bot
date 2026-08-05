@@ -45,6 +45,23 @@ def _detect_test_run() -> bool:
 
 _IS_TEST = _detect_test_run()
 
+
+def is_occ_symbol(symbol: str) -> bool:
+    """True for an option contract symbol, e.g. "NVDA 260821C220".
+
+    TradeStation's OCC format is "<ROOT> <YYMMDD><C|P><STRIKE>"; equity and ETF
+    tickers never contain a space, so the space IS the whole test.
+
+    WHY THIS LIVES HERE: three call sites depend on telling a contract from a
+    stock (the watchlist held-fold-in, the stop bootstrap, and the stop
+    reconcile), and they sit in two different modules. Both import config, so
+    this is the one place both can reach. Re-implementing the check per site is
+    how the three drift apart — the 2026-08-05 exit loop was caused by exactly
+    one site (watchlist) not making the distinction at all.
+    """
+    return " " in (symbol or "").strip()
+
+
 # Test runs get their own prefix so they can never append to a production log.
 # conftest.py additionally redirects these into a tmpdir; this prefix is the
 # floor that holds even when a test is run directly, outside pytest.

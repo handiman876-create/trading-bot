@@ -14,6 +14,17 @@ The live list is assembled fresh every cycle as:
   rotates OUT of the momentum slot while we still hold shares, keeping it in the
   list means evaluate_stock still sees its SELL cross instead of stranding the
   position. (Mirrors evaluate_future's stale-contract roll guard.)
+  STOCKS ONLY: the fold-in reads broker positions directly, and those include
+  option contracts. OCC symbols are filtered out (config.is_occ_symbol).
+
+  WHY THAT FILTER EXISTS: on 2026-08-05 the held fold-in put "NVDA 260821C220"
+  into this list, so evaluate_stock ran the whole equity pipeline against an
+  option contract — EMAs computed on option premium, a trailing stop bootstrapped
+  off cost_basis/contracts (815.00 for an 8.15 fill, the x100 multiplier), and
+  every exit routed through place_equity_order, which sends TradeAction "SELL".
+  That is invalid for an option, so TradeStation 400'd all 326 attempts between
+  14:02 and 19:59 while the contract sat unsellable. Options have no bot-managed
+  stop by design; evaluate_option exits them on EMA state via place_option_order.
 """
 
 import json
@@ -82,12 +93,35 @@ def momentum_slot() -> tuple[list[str], str]:
     return _symbols_from_doc(doc), (doc.get("generated") or "")
 
 
+_occ_filtered   = 0      # lifetime count of contract symbols kept out of the list
+_occ_seen: set[str] = set()   # log each contract once, not once per 65s cycle
+
+
 def effective_stock_watchlist(positions: list[dict]) -> list[str]:
     """CORE ∪ momentum ∪ held, de-duplicated with a stable order
-    (core first, then momentum, then any held stragglers)."""
+    (core first, then momentum, then any held stragglers).
+
+    STOCKS ONLY. The held fold-in reads straight from broker positions, which
+    include option contracts, so OCC symbols are filtered out here — see the
+    module docstring for what happens when they are not."""
+    global _occ_filtered
     core = [s.upper() for s in config.CORE_WATCHLIST]
     momentum = _load_momentum_symbols()
-    held = [str(p.get("symbol", "")).upper()
-            for p in positions if int(p.get("quantity", 0)) != 0 and p.get("symbol")]
+    held = []
+    for p in positions:
+        symbol = str(p.get("symbol", "")).upper()
+        if not symbol or int(p.get("quantity", 0)) == 0:
+            continue
+        if config.is_occ_symbol(symbol):
+            # Options are managed end-to-end by strategy.evaluate_option, off the
+            # OPTIONS_WATCHLIST — they must never enter the stock loop.
+            _occ_filtered += 1
+            if symbol not in _occ_seen:
+                _occ_seen.add(symbol)
+                logger.info("WATCHLIST OCC FILTER: %s is an option contract — "
+                            "excluded from the stock loop (evaluate_option owns "
+                            "it) #%d", symbol, _occ_filtered)
+            continue
+        held.append(symbol)
     # dict.fromkeys preserves first-seen order while removing duplicates.
     return list(dict.fromkeys(core + momentum + held))

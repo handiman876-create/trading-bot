@@ -463,6 +463,7 @@ _option_stale_recovered = 0  # exits routed to a STORED occ_symbol a recompute w
 _option_expiry_drops    = 0  # stored contracts cleared because their expiration passed
 _option_orphan_drops    = 0  # stored contracts the broker no longer reports
 _option_adoptions       = 0  # live broker contracts folded into the store (pre-fix legacy)
+_occ_stop_prunes        = 0  # OCC-keyed stop records dropped (options are not stop-managed)
 
 
 def _load_json(path: str) -> dict:
@@ -599,8 +600,28 @@ def _bootstrap_stop(symbol: str, held: int, sig: dict, positions: list[dict],
     if atr is None or atr <= 0:
         logger.warning("STOP BOOTSTRAP %s skipped: ATR unavailable", symbol)
         return None
-    basis = _cost_basis(positions, symbol)
-    entry = (basis / abs(held)) if (basis and held) else price
+    # Entry estimate. cost_basis/|qty| is right for shares but WRONG for an option
+    # contract: the basis is in dollars and carries the x100 contract multiplier,
+    # so a 8.15 premium fill reads back as 815.00 — a stop then armed 3xATR under
+    # 815 and compared against a ~7 premium is breached on its first cycle, every
+    # cycle (2026-08-05, NVDA 260821C220). The options store already holds the true
+    # per-share fill, so for a contract we read it instead of re-deriving it.
+    #
+    # DEFENSIVE: with the watchlist OCC filter in place this branch is unreachable
+    # in normal operation — options are managed by evaluate_option, which arms no
+    # bot stop at all. It stays because the failure it prevents is silent and
+    # expensive, and a future caller reaching _bootstrap_stop with a contract
+    # should get correct units rather than a 100x-off stop.
+    if config.is_occ_symbol(symbol):
+        entry = _option_entry_price(symbol)
+        if entry is None:
+            logger.warning("STOP BOOTSTRAP %s skipped: option contract with no "
+                           "stored entry price (refusing a cost-basis estimate — "
+                           "it would be off by the x100 multiplier)", symbol)
+            return None
+    else:
+        basis = _cost_basis(positions, symbol)
+        entry = (basis / abs(held)) if (basis and held) else price
     # Band off the ESTIMATED entry, not the live price, so the ratio matches the
     # entry_price actually written into the record.
     mult = _get_atr_mult(regime, atr, entry)
@@ -696,6 +717,7 @@ def reconcile_stops(positions: list[dict]) -> None:
     and pruning against that would wipe every stop, then re-bootstrap next cycle
     with a reset high-water — silently loosening ratcheted stops. Skipping prune
     on empty leaves stale records inert for a cycle (harmless)."""
+    global _occ_stop_prunes
     if not positions:
         return
     held = {p.get("symbol") for p in positions
@@ -705,7 +727,21 @@ def reconcile_stops(positions: list[dict]) -> None:
     for s in stale:
         del stops[s]
         logger.info("STOP PRUNE %s: no longer held — dropping stop record", s)
-    if stale:
+    # Option contracts carry no bot-managed stop (evaluate_option exits on EMA
+    # state), so any OCC-keyed record here is debris from the pre-2026-08-05 path
+    # where a contract leaked into the stock loop and got one bootstrapped. It is
+    # unreachable now, but a held contract survives the not-held prune above, so
+    # it would otherwise sit in the file forever carrying a 100x-off entry price.
+    # Re-derived from current logic rather than one-shot cleaned, so it also
+    # catches records written by any future leak.
+    contracts = [s for s in stops if config.is_occ_symbol(s)]
+    for s in contracts:
+        rec = stops.pop(s)
+        _occ_stop_prunes += 1
+        logger.info("STOP PRUNE %s: option contract — options are not stop-managed "
+                    "(dropping record, entry_price=%s) #%d",
+                    s, rec.get("entry_price"), _occ_stop_prunes)
+    if stale or contracts:
         _save_stops(stops)
 
 
@@ -1523,6 +1559,22 @@ def _save_option_position(key: str, record: dict) -> None:
     store = _load_option_positions()
     store[key] = record
     _save_option_positions(store)
+
+
+def _option_entry_price(occ_symbol: str) -> Optional[float]:
+    """The stored per-share entry premium for a contract, or None if unknown.
+
+    Looked up BY occ_symbol (scanning the store) rather than by rebuilding the
+    "<UNDERLYING>_<type>" key from the symbol — same reasoning as the section
+    header above: the stored record is the anchor, and re-deriving a key is the
+    bug class this store exists to kill.
+    """
+    for rec in _load_option_positions().values():
+        if rec.get("occ_symbol") == occ_symbol:
+            entry = rec.get("entry_price")
+            if isinstance(entry, (int, float)) and entry > 0:
+                return float(entry)
+    return None
 
 
 def _close_option_position(key: str) -> None:
