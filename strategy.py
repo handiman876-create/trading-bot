@@ -345,6 +345,50 @@ def _note_cross_gap_block(symbol: str, sig: dict, what: str,
                 config.EMA_CROSS_MIN_GAP_PCT * 100, _cross_gap_blocks)
 
 
+# Consecutive failed history fetches per symbol. In-memory: a restart forgets
+# the streak and the next miss starts a fresh one, which under-reports rather
+# than over-reports — the same direction _cross_first_seen fails in.
+_history_gap_streak: dict[str, int] = {}
+
+
+def _note_history_gap(symbol: str, held: int, label: str = "") -> None:
+    """Record a poll that evaluated NOTHING for a held name because bar history
+    was unavailable.
+
+    All three evaluate_* paths return early on an empty history, which aborts
+    the cycle before any exit logic runs — the trailing stop for equities and
+    futures, the close-on-opposite-state for options. When the name is flat that
+    costs nothing. When it is HELD, protection went unevaluated and nothing said
+    so; making that visible is the only reason this exists.
+
+    Silent when flat on purpose. A skipped poll on a flat name protects nothing,
+    and counting those would measure the broker's uptime rather than our
+    exposure (2026-08-04: DXCM burned 7 such polls flat, PLTR 6 while held —
+    indistinguishable in the log before this).
+
+    Watch _history_gaps_held against _stop_exits: a name that stops out shortly
+    after logging gaps is one whose exit this delayed.
+    """
+    global _history_gaps_held
+    key = symbol or "<unnamed>"
+    streak = _history_gap_streak.get(key, 0) + 1
+    _history_gap_streak[key] = streak
+    if held == 0:
+        return
+    _history_gaps_held += 1
+    log = (logger.error if streak >= config.HISTORY_GAP_ERROR_STREAK
+           else logger.warning)
+    log("POSITION UNCHECKED %s%s — no bar history for %d consecutive poll(s); "
+        "stop and exit logic not evaluated this cycle (held=%d, unchecked #%d)",
+        key, f" ({label})" if label else "", streak, held, _history_gaps_held)
+
+
+def _clear_history_gap(symbol: str) -> None:
+    """A good fetch ends the streak, so escalation measures a CURRENT outage
+    rather than accumulating unrelated blips over a session."""
+    _history_gap_streak.pop(symbol or "<unnamed>", None)
+
+
 def _shares_to_buy(price: float, equity: Optional[float]) -> int:
     """Size a stock entry at EQUITY_PER_TRADE_PCT of current account equity.
     Returns 0 (caller skips the trade) when price or equity is unusable, so a
@@ -413,6 +457,8 @@ _cross_sustain_blocks = 0  # gap-valid entry crosses deferred by CROSS_SUSTAIN_M
 _regime_short_blocks = 0   # would-be short entries suppressed by SHORT_MIN_REGIME
 _stops_trailed = 0         # trailing stops that actually moved (new extreme)
 _breakeven_locks = 0       # stops floored at entry after +1 ATR of profit (principal locked)
+_history_gaps_held = 0     # polls that evaluated NO stop because history was unavailable
+                           # AND the name was held (flat names are not counted)
 _option_stale_recovered = 0  # exits routed to a STORED occ_symbol a recompute would have missed
 _option_expiry_drops    = 0  # stored contracts cleared because their expiration passed
 _option_orphan_drops    = 0  # stored contracts the broker no longer reports
@@ -1252,7 +1298,12 @@ def evaluate_stock(symbol: str, account_id: str, positions: list[dict],
 
     history = tc.get_historical(symbol, days=90)
     if not history:
+        # `positions` is already in hand, so held is knowable WITHOUT history --
+        # which is what lets this separate a harmless skip on a flat name from a
+        # live stop that went unchecked.
+        _note_history_gap(symbol, _current_position(positions, symbol))
         return
+    _clear_history_gap(symbol)
 
     sig = ind.compute_indicators(
         history,
@@ -1554,7 +1605,16 @@ def evaluate_option(
 
     history = tc.get_historical(symbol, days=90)
     if not history:
+        # occ_symbol is derived from `sig` further down, so it is unavailable
+        # here — but the STORED contract already carries it, the same record
+        # every exit keys off. No record means no open contract, hence held=0.
+        rec = _load_option_positions().get(_option_key(symbol, opt_type))
+        occ = rec.get("occ_symbol") if rec else None
+        _note_history_gap(symbol,
+                          _current_position(positions, occ) if occ else 0,
+                          label=f"{opt_type} option")
         return
+    _clear_history_gap(symbol)
 
     sig = ind.compute_indicators(
         history,
@@ -1723,8 +1783,13 @@ def evaluate_future(root: str, account_id: str, positions: list[dict],
 
     history = tc.get_historical(sig_symbol, days=90)
     if not history:
-        logger.warning("%s: no bar history for %s", root, sig_symbol)
+        # Replaces a bare WARNING that named the outage but never said a held
+        # contract had gone unevaluated, and carried no counter.
+        _note_history_gap(sig_symbol,
+                          _current_position(positions, trade_symbol),
+                          label=root)
         return
+    _clear_history_gap(sig_symbol)
 
     sig = ind.compute_indicators(
         history,

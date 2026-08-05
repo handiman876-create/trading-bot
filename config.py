@@ -189,6 +189,17 @@ OPTIONS_WATCHLIST = [
 # above strategy._option_key for the full failure story.
 OPTIONS_POSITION_FILE = "data/options_positions.json"   # generated (gitignored)
 
+# ── Bar-history outage reporting ─────────────────────────────────────────────
+# A history fetch that returns nothing aborts the poll for that symbol BEFORE
+# the trailing-stop check, so a held position goes unevaluated for that cycle.
+# That was silent until now: on 2026-08-04 PLTR went 6 consecutive polls
+# unchecked (14:46-15:00) during a TradeStation /barcharts outage and no log
+# line said so. Consecutive misses on a HELD name escalate WARNING -> ERROR at
+# this threshold; 3 polls at POLL_INTERVAL=60 is ~3 minutes of unchecked stop.
+# Flat names never log — a skipped poll protects nothing when there is no
+# position, and counting those would measure API weather, not exposure.
+HISTORY_GAP_ERROR_STREAK = 3
+
 # ── Strategy Parameters ───────────────────────────────────────────────────────
 MA_SHORT_PERIOD  = 9     # fast EMA
 MA_LONG_PERIOD   = 21    # slow EMA
