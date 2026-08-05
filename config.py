@@ -163,7 +163,9 @@ CORE_WATCHLIST = CORE_MEGA + CORE_GROWTH
 #   expiration → next monthly 3rd Friday (market_hours.next_monthly_expiration)
 OPTIONS_WATCHLIST = [
     ("SPY",  "call"),
-    ("AAPL", "put"),
+    ("QQQ",  "call"),
+    ("NVDA", "call"),
+    ("AMD",  "call"),
 ]
 
 # Open-contract store for the options path (generated, gitignored). Keyed by
