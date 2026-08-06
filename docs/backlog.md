@@ -383,3 +383,48 @@ stated end goal. Note the ordering: 0–3 DTE options decay fastest and carry th
 widest spreads (~2.1% round-trip vs ~0.04% on equities), so they punish a weak
 signal far harder than shares do. The equity version has to prove an edge first;
 options scalping cannot rescue a signal that does not work on stock.
+
+---
+
+## Options exit thresholds are arbitrary (not hardcoded — unvalidated)
+
+Shipped 2026-08-06 in `ec48e56`. **These are already config constants**, so the
+work is not plumbing:
+
+```python
+config.OPTION_PROFIT_TARGET_PCT   = 1.50   # +50%
+config.OPTION_STOP_LOSS_PCT       = 0.50   # -50%
+config.OPTION_MIN_DAYS_TO_EXPIRY  = 5
+ENABLE_OPTION_EXIT_TARGETS        = True
+```
+
+Change any of them by editing config.py and restarting — no code change, and the
+startup banner reprints the live values ("Option exits:" line).
+
+**The open question is whether the NUMBERS are right, and there is currently no
+evidence either way.** They were chosen as round symmetric figures, not fit to
+anything. This bot has placed exactly three options trades ever
+(SPY260717C00540000, which died orphaned; NVDA 260821C220; QQQ 260821C715), so
+there is no distribution to fit against — the same problem that kept
+ENABLE_PROFIT_TAKING disabled for two weeks, and the reason the equities
+profit-take is still a single data point (MSFT 2026-08-03).
+
+Specific doubts worth testing once there are closed trades:
+
+- **-50% may be far too wide for a 2-3 week contract.** An ATM call routinely
+  gives up half its premium on an ordinary underlying pullback and recovers. The
+  stop may fire mostly on noise, or never fire before the expiry rule does.
+- **The rules are symmetric; option payoffs are not.** A long call's loss is
+  capped at 100% while its gain is unbounded, so +50%/-50% is not a 1:1 risk
+  ratio in any meaningful sense.
+- **5 days may be too late for 0-3 DTE work** (see the 5-minute scalping section
+  above) and too early for a 45-day contract. It is one constant serving two very
+  different regimes.
+- **No trailing analogue.** The equities side trails its stop; options take a
+  fixed threshold off entry and never ratchet, so a contract can go +140%, fall
+  back to +5%, and exit on EMA state with nothing locked. Same structural gap as
+  the breakeven lock flooring at entry rather than at profit.
+
+**Acceptable as-is for now** — something is strictly better than the previous
+state (EMA state only, i.e. no premium-based exit at all). Revisit once 5+
+options round trips have closed, and fit rather than guess.
