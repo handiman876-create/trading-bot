@@ -245,6 +245,27 @@ MAX_POSITIONS        = 20     # skip new stock entries once this many positions 
                               # open (0.05 × 20 = 100% fully deployed)
 OPTIONS_CONTRACTS    = 1      # contracts per options trade
 
+# ── Options exit targets (premium-based, NOT ATR) ─────────────────────────────
+# Equities exit on an ATR trailing stop; options had NOTHING but the EMA-state
+# flip, so a contract could bleed to zero while the underlying's EMAs stayed
+# bullish. These three rules are the options analogue of the stop, and they are
+# checked BEFORE the state exit because all three are de-risking.
+#
+# Evaluated against the BID (what a sell actually receives), consistent with
+# _option_fill_price(quote, "exit") — NOT the mid. Options round-trip spreads run
+# ~2.1%, so a mid-based trigger reports a fill the book will not give you.
+#
+# The entry reference is the STORED entry_price. Adopted positions carry
+# entry_price 0.0 (strategy.py: the adoption path cannot know what was paid), and
+# 0.0 would make `bid >= entry * 1.50` read 0 >= 0 == True and close instantly —
+# so a non-positive entry SKIPS the target/stop rules. Expiry is unaffected: it
+# needs no entry price and remains armed on adopted contracts.
+ENABLE_OPTION_EXIT_TARGETS = True
+OPTION_PROFIT_TARGET_PCT   = 1.50   # close once bid >= entry × this (+50%)
+OPTION_STOP_LOSS_PCT       = 0.50   # close once bid <= entry × this (−50%)
+OPTION_MIN_DAYS_TO_EXPIRY  = 5      # close with <= this many calendar days left,
+                                    # before gamma/theta make the exit unpriceable
+
 # ── Stop Loss (bot-managed trailing stop) ─────────────────────────────────────
 # Bot-managed (not broker-native) ATR trailing stop, checked every cycle in
 # strategy.evaluate_stock BEFORE the EMA-cross signal. Paper-trading choice for

@@ -459,10 +459,12 @@ _stops_trailed = 0         # trailing stops that actually moved (new extreme)
 _breakeven_locks = 0       # stops floored at entry after +1 ATR of profit (principal locked)
 _history_gaps_held = 0     # polls that evaluated NO stop because history was unavailable
                            # AND the name was held (flat names are not counted)
-_option_stale_recovered = 0  # exits routed to a STORED occ_symbol a recompute would have missed
 _option_expiry_drops    = 0  # stored contracts cleared because their expiration passed
 _option_orphan_drops    = 0  # stored contracts the broker no longer reports
 _option_adoptions       = 0  # live broker contracts folded into the store (pre-fix legacy)
+_option_target_exits    = 0  # contracts closed at OPTION_PROFIT_TARGET_PCT
+_option_stop_exits      = 0  # contracts closed at OPTION_STOP_LOSS_PCT
+_option_expiry_exits    = 0  # contracts closed with <= OPTION_MIN_DAYS_TO_EXPIRY left
 _occ_stop_prunes        = 0  # OCC-keyed stop records dropped (options are not stop-managed)
 
 
@@ -1620,6 +1622,53 @@ def _option_expired(expiration: str) -> bool:
         return False
 
 
+def _days_to_expiry(expiration: str) -> Optional[int]:
+    """Calendar days from today to `expiration`, or None if unparseable.
+
+    None (not 0, and not a huge number) so the caller can tell "no idea" apart
+    from "expires today". _option_expired already fails OPEN on a bad date; this
+    mirrors that — an unreadable date must not trigger a forced liquidation.
+    """
+    try:
+        return (date.fromisoformat(str(expiration)) - date.today()).days
+    except (TypeError, ValueError):
+        return None
+
+
+def _option_exit_reason(bid: float, entry: Optional[float],
+                        expiration: str) -> Optional[str]:
+    """Which premium-based exit rule fires, or None. Ordered worst-news-first:
+    stop before target (a contract cannot be at both, but if the data is weird
+    the loss branch should win), then expiry.
+
+    Split out of evaluate_option so the thresholds are testable without stubbing
+    a broker, a quote feed and an indicator stack — the same reason
+    _option_fill_price is its own function.
+    """
+    if not config.ENABLE_OPTION_EXIT_TARGETS:
+        return None
+
+    # Adopted contracts store entry_price 0.0 (unknown). Guard BEFORE arithmetic:
+    # 0.0 would make every ratio degenerate and close the position on sight.
+    if entry is not None and entry > 0 and bid > 0:
+        # Half a cent — below the minimum tick, so it can never reach past a real
+        # quote into the next price level, but it absorbs the float error in the
+        # threshold: 8.15 * 1.50 is 12.225000000000001, so a bid of exactly 12.225
+        # would MISS its own target without this.
+        eps = 0.005
+        if bid <= entry * config.OPTION_STOP_LOSS_PCT + eps:
+            return (f"stop loss — bid {bid:.2f} <= "
+                    f"{config.OPTION_STOP_LOSS_PCT:.0%} of entry {entry:.2f}")
+        if bid >= entry * config.OPTION_PROFIT_TARGET_PCT - eps:
+            return (f"profit target — bid {bid:.2f} >= "
+                    f"{config.OPTION_PROFIT_TARGET_PCT:.0%} of entry {entry:.2f}")
+
+    days = _days_to_expiry(expiration)
+    if days is not None and days <= config.OPTION_MIN_DAYS_TO_EXPIRY:
+        return f"near expiry — {days}d left (<= {config.OPTION_MIN_DAYS_TO_EXPIRY})"
+    return None
+
+
 def _option_fill_price(quote: Optional[dict], side: str) -> float:
     """Marketable price from the side of the book we actually trade against: an
     ENTRY lifts the ASK, an EXIT hits the BID.
@@ -1652,8 +1701,9 @@ def evaluate_option(
     account_id: str,
     positions:  list[dict],
 ) -> None:
-    global _entries_delayed, _option_stale_recovered, _option_expiry_drops
+    global _entries_delayed, _option_expiry_drops
     global _option_orphan_drops, _option_adoptions
+    global _option_target_exits, _option_stop_exits, _option_expiry_exits
 
     history = tc.get_historical(symbol, days=90)
     if not history:
@@ -1713,19 +1763,14 @@ def evaluate_option(
                                   f"contract (orphan drops #{_option_orphan_drops})")
             return
 
-        # Observability: would the OLD recompute path still have found this
-        # contract? Every increment is a position the pre-fix code had already
-        # lost track of and could never have exited.
-        recomputed = tc.find_option_symbol(symbol, exp_used,
-                                           _atm_strike(sig["close"]), opt_type)
-        if recomputed and recomputed != occ_symbol:
-            _option_stale_recovered += 1
-            logger.info("STALE OPTION RECOVERED %s — holding %s, but a recompute at "
-                        "the current underlying (%.2f) resolves to %s; the pre-fix "
-                        "path would have read held=0 and never exited "
-                        "(stale recoveries #%d)",
-                        key, occ_symbol, sig["close"], recomputed,
-                        _option_stale_recovered)
+        # RETIRED 2026-08-06: this used to recompute the ATM symbol every poll and
+        # log STALE OPTION RECOVERED when it disagreed with the stored one. It was
+        # never the lookup — `held` above resolves against the STORED occ_symbol —
+        # so the counter could only ever measure how far the underlying had drifted
+        # from the strike, which is not a fault condition. It fired 42 times in the
+        # 2026-08-06 session against two healthy positions, and cost one
+        # find_option_symbol API call per poll per held contract to say so. The
+        # regression it guarded is covered by test_price_move_uses_stored_symbol.
     else:
         # ── Flat per the store: the ATM contract we WOULD open. Strike is chosen
         # at signal time from the underlying (nearest $5) so entries track the
@@ -1799,6 +1844,31 @@ def evaluate_option(
     # expiry. A call is long the underlying, a put is short it, so they take the
     # long/short exit helpers respectively.
     elif held > 0:
+        # ── Premium-based exits FIRST. The EMA state below is a view on the
+        # UNDERLYING; it says nothing about what the contract is worth. A call can
+        # lose half its premium to theta and a small adverse move while the EMAs
+        # stay bullish, and before this block the only way out was expiry. These
+        # are de-risking, so like the equities stop they run ahead of the signal.
+        entry_ref = (stored or {}).get("entry_price") if stored else None
+        reason    = _option_exit_reason(exit_price, entry_ref, exp_used)
+        if reason:
+            if _close_option(account_id, occ_symbol, held, exit_price,
+                             symbol, exp_used, strike, opt_type, sig):
+                _mark_sold(occ_symbol)
+                _close_option_position(key)
+                if reason.startswith("stop loss"):
+                    _option_stop_exits += 1
+                    tag, n = "stop exits", _option_stop_exits
+                elif reason.startswith("profit target"):
+                    _option_target_exits += 1
+                    tag, n = "target exits", _option_target_exits
+                else:
+                    _option_expiry_exits += 1
+                    tag, n = "expiry exits", _option_expiry_exits
+                logger.warning("OPTION TARGET EXIT %s %s x%d @ %.2f — %s (%s #%d)",
+                               key, occ_symbol, held, exit_price, reason, tag, n)
+            return
+
         exit_state = (_bearish_state(sig, occ_symbol) if is_call
                       else _bullish_state(sig, occ_symbol))
         edge_key = "bearish_cross" if is_call else "bullish_cross"

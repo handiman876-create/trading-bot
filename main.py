@@ -339,6 +339,19 @@ def main() -> None:
             logger.info("Profit take : DISABLED (enable via ENABLE_PROFIT_TAKING; would sell %.0f%% at +%.0f%% & RSI >= %.0f)",
                         config.PROFIT_TAKE_FRACTION * 100, config.PROFIT_TAKE_PCT * 100,
                         config.PROFIT_TAKE_RSI_MIN)
+        if config.ENABLE_OPTION_EXIT_TARGETS:
+            logger.info("Option exits: ENABLED (bid >= %.0f%% of entry -> target; "
+                        "bid <= %.0f%% -> stop; <= %dd to expiry -> close). Priced off "
+                        "the BID, checked BEFORE the EMA-state exit. Adopted contracts "
+                        "(entry_price 0.0) skip target/stop but keep the expiry rule. "
+                        "Counters: OPTION TARGET EXIT",
+                        config.OPTION_PROFIT_TARGET_PCT * 100,
+                        config.OPTION_STOP_LOSS_PCT * 100,
+                        config.OPTION_MIN_DAYS_TO_EXPIRY)
+        else:
+            logger.info("Option exits: DISABLED (enable via ENABLE_OPTION_EXIT_TARGETS) "
+                        "— options exit on EMA STATE ONLY, so a contract can bleed to "
+                        "zero while the underlying's EMAs stay favourable")
         try:
             _excl, _univ = momentum_screen.count_excluded_universe()
             logger.info("Sector filter: %d of %d universe excluded %s "

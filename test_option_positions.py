@@ -71,7 +71,6 @@ def _reset(monkeypatch=None, sig=None, underlying=100.0, quote=None):
     strategy._save_option_positions({})
     strategy._signaled_buy_today.clear()
     strategy._signaled_sell_today.clear()
-    strategy._option_stale_recovered = 0
     strategy._option_expiry_drops = 0
     strategy._option_orphan_drops = 0
     strategy._option_adoptions = 0
@@ -211,9 +210,12 @@ def test_price_move_uses_stored_symbol():
     assert [o[0] for o in ORDERS] == ["sell_to_close"], \
         "the stored contract must still be exitable after a 60-point move"
     assert ORDERS[0][1] == occ, "the sell must target the STORED symbol"
-    assert strategy._option_stale_recovered == 1, \
-        "a recovered stale contract must be counted"
-    assert "STALE OPTION RECOVERED" in cap.text
+    # The STALE OPTION RECOVERED counter that used to be asserted here was retired
+    # on 2026-08-06 — it was observability over a path that no longer runs, and it
+    # fired on every poll of a healthy position. What it was protecting is exactly
+    # the two assertions above, which is why they are the ones that stayed.
+    assert "STALE OPTION RECOVERED" not in cap.text, \
+        "the retired recompute must not log anything"
 
 
 def test_pre_fix_behaviour_would_have_missed_it():
