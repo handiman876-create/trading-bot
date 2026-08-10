@@ -93,6 +93,10 @@ def _post(path: str, json_body: dict) -> dict:
     return _request("POST", path, json_body=json_body)
 
 
+def _delete(path: str) -> dict:
+    return _request("DELETE", path)
+
+
 def _f(value) -> Optional[float]:
     """Coerce a TradeStation numeric (often a string) to float, or None if absent."""
     if value is None or value == "":
@@ -349,21 +353,47 @@ def _build_order_body(
     order_type:  str,
     duration:    str,
     limit_price: Optional[float],
+    stop_price:  Optional[float] = None,
 ) -> dict:
     """Assemble the request body shared by place (orders) and confirm
     (orderconfirm) so the two paths can never diverge. Route "Intelligent" is
-    accepted (and is the default) for equities, options AND futures."""
+    accepted (and is the default) for equities, options AND futures.
+
+    An unknown order_type RAISES rather than defaulting. It used to fall back to
+    "Market", which is a quiet catastrophe for a stop: a typo'd type would send a
+    MARKET order that fills instantly at any price instead of resting at a
+    trigger. The wrappers below catch the raise and return None, so a bad call
+    now places nothing at all — the only safe failure for an order.
+
+    Trigger/limit prices are rounded to a 0.01 tick, correct for equities and
+    options. FUTURES TICK DIFFERENTLY (ES/NQ 0.25, RTY 0.10) and would be
+    rejected or silently re-ticked by the broker, so place_futures_order refuses
+    the stop path until per-root tick rounding exists. Nothing arms futures stops
+    today (strategy._arm_stop_on_entry is called only from the equity paths).
+    """
+    kind = order_type.lower()
+    ts_type = _ORDER_TYPES.get(kind)
+    if ts_type is None:
+        raise ValueError(f"Unsupported order_type {order_type!r} — expected one "
+                         f"of {sorted(_ORDER_TYPES)}")
+    if kind == "limit" and limit_price is None:
+        raise ValueError("limit order requires limit_price")
+    if kind == "stop" and stop_price is None:
+        raise ValueError("stop order requires stop_price")
+
     body = {
         "AccountID":   account_id,
         "Symbol":      symbol,
         "Quantity":    str(quantity),
-        "OrderType":   _ORDER_TYPES.get(order_type.lower(), "Market"),
+        "OrderType":   ts_type,
         "TradeAction": trade_action,
         "TimeInForce": {"Duration": duration.upper()},
         "Route":       "Intelligent",
     }
-    if order_type.lower() == "limit" and limit_price is not None:
-        body["LimitPrice"] = str(limit_price)
+    if kind == "limit":
+        body["LimitPrice"] = f"{round(limit_price, 2):.2f}"
+    if kind == "stop":
+        body["StopPrice"] = f"{round(stop_price, 2):.2f}"
     return body
 
 
@@ -375,13 +405,14 @@ def _place_order(
     order_type:  str,
     duration:    str,
     limit_price: Optional[float],
+    stop_price:  Optional[float] = None,
 ) -> Optional[dict]:
     """Single dispatch point for equity, option and futures orders.
 
     Returns a Tradier-shaped {"order": {"id": <OrderID>}} on success, or None.
     """
     body = _build_order_body(account_id, symbol, trade_action, quantity,
-                             order_type, duration, limit_price)
+                             order_type, duration, limit_price, stop_price)
 
     data = _post("orderexecution/orders", body)
     orders = data.get("Orders", [])
@@ -401,6 +432,7 @@ def place_equity_order(
     order_type: str = "market",
     duration: str   = "day",
     limit_price: Optional[float] = None,
+    stop_price: Optional[float] = None,
 ) -> Optional[dict]:
     action = _EQUITY_ACTIONS.get(side.lower())
     if action is None:
@@ -408,7 +440,7 @@ def place_equity_order(
         return None
     try:
         return _place_order(account_id, symbol, action, quantity,
-                            order_type, duration, limit_price)
+                            order_type, duration, limit_price, stop_price)
     except Exception as exc:
         logger.error("Equity order failed %s %s %s: %s", side, quantity, symbol, exc)
         return None
@@ -422,6 +454,7 @@ def place_option_order(
     order_type:    str = "market",
     duration:      str = "day",
     limit_price:   Optional[float] = None,
+    stop_price:    Optional[float] = None,
 ) -> Optional[dict]:
     action = _OPTION_ACTIONS.get(side.lower())
     if action is None:
@@ -429,7 +462,7 @@ def place_option_order(
         return None
     try:
         return _place_order(account_id, option_symbol, action, quantity,
-                            order_type, duration, limit_price)
+                            order_type, duration, limit_price, stop_price)
     except Exception as exc:
         logger.error("Option order failed %s %s %s: %s", side, quantity, option_symbol, exc)
         return None
@@ -443,10 +476,19 @@ def place_futures_order(
     order_type:  str = "market",
     duration:    str = "day",
     limit_price: Optional[float] = None,
+    stop_price: Optional[float] = None,
 ) -> Optional[dict]:
     action = _FUTURES_ACTIONS.get(side.lower())
     if action is None:
         logger.error("Unknown futures side: %s", side)
+        return None
+    # Refused, not silently mis-ticked: _build_order_body rounds to 0.01, but ES
+    # and NQ tick at 0.25 and RTY at 0.10, so a rounded stop is an invalid price.
+    # Nothing arms futures stops today; lift this once per-root tick rounding
+    # lands, together in one change so the two can never disagree.
+    if order_type.lower() == "stop" or stop_price is not None:
+        logger.error("Futures stop orders are not supported yet (%s): needs "
+                     "per-root tick rounding (ES/NQ 0.25, RTY 0.10)", symbol)
         return None
     try:
         return _place_order(account_id, symbol, action, quantity,
@@ -464,16 +506,21 @@ def confirm_order(
     order_type:   str = "market",
     duration:     str = "day",
     limit_price:  Optional[float] = None,
+    stop_price:   Optional[float] = None,
 ) -> Optional[dict]:
     """Validate an order WITHOUT placing it, via orderexecution/orderconfirm.
 
     Returns the first Confirmation dict (for futures this includes
     InitialMarginDisplay / EstimatedCost / EstimatedPrice), or None on error.
     Useful as a pre-trade margin check and in the read-only smoke test.
+
+    The body build sits INSIDE the try so the validation raises added to
+    _build_order_body return None here, exactly as they do in the place_*
+    wrappers — a dry run must not be the one path that explodes.
     """
-    body = _build_order_body(account_id, symbol, trade_action, quantity,
-                             order_type, duration, limit_price)
     try:
+        body = _build_order_body(account_id, symbol, trade_action, quantity,
+                                 order_type, duration, limit_price, stop_price)
         data = _post("orderexecution/orderconfirm", body)
     except Exception as exc:
         logger.error("Order confirm failed %s %s x%d: %s",
@@ -530,3 +577,51 @@ def get_order(account_id: str, order_id: str) -> Optional[float]:
             logger.warning("Order %s still pending after 2s (status=%s)",
                            order_id, o.get("StatusDescription"))
     return None
+
+
+def cancel_order(account_id: str, order_id: str) -> bool:
+    """Cancel a working order. Returns True iff it is gone (or already was).
+
+    Built for tearing down a resting broker-native stop when the position leaves
+    by some OTHER route — a state exit, a crisis de-risk, a profit take. Skip
+    that teardown and the stop outlives the position it protected: a GTC sell
+    stop with no shares behind it can fill later and open an unintended SHORT.
+    That is why this returns a bool the caller must actually check rather than
+    firing and forgetting.
+
+    An order that is already filled or already cancelled reports True: the
+    caller's goal is "no live stop for this symbol", and that goal is met. Only
+    a real failure — network, auth, an order still working after a rejected
+    cancel — returns False, which means an orphan may be live and a human needs
+    to look.
+
+    NOTE this is a cancel REQUEST. An order can still fill in the race between
+    the request and the broker acting on it, so a True here means "no longer
+    working", not "never filled". Callers reconciling positions should re-read
+    state rather than assume the cancel won.
+    """
+    try:
+        data = _delete(f"orderexecution/orders/{order_id}")
+    except Exception as exc:
+        # 404 and "order not found" mean the order is already gone, which is the
+        # outcome we wanted; anything else is a genuine failure.
+        msg = str(exc).lower()
+        if "404" in msg or "not found" in msg:
+            logger.info("Cancel %s: order already gone (%s)", order_id, exc)
+            return True
+        logger.error("Cancel FAILED for order %s: %s — a resting stop may still "
+                     "be live at the broker", order_id, exc)
+        return False
+
+    errors = data.get("Errors") or []
+    if errors:
+        text = str(errors).lower()
+        if "not found" in text or "already" in text:
+            logger.info("Cancel %s: nothing to cancel (%s)", order_id, errors)
+            return True
+        logger.error("Cancel REJECTED for order %s: %s — a resting stop may "
+                     "still be live at the broker", order_id, errors)
+        return False
+
+    logger.info("Cancel request accepted for order %s", order_id)
+    return True
