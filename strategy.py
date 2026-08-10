@@ -650,11 +650,184 @@ def _bootstrap_stop(symbol: str, held: int, sig: dict, positions: list[dict],
     return rec
 
 
+# ── Broker-native stop floor (static disaster backstop) ───────────────────────
+# Counters, so we can tell later whether this ever earned its keep. _floor_fires
+# is the one that matters: it should stay at ZERO in normal operation, because a
+# floor that fires means the bot's own stop did not. A climbing _floor_fires is
+# not the feature working — it is the bot failing to exit and the backstop
+# catching what it missed, and each one deserves a look.
+_floors_placed = 0
+_floors_cancelled = 0
+_floor_orphans = 0
+_floor_cancel_failures = 0
+# Latched once the startup reconcile has run, so it stays a startup-only pass and
+# does not add a working-orders fetch to every 60s cycle. A cancel that FAILS is
+# therefore retried on the next restart, not on the next poll — the loud error in
+# _cancel_broker_floor is what surfaces it in the meantime.
+_floors_reconciled = False
+
+
+def _floor_price(entry: float, atr: float, mult: float, direction: str) -> float:
+    """The static GTC backstop level: the INITIAL ATR stop distance, widened by
+    BROKER_STOP_FLOOR_BUFFER so the bot's stop always trips first.
+
+    Deliberately derived from entry and the entry ATR — the same anchors the stop
+    record uses — and NEVER from the current stop_price, which trails. A floor
+    recomputed off a trailed stop would creep toward the market and eventually
+    overtake the bot, which is the exact failure this design exists to avoid.
+    """
+    buf = atr * mult * config.BROKER_STOP_FLOOR_BUFFER
+    return entry + buf if direction == "short" else entry - buf
+
+
+def _place_broker_floor(symbol: str, qty: int, rec: dict,
+                        account_id: str) -> None:
+    """Place the one-time GTC stop behind a freshly armed position.
+
+    Mutates `rec` in place with broker_floor_price / broker_order_id so the
+    caller persists them in the same write as the rest of the stop record. On
+    any failure the keys are simply absent: the position keeps its bot-managed
+    stop and reconcile re-arms the floor on the next startup. A missing floor is
+    a degraded state, never a blocked entry — refusing to hold a position we
+    already bought because a backstop order failed would be strictly worse.
+    """
+    global _floors_placed
+    if not config.ENABLE_BROKER_STOP_FLOOR:
+        return
+    if qty is None or qty < 1 or not account_id:
+        return
+    floor = _floor_price(rec["entry_price"], rec["atr_at_entry"],
+                         rec["atr_mult"], rec["direction"])
+    side = "buy_to_cover" if rec["direction"] == "short" else "sell"
+    result = tc.place_equity_order(account_id, symbol, side, qty,
+                                   order_type="stop", duration="gtc",
+                                   stop_price=floor)
+    if not result:
+        logger.error("BROKER FLOOR %s: placement FAILED — position holds its "
+                     "bot-managed stop only (no gap protection until reconcile)",
+                     symbol)
+        return
+    order_id = result.get("order", {}).get("id")
+    rec["broker_floor_price"] = round(floor, 2)
+    rec["broker_order_id"] = order_id
+    _floors_placed += 1
+    logger.info("BROKER FLOOR %s %s x%d @ %.2f GTC (entry=%.2f, %.1fx ATR x %.1f "
+                "buffer, bot stop=%.2f) order=%s — floors #%d",
+                symbol, side, qty, floor, rec["entry_price"], rec["atr_mult"],
+                config.BROKER_STOP_FLOOR_BUFFER, rec["stop_price"], order_id,
+                _floors_placed)
+
+
+def _cancel_broker_floor(symbol: str, rec: Optional[dict],
+                         account_id: Optional[str]) -> bool:
+    """Cancel the resting floor behind a position that is leaving. True if gone.
+
+    Called from EVERY exit route. A floor that outlives its position is not
+    inert: a GTC sell stop with no shares behind it fills into a fresh SHORT the
+    next time price trades through it. A False return is logged loudly because
+    it means exactly that risk is live.
+    """
+    global _floors_cancelled, _floor_cancel_failures
+    if not rec:
+        return True
+    order_id = rec.get("broker_order_id")
+    if not order_id or not account_id:
+        return True
+    if tc.cancel_order(account_id, order_id):
+        _floors_cancelled += 1
+        logger.info("BROKER FLOOR %s: cancelled order %s — cancels #%d",
+                    symbol, order_id, _floors_cancelled)
+        return True
+    _floor_cancel_failures += 1
+    logger.error("BROKER FLOOR %s: cancel FAILED for order %s — an orphaned GTC "
+                 "stop may still be resting and could open an unintended "
+                 "position; startup reconcile will retry — failures #%d",
+                 symbol, order_id, _floor_cancel_failures)
+    return False
+
+
+def _release_stop(symbol: str, account_id: Optional[str] = None) -> None:
+    """Tear down a position's protection: cancel the broker floor, drop the
+    record. The single teardown entry point — _clear_stop alone would leave the
+    broker order resting, so every exit route calls THIS."""
+    stops = _load_stops()
+    _cancel_broker_floor(symbol, stops.get(symbol), account_id)
+    if symbol in stops:
+        del stops[symbol]
+        _save_stops(stops)
+
+
+def reconcile_broker_floors(positions: list[dict], account_id: str) -> None:
+    """Cancel orphaned floors and re-arm missing ones. Called once at startup.
+
+    The broker's working-order list is the authority here, NOT the order ids in
+    stop_prices.json — mirroring reconcile_stops, which treats `positions` as
+    the authority for the same reason. A stored id says what we last did; only
+    the broker says what is actually resting.
+
+    Bails on a None fetch: that means the API call failed, and treating it as
+    "nothing is resting" would cancel nothing while re-arming duplicates on top
+    of floors that are still live.
+    """
+    global _floor_orphans, _floors_reconciled
+    if not config.ENABLE_BROKER_STOP_FLOOR:
+        return
+    if _floors_reconciled:
+        return                            # one-shot per process (startup only)
+    working = tc.get_working_orders(account_id)
+    if working is None:
+        logger.warning("BROKER FLOOR reconcile skipped: working-order fetch "
+                       "failed — not cancelling or re-arming on an unknown state")
+        return
+    stops = _load_stops()
+    held = {p.get("symbol"): int(p.get("quantity", 0)) for p in positions
+            if p.get("symbol")}
+    known_ids = {r.get("broker_order_id") for r in stops.values()
+                 if r.get("broker_order_id")}
+
+    # 1. Orphans: a resting stop we own the id for, but hold no position behind.
+    for o in working:
+        if str(o.get("order_type", "")).lower() not in ("stopmarket", "stop"):
+            continue
+        oid, sym = o.get("order_id"), o.get("symbol")
+        if oid not in known_ids:
+            continue                      # not ours — leave manual orders alone
+        if held.get(sym):
+            continue                      # position still open, floor is correct
+        if tc.cancel_order(account_id, oid):
+            _floor_orphans += 1
+            logger.warning("BROKER FLOOR ORPHAN %s: resting stop %s with no "
+                           "position — cancelled (orphans #%d)",
+                           sym, oid, _floor_orphans)
+
+    # 2. Missing: a held position whose stop record has no live resting floor.
+    live_ids = {o.get("order_id") for o in working}
+    changed = False
+    for sym, rec in stops.items():
+        qty = held.get(sym)
+        if not qty or config.is_occ_symbol(sym):
+            continue
+        if rec.get("broker_order_id") in live_ids:
+            continue                      # already protected
+        rec.pop("broker_order_id", None)   # stale id: broker says it is gone
+        rec.pop("broker_floor_price", None)
+        _place_broker_floor(sym, abs(qty), rec, account_id)
+        changed = bool(rec.get("broker_order_id")) or changed
+    if changed:
+        _save_stops(stops)
+    # Latched only after a pass that actually saw the broker's state, so a
+    # transient fetch failure at startup retries next cycle instead of leaving
+    # the process permanently un-reconciled.
+    _floors_reconciled = True
+
+
 def _arm_stop_on_entry(symbol: str, entry_price: float, atr: Optional[float],
                        direction: str = "long", regime: str = "risk_on",
                        signal_price: Optional[float] = None,
                        fill_price: Optional[float] = None,
-                       slippage: Optional[float] = None) -> None:
+                       slippage: Optional[float] = None,
+                       qty: Optional[int] = None,
+                       account_id: Optional[str] = None) -> None:
     """Create a fresh stop record after a BUY (long) or SELLSHORT (short) fills.
     The stop WIDTH is the regime's ATR multiple (risk_on 2.5 → crisis 1.0),
     persisted as "atr_mult" and reused for all later trailing so the width is
@@ -687,6 +860,10 @@ def _arm_stop_on_entry(symbol: str, entry_price: float, atr: Optional[float],
         stop = entry_price - mult * atr
         rec["high_water"] = round(entry_price, 4)
     rec["stop_price"] = round(stop, 4)
+    # Broker floor placed BEFORE the save so the order id lands in the same write
+    # as the record it belongs to. A crash between the two would otherwise leave
+    # a resting GTC order nobody remembers placing.
+    _place_broker_floor(symbol, qty, rec, account_id)
     stops = _load_stops()
     stops[symbol] = rec
     _save_stops(stops)
@@ -878,6 +1055,10 @@ def _check_and_trail_stop(symbol: str, held: int, sig: dict,
         result = tc.place_equity_order(account_id, symbol, exit_side, exit_qty)
         if result:
             _stop_exits += 1
+            # Fourth teardown route. Deliberately _cancel_broker_floor and not
+            # _release_stop: this path already holds `stops` and saves it below,
+            # and _release_stop would reload/rewrite the file underneath it.
+            _cancel_broker_floor(symbol, rec, account_id)
             stops.pop(symbol, None)
             _save_stops(stops)
             # Mark BOTH gates: a stop-out should block every same-day signal for
@@ -942,6 +1123,18 @@ def _maybe_take_profit(symbol: str, held: int, sig: dict, account_id: str) -> bo
         return False
     _profit_takes += 1
     rec["profit_taken"] = True               # latch BEFORE anything else can re-read
+    # Resize the broker floor to the shares that REMAIN. The floor was sized for
+    # the full position; left alone it would try to sell more than we hold and
+    # open a short on the difference. This is the one place the "never update the
+    # floor" rule bends, and it bends for a QUANTITY change, not a price change —
+    # one-shot per position (profit_taken latches above), so two API calls in a
+    # position's entire lifetime, not two per trail.
+    remaining = held - sell_qty
+    if remaining > 0 and rec.get("broker_order_id"):
+        _cancel_broker_floor(symbol, rec, account_id)
+        rec.pop("broker_order_id", None)
+        rec.pop("broker_floor_price", None)
+        _place_broker_floor(symbol, remaining, rec, account_id)
     stops[symbol] = rec
     _save_stops(stops)                       # record kept -> remainder keeps its stop
     order_id = result.get("order", {}).get("id")
@@ -1135,7 +1328,8 @@ def _enter_long(symbol: str, sig: dict, price: float, account_id: str,
         log_trade("BUY", symbol, qty, price, "market", order_id, reason,
                   fill_price=fill_px, signal_price=price, slippage=slippage)
         _arm_stop_on_entry(symbol, entry_px, sig.get("atr"), regime=regime,
-                           signal_price=price, fill_price=fill_px, slippage=slippage)
+                           signal_price=price, fill_price=fill_px, slippage=slippage,
+                           qty=qty, account_id=account_id)
         return True
     return False
 
@@ -1172,7 +1366,7 @@ def _enter_short(symbol: str, sig: dict, price: float, account_id: str,
                   fill_price=fill_px, signal_price=price, slippage=slippage)
         _arm_stop_on_entry(symbol, entry_px, sig.get("atr"), direction="short",
                            regime=regime, signal_price=price, fill_price=fill_px,
-                           slippage=slippage)
+                           slippage=slippage, qty=qty, account_id=account_id)
         return True
     return False
 
@@ -1391,7 +1585,7 @@ def evaluate_stock(symbol: str, account_id: str, positions: list[dict],
                 order_id = result.get("order", {}).get("id")
                 _log_exit_trade("SELL", symbol, held, price, order_id,
                                 "VIX crisis de-risk", account_id)
-                _clear_stop(symbol)
+                _release_stop(symbol, account_id)
             else:
                 logger.error("CRISIS SELL %s FAILED — retry next cycle", symbol)
             return
@@ -1420,7 +1614,7 @@ def evaluate_stock(symbol: str, account_id: str, positions: list[dict],
             _log_exit_trade("SELL", symbol, held, price, order_id,
                             f"EMA bearish, RSI={sig['rsi']:.1f}", account_id)
             _note_state_only_exit(symbol, sig, "bearish_cross")
-            _clear_stop(symbol)
+            _release_stop(symbol, account_id)
         return
 
     # COVER — close a short whenever the trend is bullish (mirror of SELL).
@@ -1435,7 +1629,7 @@ def evaluate_stock(symbol: str, account_id: str, positions: list[dict],
             _log_exit_trade("BUY_TO_COVER", symbol, qty, price, order_id,
                             f"EMA bullish (cover), RSI={sig['rsi']:.1f}", account_id)
             _note_state_only_exit(symbol, sig, "bullish_cross")
-            _clear_stop(symbol)
+            _release_stop(symbol, account_id)
         return
 
     # ── ENTRIES ───────────────────────────────────────────────────────────────

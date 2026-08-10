@@ -556,6 +556,28 @@ VIX_CRISIS_SHADOW = True
 ENABLE_BREAKEVEN_LOCK = True
 BREAKEVEN_LOCK_ATR    = 1.0    # favorable excursion (in entry-ATRs) required to arm
 
+# ── Broker-native stop floor (disaster backstop) ──────────────────────────────
+# The bot's ATR stop lives in this process: it only exists while the bot is
+# running and the market is open. It cannot protect against an overnight gap or
+# against the bot being down, because nothing is resting at the broker.
+#
+# This places ONE GTC stop order at entry and never moves it. It sits BEYOND the
+# initial ATR stop by BROKER_STOP_FLOOR_BUFFER, so the bot's stop — which starts
+# at the ATR level and only ever ratchets AWAY from the floor — always triggers
+# first in normal trading. The floor is reached only if the bot is dead or price
+# gaps clean through everything.
+#
+# The buffer must be > 1.0. At 1.0 the floor sits exactly ON the initial ATR stop
+# and the two race on day one, which is the one thing this design must not do:
+# a broker floor that can fire before the bot's stop turns every exit into a
+# market order at an untrailed level. DO NOT set this to 1.0 or below.
+#
+# Honest limit: a stop-market becomes a MARKET order when triggered, so a gap
+# fills at the gapped price, not at the floor. This bounds whether you are still
+# in the trade, not what the gap costs.
+ENABLE_BROKER_STOP_FLOOR = False   # off until proven; see reconcile on startup
+BROKER_STOP_FLOOR_BUFFER = 1.2     # multiple of the initial ATR stop distance
+
 # ── Polygon.io (momentum-screen data source; free tier) ───────────────────────
 POLYGON_API_KEY  = os.environ.get("POLYGON_API_KEY", "")
 POLYGON_BASE_URL = "https://api.polygon.io"

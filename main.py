@@ -163,6 +163,13 @@ def _run_cycle(account_id: str) -> None:
     # equity stop. Guarded internally against an empty/failed positions fetch too.
     strategy.reconcile_stops(positions)
 
+    # Broker-native stop floors: cancel any GTC stop left resting behind a
+    # position we no longer hold, and re-arm a held position whose floor the
+    # broker says is gone. Self-latching to a single pass per process, so this
+    # costs one working-orders fetch at startup and nothing thereafter. No-op
+    # while ENABLE_BROKER_STOP_FLOOR is False.
+    strategy.reconcile_broker_floors(positions, account_id)
+
     # Momentum slot + rotation id, read once per cycle. is_momentum drives the
     # one-shot alignment entry; generation re-arms the latch each new rotation.
     momentum_symbols, generation = watchlist.momentum_slot()

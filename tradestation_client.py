@@ -579,6 +579,52 @@ def get_order(account_id: str, order_id: str) -> Optional[float]:
     return None
 
 
+# Terminal states — an order in any of these is finished and is NOT resting.
+_DONE_STATUSES = {"filled", "canceled", "cancelled", "rejected", "expired",
+                  "replaced", "out", "too late to cancel"}
+
+
+def get_working_orders(account_id: str) -> Optional[list[dict]]:
+    """Orders still WORKING at the broker right now, or None on error.
+
+    Distinct from get_historical_orders, which reports only FINISHED orders.
+    This is the live view a reconcile needs: to answer "is a stop actually
+    resting behind this position" you have to ask the broker. A stored order id
+    cannot answer it — the broker can fill, cancel or expire an order without
+    telling us, so the stored value ages out of agreement with reality exactly
+    the way any other derived field does.
+
+    Same None-vs-[] contract as get_positions, and for the same reason: None
+    means the fetch FAILED and the caller must not read it as "nothing is
+    resting" (that would cancel nothing and re-arm duplicates); [] means there
+    genuinely are no working orders.
+    """
+    try:
+        data = _get(f"brokerage/accounts/{account_id}/orders")
+    except Exception as exc:
+        logger.error("Working-orders fetch failed: %s", exc)
+        return None
+    out = []
+    for o in data.get("Orders", []):
+        status = str(o.get("StatusDescription", "")).strip().lower()
+        if status in _DONE_STATUSES:
+            continue
+        legs = o.get("Legs") or []
+        leg = legs[0] if legs else {}
+        out.append({
+            "order_id":   str(o.get("OrderID")),
+            "symbol":     leg.get("Symbol"),
+            "action":     leg.get("BuyOrSell"),
+            "quantity":   _f(leg.get("QuantityOrdered")),
+            "order_type": o.get("OrderType"),
+            "stop_price": _f(o.get("StopPrice")),
+            "duration":   (o.get("Duration") or
+                           (o.get("TimeInForce") or {}).get("Duration")),
+            "status":     o.get("StatusDescription"),
+        })
+    return out
+
+
 def cancel_order(account_id: str, order_id: str) -> bool:
     """Cancel a working order. Returns True iff it is gone (or already was).
 
