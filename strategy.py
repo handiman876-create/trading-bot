@@ -803,6 +803,7 @@ def reconcile_broker_floors(positions: list[dict], account_id: str) -> None:
     # 2. Missing: a held position whose stop record has no live resting floor.
     live_ids = {o.get("order_id") for o in working}
     changed = False
+    unplaced = 0
     for sym, rec in stops.items():
         qty = held.get(sym)
         if not qty or config.is_occ_symbol(sym):
@@ -812,12 +813,21 @@ def reconcile_broker_floors(positions: list[dict], account_id: str) -> None:
         rec.pop("broker_order_id", None)   # stale id: broker says it is gone
         rec.pop("broker_floor_price", None)
         _place_broker_floor(sym, abs(qty), rec, account_id)
-        changed = bool(rec.get("broker_order_id")) or changed
+        if rec.get("broker_order_id"):
+            changed = True
+        else:
+            unplaced += 1
     if changed:
         _save_stops(stops)
-    # Latched only after a pass that actually saw the broker's state, so a
-    # transient fetch failure at startup retries next cycle instead of leaving
-    # the process permanently un-reconciled.
+    # Latch only on a CLEAN pass. Two ways this stays unlatched and retries next
+    # cycle: the working-order fetch failed above (unknown broker state), or a
+    # placement failed here. The second matters most on the first run after
+    # enabling — if the broker rejects the order shape, every position is left
+    # unfloored, and latching would mean no retry until someone restarts the bot.
+    if unplaced:
+        logger.warning("BROKER FLOOR reconcile incomplete: %d position(s) still "
+                       "unfloored — will retry next cycle", unplaced)
+        return
     _floors_reconciled = True
 
 

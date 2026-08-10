@@ -362,3 +362,15 @@ if __name__ == "__main__":
     finally:
         (strategy.tc.place_equity_order, strategy.log_trade,
          config.ENABLE_BROKER_STOP_FLOOR, config.BROKER_STOP_FLOOR_BUFFER) = _orig
+
+
+def test_reconcile_does_not_latch_when_a_placement_fails():
+    """The first run after enabling is where the order shape gets its real test.
+    If the broker rejects it, every position is left unfloored — latching there
+    would mean no retry until someone restarts the bot."""
+    _reset()
+    stops = {"HELD": _rec(100.0, 4.0, 2.5, "long", 90.0)}
+    strategy._save_stops(stops)
+    strategy.tc.place_equity_order = lambda *a, **k: None      # broker rejects
+    strategy.reconcile_broker_floors([{"symbol": "HELD", "quantity": 10}], "ACCT")
+    assert strategy._floors_reconciled is False, "must retry, not latch"
