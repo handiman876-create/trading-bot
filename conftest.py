@@ -101,6 +101,16 @@ def isolate_bot_state(tmp_path, monkeypatch):
     monkeypatch.setattr(strategy, "_MOM_ENTRIES_PATH", str(tmp_path / "momentum_entries.json"), raising=False)
     monkeypatch.setattr(strategy, "_OPT_POSITIONS_PATH", str(tmp_path / "options_positions.json"), raising=False)
 
+    # The broker stop floor is OFF for every test unless the test opts in. It
+    # reaches the network through tc.place_equity_order with keyword arguments
+    # (order_type/duration/stop_price), and the stubs across the older test
+    # modules are positional-only `(account_id, symbol, side, qty)` — so with the
+    # live flag True, every module that arms a stop dies on a TypeError from a
+    # feature it never asked about. Pinning it here keeps the suite hermetic
+    # against the live config value, which is the whole point of this fixture.
+    # test_broker_floor.py sets it True per-test and restores it.
+    monkeypatch.setattr(config, "ENABLE_BROKER_STOP_FLOOR", False, raising=False)
+
     # performance_analyzer, if a test drives its file-writing paths.
     try:
         import performance_analyzer as pa
