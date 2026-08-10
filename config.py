@@ -575,7 +575,9 @@ BREAKEVEN_LOCK_ATR    = 1.0    # favorable excursion (in entry-ATRs) required to
 # Honest limit: a stop-market becomes a MARKET order when triggered, so a gap
 # fills at the gapped price, not at the floor. This bounds whether you are still
 # in the trade, not what the gap costs.
-ENABLE_BROKER_STOP_FLOOR = False   # off until proven; see reconcile on startup
+ENABLE_BROKER_STOP_FLOOR = True    # enabled 2026-08-10; order shape validated
+                                   # against orderconfirm (both SELL and
+                                   # BUYTOCOVER stop/GTC) before flipping
 BROKER_STOP_FLOOR_BUFFER = 1.2     # multiple of the initial ATR stop distance
 
 # ── Polygon.io (momentum-screen data source; free tier) ───────────────────────
