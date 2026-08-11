@@ -73,7 +73,19 @@ def test_get_order_pending_then_filled_retries_once():
         tc._get, tc.time.sleep = orig_get, orig_sleep
 
 
-def test_get_order_still_pending_after_retry_returns_none():
+def test_get_order_still_pending_after_retries_returns_none():
+    """An order that never fills is polled up the backoff ladder and then given
+    up on.
+
+    This asserted exactly 2 polls until 2026-08-11, when the ladder was widened
+    to _ORDER_POLL_BACKOFF so a slow fill on a thin name gets priced at its real
+    fill rather than the signal bar. The count is read from the tuple rather
+    than hard-coded so tuning the ladder does not mean editing this test.
+
+    NOTE this ladder applies to WORKING orders only. A rejected order is
+    terminal and short-circuits without sleeping at all — see
+    test_order_outcome.test_rejection_is_never_retried.
+    """
     calls = {"n": 0}
 
     def fake_get(path, params=None):
@@ -84,7 +96,7 @@ def test_get_order_still_pending_after_retry_returns_none():
     tc._get, tc.time.sleep = fake_get, lambda s: None
     try:
         assert tc.get_order("ACCT", "T1") is None
-        assert calls["n"] == 2, "one retry then give up, no more"
+        assert calls["n"] == len(tc._ORDER_POLL_BACKOFF) + 1, calls
     finally:
         tc._get, tc.time.sleep = orig_get, orig_sleep
 

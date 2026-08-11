@@ -568,6 +568,23 @@ def _order_failed(o: dict) -> bool:
     return desc in _FAILED_STATUSES or code in _FAILED_STATUS_CODES
 
 
+# Backoff between polls of an order that is still WORKING, in seconds; the tuple
+# length sets the poll count (4 polls, 14s of waiting worst case).
+#
+# Scoped to the working case ON PURPOSE. A terminal order short-circuits above,
+# because no amount of waiting turns a rejection into a fill: polling GOOGL's
+# rejected order five times would have returned REJ five times and delayed the
+# retry-next-cycle by a full loop. Retries buy fill-price ACCURACY on a slow
+# fill, not rejection detection — that is the dead/working split's job.
+#
+# Bounded deliberately: this blocks inside the 60s trading cycle, which also has
+# ~25 symbols to poll, so every second here is dead time the rest of the loop
+# does not get. Giving up early costs only a signal-priced ledger entry (the
+# exit itself already happened), which is why the ceiling stays well under the
+# cycle budget rather than chasing certainty.
+_ORDER_POLL_BACKOFF = (2, 4, 8)
+
+
 def get_order_outcome(account_id: str, order_id: str) -> dict:
     """What actually happened to an order.
 
@@ -596,7 +613,7 @@ def get_order_outcome(account_id: str, order_id: str) -> dict:
     order "still pending", and the reason had to be pulled from the API by hand.
     """
     status = None
-    for attempt in (1, 2):
+    for attempt in range(1, len(_ORDER_POLL_BACKOFF) + 2):
         try:
             data = _get(f"brokerage/accounts/{account_id}/orders/{order_id}")
         except Exception as exc:
@@ -633,14 +650,21 @@ def get_order_outcome(account_id: str, order_id: str) -> dict:
                          order_id, status, f": {reason}" if reason else "")
             return {"state": "dead", "fill_price": None,
                     "reason": reason, "status": status}
-        # Genuinely still working (Received/Sent, no price yet). Retry once.
-        if attempt == 1:
-            logger.info("Order %s still working (status=%s) — retrying in 2s",
-                        order_id, status)
-            time.sleep(2)
+        # Genuinely still working (Received/Sent, no price yet) — the ONE case
+        # where waiting can change the answer. Back off and re-ask.
+        if attempt <= len(_ORDER_POLL_BACKOFF):
+            delay = _ORDER_POLL_BACKOFF[attempt - 1]
+            logger.info("Order %s still working (status=%s) — poll %d/%d, "
+                        "retrying in %ds", order_id, status, attempt,
+                        len(_ORDER_POLL_BACKOFF) + 1, delay)
+            time.sleep(delay)
         else:
-            logger.warning("Order %s still working after 2s (status=%s)",
-                           order_id, status)
+            logger.warning("Order %s STILL working after %d polls / %ds "
+                           "(status=%s) — reporting unfilled. The exit itself is "
+                           "unaffected; only the price it gets LOGGED at is, "
+                           "which falls back to the signal bar.",
+                           order_id, len(_ORDER_POLL_BACKOFF) + 1,
+                           sum(_ORDER_POLL_BACKOFF), status)
     return {"state": "working", "fill_price": None,
             "reason": None, "status": status}
 

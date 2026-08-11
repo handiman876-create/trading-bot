@@ -83,6 +83,63 @@ def test_working_order_is_not_dead():
     assert out["state"] == "working", out
 
 
+# ── Polling and backoff ───────────────────────────────────────────────────────
+
+def test_working_order_is_polled_with_backoff():
+    """A slow fill gets the full ladder, so a thin name that takes >2s is priced
+    at its real fill instead of the signal bar."""
+    slept, calls = [], []
+    orig, orig_sleep = tc._get, tc.time.sleep
+
+    def _count(path, params=None):
+        calls.append(path)
+        return _resp("Received", status="ACK")
+    tc._get, tc.time.sleep = _count, slept.append
+    try:
+        tc.get_order_outcome("ACCT", "X1")
+    finally:
+        tc._get, tc.time.sleep = orig, orig_sleep
+    assert slept == list(tc._ORDER_POLL_BACKOFF), slept
+    assert len(calls) == len(tc._ORDER_POLL_BACKOFF) + 1, calls
+
+
+def test_a_fill_arriving_mid_backoff_ends_the_polling():
+    """The ladder must stop the moment the fill lands, not run to its end."""
+    seq = [_resp("Received", status="ACK"),
+           _resp("Filled", status="FLL", filled_price=349.91)]
+    slept = []
+    orig, orig_sleep = tc._get, tc.time.sleep
+    tc._get = lambda path, params=None: seq.pop(0)
+    tc.time.sleep = slept.append
+    try:
+        out = tc.get_order_outcome("ACCT", "X1")
+    finally:
+        tc._get, tc.time.sleep = orig, orig_sleep
+    assert out["state"] == "filled" and out["fill_price"] == 349.91, out
+    assert len(slept) == 1, slept
+
+
+def test_rejection_is_never_retried():
+    """THE correction. A rejection is TERMINAL — polling it five times returns
+    the same REJ five times, 14 seconds later, and delays the retry-next-cycle
+    by a full loop. Backoff buys fill-price accuracy on slow fills; it does
+    nothing whatsoever for refusals."""
+    slept, calls = [], []
+    orig, orig_sleep = tc._get, tc.time.sleep
+
+    def _count(path, params=None):
+        calls.append(path)
+        return _GOOGL_REJECTION
+    tc._get, tc.time.sleep = _count, slept.append
+    try:
+        out = tc.get_order_outcome("ACCT", "X1")
+    finally:
+        tc._get, tc.time.sleep = orig, orig_sleep
+    assert out["state"] == "dead", out
+    assert calls == calls[:1], calls          # exactly one lookup
+    assert slept == [], "a terminal order must not sleep at all"
+
+
 def test_filled_order_reports_price():
     with _with_get(_resp("Filled", status="FLL", filled_price=349.91)):
         out = tc.get_order_outcome("ACCT", "X1")

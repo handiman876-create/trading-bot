@@ -162,6 +162,21 @@ def test_rejected_exit_reports_failure_and_rearms_the_floor():
     assert rec.get("broker_order_id"), "floor id must be restored on the record"
 
 
+def test_rejected_exit_logs_a_critical_with_the_broker_reason(caplog):
+    """A refused exit must be findable in the log at CRITICAL, carrying the
+    broker's own words. On 2026-08-11 nothing marked the failure at all: the
+    only trace was two lines calling a rejected order 'still pending', and the
+    reason existed nowhere outside the API response."""
+    import logging
+    rec = _setup(exit_state="rejected")
+    with caplog.at_level(logging.CRITICAL):
+        strategy._submit_exit_order("GOOGL", "sell", 127, "ACCT", rec)
+    blob = caplog.text
+    assert "CRITICAL: EXIT ORDER REJECTED" in blob, blob
+    assert "remaining on sell orders" in blob, blob
+    assert "STILL OPEN" in blob, blob
+
+
 def test_stuck_floor_blocks_the_exit_and_keeps_the_order_id():
     """If we cannot confirm the floor is gone we must not submit — but we also
     must not drop the order id, or the floor is orphaned beyond recall. Keeping
@@ -223,12 +238,18 @@ def test_rejected_stop_exit_keeps_the_stop_record():
 if __name__ == "__main__":
     strategy._STOPS_PATH = _testlib.assert_disposable(
         tempfile.mkdtemp()) + "/stop_prices.json"
+    import inspect
     import sys
     mod = sys.modules[__name__]
     for name in [n for n in dir(mod) if n.startswith("test_")]:
+        fn = getattr(mod, name)
+        if inspect.signature(fn).parameters:
+            # Takes a pytest fixture (caplog); only reachable under pytest.
+            print("skip", name, "(needs pytest fixtures)")
+            continue
         saved = _snapshot()            # same isolation pytest's fixture gives
         try:
-            getattr(mod, name)()
+            fn()
         finally:
             _restore(saved)
         print("ok", name)

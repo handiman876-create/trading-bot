@@ -791,10 +791,16 @@ def _wait_floor_clear(symbol: str, floor_id: str, account_id: str,
         if attempt < tries:
             time.sleep(delay)
     _floor_clear_stuck += 1
-    logger.error("BROKER FLOOR %s: floor %s STILL not clear after %d polls — "
-                 "holding off the exit rather than having it refused; will "
-                 "retry next cycle — stuck #%d",
-                 symbol, floor_id, tries, _floor_clear_stuck)
+    # Also CRITICAL: the cancel was accepted, so the floor is probably already
+    # gone, and we are declining to submit the exit — which is precisely the
+    # naked-position state GOOGL sat in for three hours. It self-heals on the
+    # next cycle, but nobody should have to infer that from an INFO line.
+    logger.critical(
+        "CRITICAL: BROKER FLOOR %s — floor %s STILL not confirmed clear after "
+        "%d polls. Holding the exit rather than having it refused, so the "
+        "position may be OPEN AND UNPROTECTED right now. Retrying next cycle; "
+        "if this repeats, MANUAL INTERVENTION REQUIRED — stuck #%d",
+        symbol, floor_id, tries, _floor_clear_stuck)
     return "stuck"
 
 
@@ -868,11 +874,19 @@ def _submit_exit_order(symbol: str, side: str, qty: int, account_id: str,
     state = outcome.get("state")
     if state == "dead":
         _exit_rejections += 1
-        logger.error("EXIT %s %s x%d REJECTED by broker (order %s, status=%s): "
-                     "%s — position is STILL OPEN, not logging a trade, "
-                     "re-arming protection — rejections #%d",
-                     symbol, side, qty, order_id, outcome.get("status"),
-                     outcome.get("reason") or "no reason given", _exit_rejections)
+        # CRITICAL, not ERROR: the bot wanted out of this position and the
+        # broker refused. It retries next cycle, but a rejection that REPEATS
+        # (an entitlement problem, a bad symbol, a stuck reservation) will never
+        # clear itself, and the position stays open the whole time. Nothing
+        # marked this at all on 2026-08-11 — the only trace of the GOOGL refusal
+        # was two INFO/WARNING lines calling it "still pending".
+        logger.critical(
+            "CRITICAL: EXIT ORDER REJECTED — %s %s x%d (order %s, status=%s): "
+            "%s | POSITION IS STILL OPEN and the bot could not close it. "
+            "Retrying next cycle; if this repeats, MANUAL INTERVENTION REQUIRED "
+            "— rejections #%d",
+            symbol, side, qty, order_id, outcome.get("status"),
+            outcome.get("reason") or "no reason given", _exit_rejections)
         _rearm_floor_after_failed_exit(symbol, rearm_qty, rec, account_id)
         return None, "failed"
     if state == "unknown":
