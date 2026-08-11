@@ -3,6 +3,54 @@
 Deferred work and known limitations that are observed but not actively
 prioritized. Each entry: what was seen, where, and the proposed direction.
 
+## CRITICAL log lines reach no one — REQUIRED BEFORE GOING LIVE
+
+As of 2026-08-11 the bot logs `CRITICAL` on the two states where it wanted out
+of a position and could not get out:
+
+- **Exit rejected by the broker** — the position is still open, carrying the
+  broker's own `RejectReason`.
+- **Floor cancel will not confirm** — the exit is withheld rather than risk a
+  refusal, so the position may be open *and unprotected*.
+
+Both retry on the next cycle, so a transient failure self-clears. A **repeating**
+one never does: an entitlement problem, a bad symbol, or a stuck share
+reservation will refuse the exit identically every cycle while the position sits
+there.
+
+**The gap: CRITICAL goes to `bot.log` and nowhere else.** There is no alert
+channel in this repo. Nothing pages, emails, or pushes. The line only "catches"
+a failure when a human happens to read the log — which is exactly how the
+2026-08-11 GOOGL incident ran for three hours before anyone noticed, and that
+was with the failure logged at INFO/WARNING as "still pending". CRITICAL makes
+it *findable*; it does not make it *noticed*.
+
+Proposed directions, cheapest first:
+
+- **Scan in an existing timer.** `performance-analyzer.timer` already runs and
+  already writes a report a human reads. A `grep -c CRITICAL` over `bot.log*`
+  (plus the `.gz` archives — `bot.log` holds one day only) costs nothing and
+  needs no new infrastructure. Weakness: weekly cadence is far too slow for an
+  open unprotected position.
+- **systemd `OnFailure=`.** Clean and native, but it fires on *process* failure,
+  and a CRITICAL here does **not** crash the bot — the whole design is to keep
+  trading and retry. Would need the bot to exit non-zero on a repeat count, which
+  conflicts with "degrade, don't die". Probably wrong for this.
+- **A dedicated cron scan + webhook/email**, every 5–15 min over the tail of
+  `bot.log`, alerting on new CRITICAL lines since the last watermark. Most likely
+  the right answer. Needs a watermark file so a single event does not re-alert
+  forever, and must fail non-zero itself if the scan cannot run (see the
+  fail-safe-is-not-exit-0 rule).
+
+Counters already exist for the underlying conditions (`_exit_rejections`,
+`_floor_clear_stuck`, `_floor_rearms`), so an alert can key off those rather than
+scraping text — but they are per-process and reset on restart, so a scan needs
+the log either way.
+
+**This is paper trading today. Do not go live without an alert channel** — the
+whole failure class is "the bot believes it closed a position it did not", and
+in a live account that is real money left exposed with no one watching.
+
 ## A/B tracker: option IV needs an entitled Polygon key
 
 **Observed (2026-07-19):** `screen_ab_tracker.py` records `avg_iv` per screen via

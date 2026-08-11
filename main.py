@@ -401,6 +401,13 @@ def main() -> None:
                 "(unknown != flat); ERROR after %d consecutive — stops are "
                 "unenforced during an outage",
                 _POSITIONS_FAILURE_ESCALATE_AFTER)
+    # Both modes: exit submission is shared, so this reports outside the branch.
+    logger.info("Exit alerts : CRITICAL on rejection (broker refused the exit — "
+                "position still open) and on a floor cancel that will not "
+                "confirm (exit withheld — position may be open AND unprotected). "
+                "Both retry next cycle; a REPEATING one never self-clears. Goes "
+                "to bot.log ONLY — there is no alert channel, so nothing pages "
+                "you. Counters: EXIT ORDER REJECTED, BROKER FLOOR stuck")
     if config.ENABLE_VIX_FILTER:
         logger.info("VIX filter  : ENABLED — %s, %ds cache; risk_on/cautious/"
                     "defensive/crisis @ <%g/%g/%g/>=%g (crisis>=%g EXTREME); "
