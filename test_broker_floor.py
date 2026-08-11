@@ -34,7 +34,12 @@ def _fake_place(account_id, symbol, side, qty, order_type="market",
     _placed.append({"symbol": symbol, "side": side, "qty": qty,
                     "order_type": order_type, "duration": duration,
                     "stop_price": stop_price})
-    return {"order": {"id": f"FLOOR{len(_placed)}"}}
+    # Floors are the only STOP orders these tests place; exits are market orders.
+    # Distinct id prefixes let _fake_outcome answer the two different questions
+    # ("is this floor out of the way?" vs "did this exit fill?") without
+    # conflating them — the exit path now asks both.
+    prefix = "FLOOR" if order_type == "stop" else "EXIT"
+    return {"order": {"id": f"{prefix}{len(_placed)}"}}
 
 
 def _fake_cancel(account_id, order_id):
@@ -46,6 +51,29 @@ def _fake_working(account_id):
     return None if _working_fails else list(_working)
 
 
+# What get_order_outcome reports for a cancelled floor. "dead" is the normal
+# post-cancel answer and the only one that lets an exit proceed; the others let a
+# test drive the branches that must NOT submit — "working" (cancel not through
+# yet) and "filled" (the floor closed the position first).
+_floor_outcome = {"state": "dead", "fill_price": None,
+                  "reason": None, "status": "UROut"}
+
+
+def _fake_outcome(account_id, order_id):
+    """Stand-in for tc.get_order_outcome.
+
+    Exit orders are the ids _fake_place hands out (FLOOR<n>); anything the test
+    has not specifically staged is reported as a clean fill so exit paths run to
+    completion. Without this stub these tests hit the live API — the profit-take
+    test was doing exactly that and only surfaced when the exit path started
+    consulting order state.
+    """
+    if str(order_id).startswith("FLOOR"):
+        return dict(_floor_outcome)
+    return {"state": "filled", "fill_price": 100.0,
+            "reason": None, "status": "Filled"}
+
+
 def _reset(enabled=True, buffer_=1.2):
     global _cancel_ok, _working_fails
     _placed.clear()
@@ -53,6 +81,8 @@ def _reset(enabled=True, buffer_=1.2):
     _working.clear()
     _cancel_ok = True
     _working_fails = False
+    _floor_outcome.update({"state": "dead", "fill_price": None,
+                           "reason": None, "status": "UROut"})
     config.ENABLE_BROKER_STOP_FLOOR = enabled
     config.BROKER_STOP_FLOOR_BUFFER = buffer_
     strategy._floors_placed = 0
@@ -60,9 +90,14 @@ def _reset(enabled=True, buffer_=1.2):
     strategy._floor_orphans = 0
     strategy._floor_cancel_failures = 0
     strategy._floors_reconciled = False
+    strategy._exit_rejections = 0
+    strategy._floor_clear_waits = 0
+    strategy._floor_clear_stuck = 0
+    strategy._floor_rearms = 0
     strategy.tc.place_equity_order = _fake_place
     strategy.tc.cancel_order = _fake_cancel
     strategy.tc.get_working_orders = _fake_working
+    strategy.tc.get_order_outcome = _fake_outcome
     _testlib.safe_remove(strategy._STOPS_PATH)
 
 
@@ -86,12 +121,14 @@ try:
                      config.ENABLE_PROFIT_TAKING)
         saved_tc = (getattr(strategy.tc, "place_equity_order", None),
                     getattr(strategy.tc, "cancel_order", None),
-                    getattr(strategy.tc, "get_working_orders", None))
+                    getattr(strategy.tc, "get_working_orders", None),
+                    getattr(strategy.tc, "get_order_outcome", None))
         yield
         (config.ENABLE_BROKER_STOP_FLOOR, config.BROKER_STOP_FLOOR_BUFFER,
          config.ENABLE_PROFIT_TAKING) = saved_cfg
         (strategy.tc.place_equity_order, strategy.tc.cancel_order,
-         strategy.tc.get_working_orders) = saved_tc
+         strategy.tc.get_working_orders,
+         strategy.tc.get_order_outcome) = saved_tc
 except ImportError:                       # direct `python3 test_broker_floor.py`
     pass
 

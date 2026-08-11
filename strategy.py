@@ -660,6 +660,16 @@ _floors_placed = 0
 _floors_cancelled = 0
 _floor_orphans = 0
 _floor_cancel_failures = 0
+# Exit-submission counters. _exit_rejections is the one that matters here: it
+# should stay at ZERO, because every increment is an exit the broker refused —
+# a position the bot believed it had closed and had not. It was silently 1 on
+# 2026-08-11 (GOOGL) with no counter to show it. _floor_clear_waits climbing is
+# healthy and expected (it means the ordering fix is doing its job); a nonzero
+# _floor_clear_stuck or _floor_rearms means an exit left protection in doubt.
+_exit_rejections = 0
+_floor_clear_waits = 0
+_floor_clear_stuck = 0
+_floor_rearms = 0
 # Latched once the startup reconcile has run, so it stays a startup-only pass and
 # does not add a working-orders fetch to every 60s cycle. A cancel that FAILS is
 # therefore retried on the next restart, not on the next poll — the loud error in
@@ -746,15 +756,188 @@ def _cancel_broker_floor(symbol: str, rec: Optional[dict],
     return False
 
 
-def _release_stop(symbol: str, account_id: Optional[str] = None) -> None:
+def _wait_floor_clear(symbol: str, floor_id: str, account_id: str,
+                      tries: int = 4, delay: float = 1.0) -> str:
+    """Wait for a just-cancelled floor to be genuinely OUT at the broker.
+
+    Returns "clear" (gone — safe to sell), "filled" (the floor itself executed,
+    so the position is ALREADY closed and must not be sold again), or "stuck"
+    (still resting after `tries` — do not submit, retry the whole exit later).
+
+    A cancel is a REQUEST, not a completion; cancel_order's own docstring says
+    so. Submitting the exit before the broker has actually released the shares
+    is how the exit gets refused, so this is the confirmation step that turns
+    "we asked" into "it is gone".
+    """
+    global _floor_clear_waits, _floor_clear_stuck
+    for attempt in range(1, tries + 1):
+        outcome = tc.get_order_outcome(account_id, floor_id)
+        state = outcome.get("state")
+        if state == "filled":
+            logger.warning("BROKER FLOOR %s: floor order %s FILLED during exit "
+                           "— position already closed by the floor at %s; not "
+                           "submitting a second exit",
+                           symbol, floor_id, outcome.get("fill_price"))
+            return "filled"
+        if state == "dead":
+            if attempt > 1:
+                _floor_clear_waits += 1
+                logger.info("BROKER FLOOR %s: floor %s cleared after %d poll(s) "
+                            "— waits #%d", symbol, floor_id, attempt,
+                            _floor_clear_waits)
+            return "clear"
+        # "working" or "unknown" — the shares may still be reserved. Never
+        # assume clear on "unknown": that is the assumption that failed.
+        if attempt < tries:
+            time.sleep(delay)
+    _floor_clear_stuck += 1
+    logger.error("BROKER FLOOR %s: floor %s STILL not clear after %d polls — "
+                 "holding off the exit rather than having it refused; will "
+                 "retry next cycle — stuck #%d",
+                 symbol, floor_id, tries, _floor_clear_stuck)
+    return "stuck"
+
+
+def _submit_exit_order(symbol: str, side: str, qty: int, account_id: str,
+                       rec: Optional[dict],
+                       rearm_qty: Optional[int] = None
+                       ) -> tuple[Optional[str], str]:
+    """Clear the floor, submit an exit, and CONFIRM the broker executed it.
+
+    Returns (order_id, status) where status is exactly one of:
+      "executed"    — the exit went through; tear down state and log the trade
+      "floor_filled"— the FLOOR closed the position first; it is already flat,
+                      so log/tear down but never place a fresh floor or re-sell
+      "failed"      — nothing executed; the position is STILL OPEN with its
+                      protection restored. Log nothing, tear down nothing.
+
+    `rearm_qty` is the size the floor is put back at if the exit fails; it
+    defaults to `qty` and differs only for partial exits (a profit take sells
+    half but must be re-protected at the FULL remaining size).
+
+    ORDER OF OPERATIONS, which was wrong until 2026-08-11: the resting GTC floor
+    RESERVES the very shares the exit is trying to sell, so it must be cancelled
+    and confirmed gone BEFORE the exit is submitted. Every equity exit path did
+    the opposite — submit, then tear down the floor — which is not a race that
+    can be won or lost but a deterministic refusal. GOOGL's stop exit was
+    rejected with "You are long 127 shares with 127 remaining on sell orders!";
+    it was the first stop exit to fire since the floor feature landed (7d088b4),
+    so the ordering had never been exercised against a live floor before.
+
+    On a failed submission the floor is put BACK. A cancelled floor plus a
+    refused exit is the worst of both: GOOGL sat open and completely unprotected
+    for three hours because the teardown half succeeded and nothing rolled it
+    back.
+    """
+    global _exit_rejections
+    floor_id = (rec or {}).get("broker_order_id")
+    rearm_qty = qty if rearm_qty is None else rearm_qty
+
+    # 1. Clear the floor first, and confirm it is actually gone.
+    if floor_id and account_id:
+        if not _cancel_broker_floor(symbol, rec, account_id):
+            logger.error("EXIT %s: floor cancel failed — not submitting an exit "
+                         "that the resting floor would have refused", symbol)
+            return None, "failed"
+        cleared = _wait_floor_clear(symbol, floor_id, account_id)
+        if cleared == "stuck":
+            # Deliberately KEEP broker_order_id. We do not know whether the floor
+            # is still resting, and the two blind recoveries are both bad:
+            # re-arming could leave TWO GTC stops behind one position (which
+            # oversells into a short), and dropping the id orphans a floor we can
+            # no longer cancel. Holding the reference means the next cycle
+            # retries this same cancel-and-confirm, and startup reconcile stays
+            # the backstop. This is the branch that must never repeat GOOGL:
+            # floor down, exit not submitted, nothing rolled back.
+            return None, "failed"
+        (rec or {}).pop("broker_order_id", None)
+        (rec or {}).pop("broker_floor_price", None)
+        if cleared == "filled":
+            return None, "floor_filled"
+
+    # 2. Submit the exit.
+    result = tc.place_equity_order(account_id, symbol, side, qty)
+    order_id = (result or {}).get("order", {}).get("id")
+    if not result or not order_id:
+        _rearm_floor_after_failed_exit(symbol, rearm_qty, rec, account_id)
+        return None, "failed"
+
+    # 3. CONFIRM it executed. A submission id means the broker ACCEPTED the
+    #    order, not that it filled — GOOGL's rejected order had an id too.
+    outcome = tc.get_order_outcome(account_id, order_id)
+    state = outcome.get("state")
+    if state == "dead":
+        _exit_rejections += 1
+        logger.error("EXIT %s %s x%d REJECTED by broker (order %s, status=%s): "
+                     "%s — position is STILL OPEN, not logging a trade, "
+                     "re-arming protection — rejections #%d",
+                     symbol, side, qty, order_id, outcome.get("status"),
+                     outcome.get("reason") or "no reason given", _exit_rejections)
+        _rearm_floor_after_failed_exit(symbol, rearm_qty, rec, account_id)
+        return None, "failed"
+    if state == "unknown":
+        # We do not know. Treat as executed so the caller reconciles against
+        # real positions next cycle rather than double-submitting into a fill.
+        logger.warning("EXIT %s %s x%d: could not confirm order %s — assuming "
+                       "it worked; positions reconcile next cycle",
+                       symbol, side, qty, order_id)
+    return order_id, "executed"
+
+
+def _rearm_floor_after_failed_exit(symbol: str, qty: int, rec: Optional[dict],
+                                   account_id: Optional[str]) -> None:
+    """Put the floor back after an exit that did not execute.
+
+    Without this, a failed exit leaves the position naked: the floor is already
+    cancelled by the time the exit is refused. Best-effort — _place_broker_floor
+    logs its own failure and startup reconcile is the backstop.
+    """
+    global _floor_rearms
+    if not rec or not account_id or not config.ENABLE_BROKER_STOP_FLOOR:
+        return
+    if rec.get("broker_order_id"):
+        return                            # floor never came down
+    _place_broker_floor(symbol, abs(int(qty)), rec, account_id)
+    if rec.get("broker_order_id"):
+        _floor_rearms += 1
+        logger.warning("BROKER FLOOR %s: re-armed after a failed exit — "
+                       "re-arms #%d", symbol, _floor_rearms)
+
+
+def _release_stop(symbol: str, account_id: Optional[str] = None,
+                  floor_already_down: bool = False) -> None:
     """Tear down a position's protection: cancel the broker floor, drop the
     record. The single teardown entry point — _clear_stop alone would leave the
-    broker order resting, so every exit route calls THIS."""
+    broker order resting, so every exit route calls THIS.
+
+    `floor_already_down` skips the cancel for callers that came through
+    _submit_exit_order, which must take the floor down BEFORE submitting. The
+    on-disk record still carries the stale order id there, so without this the
+    reload below would re-cancel an already-dead order and inflate the
+    _floors_cancelled counter with cancels that did nothing.
+    """
     stops = _load_stops()
-    _cancel_broker_floor(symbol, stops.get(symbol), account_id)
+    if not floor_already_down:
+        _cancel_broker_floor(symbol, stops.get(symbol), account_id)
     if symbol in stops:
         del stops[symbol]
         _save_stops(stops)
+
+
+def _signal_exit(symbol: str, side: str, qty: int,
+                 account_id: str) -> tuple[Optional[str], str]:
+    """Submit a signal-driven full exit (state sell, cover, crisis de-risk).
+
+    Wraps _submit_exit_order with the stop-record load and teardown those three
+    paths all share, so the floor-first ordering lives in ONE place rather than
+    being re-derived at each call site — which is how the ordering came to be
+    wrong at five of them at once. Returns (order_id, status) unchanged.
+    """
+    rec = _load_stops().get(symbol)
+    order_id, status = _submit_exit_order(symbol, side, qty, account_id, rec)
+    if status != "failed":
+        _release_stop(symbol, account_id, floor_already_down=True)
+    return order_id, status
 
 
 def reconcile_broker_floors(positions: list[dict], account_id: str) -> None:
@@ -1062,13 +1245,17 @@ def _check_and_trail_stop(symbol: str, held: int, sig: dict,
                        "water=%.2f) — exit #%d",
                        symbol, direction, exit_qty, price, rec["stop_price"],
                        rec["entry_price"], water, _stop_exits + 1)
-        result = tc.place_equity_order(account_id, symbol, exit_side, exit_qty)
-        if result:
+        # _submit_exit_order clears the floor FIRST and confirms the broker
+        # actually executed the exit; `ok` is False when the position is still
+        # open, in which case nothing below may run.
+        order_id, status = _submit_exit_order(symbol, exit_side, exit_qty,
+                                              account_id, rec)
+        if status in ("executed", "floor_filled"):
             _stop_exits += 1
-            # Fourth teardown route. Deliberately _cancel_broker_floor and not
-            # _release_stop: this path already holds `stops` and saves it below,
-            # and _release_stop would reload/rewrite the file underneath it.
-            _cancel_broker_floor(symbol, rec, account_id)
+            # Fourth teardown route. The floor is already down (cleared by
+            # _submit_exit_order before submitting); this path holds `stops` and
+            # saves it below, and _release_stop would reload/rewrite the file
+            # underneath it.
             stops.pop(symbol, None)
             _save_stops(stops)
             # Mark BOTH gates: a stop-out should block every same-day signal for
@@ -1078,13 +1265,12 @@ def _check_and_trail_stop(symbol: str, held: int, sig: dict,
             # stopped-out name free to re-enter on the next cross the same day.
             _mark_bought(symbol)
             _mark_sold(symbol)
-            order_id = result.get("order", {}).get("id")
             _log_exit_trade(exit_action, symbol, exit_qty, price, order_id,
                             f"trailing stop hit @ {rec['stop_price']:.2f}",
                             account_id)
             return True
-        logger.error("STOP-LOSS EXIT %s: %s order failed — retrying next cycle",
-                     symbol, exit_side)
+        logger.error("STOP-LOSS EXIT %s: %s order failed — position still open, "
+                     "stop record kept, retrying next cycle", symbol, exit_side)
 
     _save_stops(stops)                # persist ratcheted water/stop progress
     return False
@@ -1127,27 +1313,37 @@ def _maybe_take_profit(symbol: str, held: int, sig: dict, account_id: str) -> bo
 
     logger.info("PROFIT TAKE %s x%d (+%.1f%% from entry, RSI=%.1f)",
                 symbol, sell_qty, gain * 100, sig["rsi"])
-    result = tc.place_equity_order(account_id, symbol, "sell", sell_qty)
-    if not result:
-        logger.error("PROFIT TAKE %s: sell order failed — retry next cycle", symbol)
+    # The resting floor is sized for the WHOLE position, so it reserves the very
+    # shares this partial sale needs — the same refusal that killed the GOOGL
+    # stop exit. _submit_exit_order takes the floor down and confirms it is gone
+    # before submitting, and puts it back at full size if the sale fails.
+    order_id, status = _submit_exit_order(symbol, "sell", sell_qty, account_id,
+                                          rec, rearm_qty=held)
+    if status == "failed":
+        logger.error("PROFIT TAKE %s: sell order failed — position unchanged, "
+                     "retry next cycle", symbol)
         return False
     _profit_takes += 1
     rec["profit_taken"] = True               # latch BEFORE anything else can re-read
-    # Resize the broker floor to the shares that REMAIN. The floor was sized for
-    # the full position; left alone it would try to sell more than we hold and
-    # open a short on the difference. This is the one place the "never update the
-    # floor" rule bends, and it bends for a QUANTITY change, not a price change —
-    # one-shot per position (profit_taken latches above), so two API calls in a
-    # position's entire lifetime, not two per trail.
+    # Re-place the broker floor at the shares that REMAIN. The floor came down
+    # in _submit_exit_order above (it had to, to free the shares); left at its
+    # original full size it would try to sell more than we hold and open a short
+    # on the difference. A QUANTITY change, not a price change — one-shot per
+    # position (profit_taken latches above), so two API calls in a position's
+    # entire lifetime, not two per trail.
     remaining = held - sell_qty
-    if remaining > 0 and rec.get("broker_order_id"):
-        _cancel_broker_floor(symbol, rec, account_id)
-        rec.pop("broker_order_id", None)
-        rec.pop("broker_floor_price", None)
+    if status == "floor_filled":
+        # The floor closed the ENTIRE position, not just this slice. Nothing is
+        # left to protect and the record is stale.
+        stops.pop(symbol, None)
+        _save_stops(stops)
+        _log_exit_trade("SELL", symbol, held, price, None,
+                        "broker floor filled during profit take", account_id)
+        return True
+    if remaining > 0:
         _place_broker_floor(symbol, remaining, rec, account_id)
     stops[symbol] = rec
     _save_stops(stops)                       # record kept -> remainder keeps its stop
-    order_id = result.get("order", {}).get("id")
     _log_exit_trade("SELL", symbol, sell_qty, price, order_id,
                     f"profit take (+{gain * 100:.1f}% from entry, RSI={sig['rsi']:.1f})",
                     account_id)
@@ -1588,16 +1784,15 @@ def evaluate_stock(symbol: str, account_id: str, positions: list[dict],
                            "signals still apply)", symbol, held)
         else:
             logger.warning("CRISIS de-risk SELL %s x%d", symbol, held)
-            result = tc.place_equity_order(account_id, symbol, "sell", held)
-            if result:
+            order_id, status = _signal_exit(symbol, "sell", held, account_id)
+            if status != "failed":
                 _crisis_exits += 1
                 _mark_sold(symbol)
-                order_id = result.get("order", {}).get("id")
                 _log_exit_trade("SELL", symbol, held, price, order_id,
                                 "VIX crisis de-risk", account_id)
-                _release_stop(symbol, account_id)
             else:
-                logger.error("CRISIS SELL %s FAILED — retry next cycle", symbol)
+                logger.error("CRISIS SELL %s FAILED — position still open, "
+                             "retry next cycle", symbol)
             return
 
     # PROFIT TAKE — scale out of a winning long before the exit/entry logic.
@@ -1617,29 +1812,25 @@ def evaluate_stock(symbol: str, account_id: str, positions: list[dict],
     # bar. This is the HCA/QQQ fix.
     if held > 0 and _exit_long_signal(sig, symbol) and not _already_sold_today(symbol):
         logger.info("SIGNAL SELL %s x%d", symbol, held)
-        result = tc.place_equity_order(account_id, symbol, "sell", held)
-        if result:
+        order_id, status = _signal_exit(symbol, "sell", held, account_id)
+        if status != "failed":
             _mark_sold(symbol)
-            order_id = result.get("order", {}).get("id")
             _log_exit_trade("SELL", symbol, held, price, order_id,
                             f"EMA bearish, RSI={sig['rsi']:.1f}", account_id)
             _note_state_only_exit(symbol, sig, "bearish_cross")
-            _release_stop(symbol, account_id)
         return
 
     # COVER — close a short whenever the trend is bullish (mirror of SELL).
     if held < 0 and _exit_short_signal(sig, symbol) and not _already_bought_today(symbol):
         qty = abs(held)
         logger.info("SIGNAL BUY_TO_COVER %s x%d", symbol, qty)
-        result = tc.place_equity_order(account_id, symbol, "buy_to_cover", qty)
-        if result:
+        order_id, status = _signal_exit(symbol, "buy_to_cover", qty, account_id)
+        if status != "failed":
             _short_covers += 1
             _mark_bought(symbol)
-            order_id = result.get("order", {}).get("id")
             _log_exit_trade("BUY_TO_COVER", symbol, qty, price, order_id,
                             f"EMA bullish (cover), RSI={sig['rsi']:.1f}", account_id)
             _note_state_only_exit(symbol, sig, "bullish_cross")
-            _release_stop(symbol, account_id)
         return
 
     # ── ENTRIES ───────────────────────────────────────────────────────────────
