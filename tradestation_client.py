@@ -534,28 +534,83 @@ def confirm_order(
     return confirmations[0]
 
 
-def get_order(account_id: str, order_id: str) -> Optional[float]:
-    """Return an order's average FilledPrice, or None if it isn't filled.
+# Terminal states — an order in any of these is finished and is NOT resting.
+#
+# Matched on BOTH the human StatusDescription and the short Status code, because
+# TradeStation reports the same outcome two ways and neither is a superset of
+# the other. "UROut" (User Requested Out — what a cancelled order BECOMES) was
+# missing from this set until 2026-08-11, so a dead order read as still-resting
+# to every caller that asked: get_working_orders listed it as live, and the
+# floor reconcile would have skipped re-arming a position it believed protected.
+_DONE_STATUSES = {"filled", "canceled", "cancelled", "rejected", "expired",
+                  "replaced", "out", "urout", "too late to cancel"}
+_DONE_STATUS_CODES = {"FLL", "CAN", "REJ", "EXP", "OUT", "UROUT", "RPL", "TLC"}
 
-    Used to arm trailing stops off the REAL fill instead of the signal-bar close
-    (see strategy._resolve_fill and memory project_stop_armed_at_signal_price).
-    Polls at most twice: market orders on liquid names fill in <1s, so if the
-    order is still working we wait 2s and re-check exactly once, then give up.
-    Returns None (with a WARNING) on a still-pending order, a null/zero
-    FilledPrice, or any API error — the caller falls back to the signal price.
+# Terminal WITHOUT having executed anything. The distinction from _DONE_STATUSES
+# is "filled": a dead order moved ZERO shares, so a caller must never price a
+# trade off it, never log it as a completed trade, and never tear down the
+# protection behind the position it failed to close.
+_FAILED_STATUSES = _DONE_STATUSES - {"filled"}
+_FAILED_STATUS_CODES = _DONE_STATUS_CODES - {"FLL"}
+
+
+def _order_is_done(o: dict) -> bool:
+    """True if an order reached a terminal state and is no longer working."""
+    desc = str(o.get("StatusDescription", "")).strip().lower()
+    code = str(o.get("Status", "")).strip().upper()
+    return desc in _DONE_STATUSES or code in _DONE_STATUS_CODES
+
+
+def _order_failed(o: dict) -> bool:
+    """True if an order is terminal AND executed nothing."""
+    desc = str(o.get("StatusDescription", "")).strip().lower()
+    code = str(o.get("Status", "")).strip().upper()
+    return desc in _FAILED_STATUSES or code in _FAILED_STATUS_CODES
+
+
+def get_order_outcome(account_id: str, order_id: str) -> dict:
+    """What actually happened to an order.
+
+    Returns {"state", "fill_price", "reason", "status"} where `state` is exactly
+    one of — and these are NOT interchangeable:
+
+      "filled"  — executed; fill_price is a real average execution price
+      "working" — still live at the broker, no fill yet; may still fill
+      "dead"    — terminal and executed NOTHING (rejected/cancelled/expired)
+      "unknown" — the lookup itself failed; we genuinely do not know
+
+    WHY THE SPLIT: this was a single Optional[float] that returned None for all
+    of working/dead/unknown, and decided pending-vs-done purely on "is there a
+    FilledPrice?" — a test a rejected order fails for the same reason a slow one
+    does. On 2026-08-11 a GOOGL stop exit was REJECTED by the broker ("You are
+    long 127 shares with 127 remaining on sell orders!"). get_order saw no fill
+    price, called it pending, and the caller read that None as "it filled but we
+    could not read the price": it logged a completed SELL of 127 shares that
+    never happened at a price 2.55 better than reality, released the trailing
+    stop, and left the position open and UNPROTECTED for three hours. A
+    rejection and a slow fill are opposite outcomes; they must never share a
+    return value.
+
+    The broker's RejectReason is logged here. It reached no log at all before
+    this — the only trace of the GOOGL failure was two lines calling a rejected
+    order "still pending", and the reason had to be pulled from the API by hand.
     """
+    status = None
     for attempt in (1, 2):
         try:
             data = _get(f"brokerage/accounts/{account_id}/orders/{order_id}")
         except Exception as exc:
-            logger.warning("get_order failed for %s: %s", order_id, exc)
-            return None
+            logger.warning("get_order_outcome failed for %s: %s", order_id, exc)
+            return {"state": "unknown", "fill_price": None,
+                    "reason": str(exc), "status": None}
         orders = data.get("Orders", [])
         if not orders:
-            logger.warning("get_order returned no order for %s: %s",
+            logger.warning("get_order_outcome returned no order for %s: %s",
                            order_id, data.get("Errors") or data)
-            return None
+            return {"state": "unknown", "fill_price": None,
+                    "reason": "no order in response", "status": None}
         o = orders[0]
+        status = o.get("StatusDescription") or o.get("Status")
         # FilledPrice is the whole-order average; fall back to the first leg's
         # ExecutionPrice (equal for a single-leg equity market order).
         price = _f(o.get("FilledPrice"))
@@ -565,23 +620,44 @@ def get_order(account_id: str, order_id: str) -> Optional[float]:
                 price = _f(legs[0].get("ExecutionPrice"))
         if price is not None and price > 0:
             if str(o.get("StatusDescription", "")).lower() == "partial fill":
-                logger.warning("get_order %s only PARTIALLY filled — using partial "
+                logger.warning("Order %s only PARTIALLY filled — using partial "
                                "average fill %.4f", order_id, price)
-            return price
-        # Still working (Received/Sent, no price yet). Retry once, then bail.
+            return {"state": "filled", "fill_price": price,
+                    "reason": None, "status": status}
+        # Terminal with nothing executed. Checked BEFORE the retry: waiting
+        # cannot resurrect a rejected order, and the old code's second poll was
+        # two wasted seconds on the way to the wrong answer.
+        if _order_failed(o):
+            reason = o.get("RejectReason") or None
+            logger.error("Order %s DEAD (status=%s) — executed NOTHING%s",
+                         order_id, status, f": {reason}" if reason else "")
+            return {"state": "dead", "fill_price": None,
+                    "reason": reason, "status": status}
+        # Genuinely still working (Received/Sent, no price yet). Retry once.
         if attempt == 1:
-            logger.info("Order %s still pending (status=%s) — retrying in 2s",
-                        order_id, o.get("StatusDescription"))
+            logger.info("Order %s still working (status=%s) — retrying in 2s",
+                        order_id, status)
             time.sleep(2)
         else:
-            logger.warning("Order %s still pending after 2s (status=%s)",
-                           order_id, o.get("StatusDescription"))
-    return None
+            logger.warning("Order %s still working after 2s (status=%s)",
+                           order_id, status)
+    return {"state": "working", "fill_price": None,
+            "reason": None, "status": status}
 
 
-# Terminal states — an order in any of these is finished and is NOT resting.
-_DONE_STATUSES = {"filled", "canceled", "cancelled", "rejected", "expired",
-                  "replaced", "out", "too late to cancel"}
+def get_order(account_id: str, order_id: str) -> Optional[float]:
+    """An order's average fill price, or None if it did not (yet) fill.
+
+    Thin wrapper over get_order_outcome for callers that only need a price and
+    treat "no price" the same however it arose (entry-side stop arming, which
+    falls back to the signal bar either way).
+
+    Any caller that acts on the DIFFERENCE between "still working", "rejected"
+    and "lookup failed" — above all an exit deciding whether to log a trade or
+    tear down a position's protection — must call get_order_outcome instead.
+    None here still collapses all three, by design.
+    """
+    return get_order_outcome(account_id, order_id).get("fill_price")
 
 
 def get_working_orders(account_id: str) -> Optional[list[dict]]:
@@ -606,8 +682,7 @@ def get_working_orders(account_id: str) -> Optional[list[dict]]:
         return None
     out = []
     for o in data.get("Orders", []):
-        status = str(o.get("StatusDescription", "")).strip().lower()
-        if status in _DONE_STATUSES:
+        if _order_is_done(o):
             continue
         legs = o.get("Legs") or []
         leg = legs[0] if legs else {}
