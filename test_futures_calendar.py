@@ -12,7 +12,9 @@ from datetime import date, datetime
 
 import pytz
 
+import config
 import futures_market_hours as fmh
+import market_hours as mh
 
 ET = pytz.timezone("America/New_York")
 
@@ -52,14 +54,28 @@ def test_front_month_basic():
 
 
 def test_front_month_roll_boundary():
-    # Sep 2026 expiry (3rd Fri) = 2026-09-18; roll date = 09-13.
-    assert fmh.front_month_contract("ES", date(2026, 9, 12)) == "ESU26"  # before roll
-    assert fmh.front_month_contract("ES", date(2026, 9, 13)) == "ESZ26"  # on roll -> next qtr
+    # Sep 2026 expiry (3rd Fri) = 2026-09-18. Roll is 5 TRADING SESSIONS back =
+    # Fri 2026-09-11 (09-17, 16, 15, 14, then 11 — the 09-12/13 weekend is skipped).
+    # The old calendar arithmetic put it on 09-13, a SUNDAY, so the roll really
+    # happened Monday 09-14 — later, and dependent on the weekday expiry fell on.
+    assert fmh.front_month_contract("ES", date(2026, 9, 10)) == "ESU26"  # before roll
+    assert fmh.front_month_contract("ES", date(2026, 9, 11)) == "ESZ26"  # on roll -> next qtr
     assert fmh.front_month_contract("ES", date(2026, 9, 14)) == "ESZ26"  # after roll
 
 
+def test_front_month_roll_date_is_a_trading_day():
+    """The regression this change exists to prevent: the roll must never land on a
+    day the market is shut, for any quarterly expiry."""
+    for year in (2026, 2027, 2028):
+        for month in (3, 6, 9, 12):
+            expiry = mh._third_friday(year, month)
+            roll = mh.shift_trading_days(expiry, -config.FUTURES_ROLL_DAYS)
+            assert mh._is_trading_day(roll), f"{year}-{month} roll {roll} is not a session"
+            assert roll < expiry
+
+
 def test_front_month_year_rollover():
-    # Dec 2026 expiry = 2026-12-18; roll = 12-13. After that -> Mar 2027.
+    # Dec 2026 expiry = 2026-12-18; roll = 5 sessions back = 12-11. After that -> Mar 2027.
     assert fmh.front_month_contract("ES", date(2026, 12, 20)) == "ESH27"
     assert fmh.front_month_contract("ES", date(2027, 1, 5))  == "ESH27"
 

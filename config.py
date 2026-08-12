@@ -263,8 +263,13 @@ OPTIONS_CONTRACTS    = 1      # contracts per options trade
 ENABLE_OPTION_EXIT_TARGETS = True
 OPTION_PROFIT_TARGET_PCT   = 1.50   # close once bid >= entry × this (+50%)
 OPTION_STOP_LOSS_PCT       = 0.50   # close once bid <= entry × this (−50%)
-OPTION_MIN_DAYS_TO_EXPIRY  = 5      # close with <= this many calendar days left,
-                                    # before gamma/theta make the exit unpriceable
+OPTION_MIN_DAYS_TO_EXPIRY  = 5      # close with <= this many TRADING SESSIONS left,
+                                    # before gamma/theta make the exit unpriceable.
+                                    # Sessions, not calendar days (changed 2026-08-12):
+                                    # a calendar threshold can go true on a weekend,
+                                    # deferring the close to the next session AND onto
+                                    # an opening bell. 5 sessions is ~7 calendar days,
+                                    # so this value did NOT change but its meaning did.
 
 # ── Stop Loss (bot-managed trailing stop) ─────────────────────────────────────
 # Bot-managed (not broker-native) ATR trailing stop, checked every cycle in
@@ -650,11 +655,16 @@ POLL_INTERVAL = 60
 
 # ── Futures (mode="futures") ──────────────────────────────────────────────────
 # Roots only; the dated front-month contract is resolved at runtime with a
-# 5-day-before-expiry quarterly roll (futures_market_hours.front_month_contract).
+# 5-TRADING-SESSION-before-expiry quarterly roll, counted with
+# market_hours.shift_trading_days (futures_market_hours.front_month_contract).
+# Sessions, not calendar days, since 2026-08-12 — see FUTURES_ROLL_DAYS below.
 # YM is excluded for now: the sandbox account is NOT ENTITLED to Dow data.
 FUTURES_WATCHLIST = ["ES", "NQ", "RTY"]
 FUTURES_CONTRACTS = 1      # contracts per futures trade (fixed size for MVP)
-FUTURES_ROLL_DAYS = 5      # roll to the next quarterly this many days before expiry
+FUTURES_ROLL_DAYS = 5      # roll to the next quarterly this many TRADING SESSIONS
+                           # before expiry (was calendar days until 2026-08-12; the
+                           # value is unchanged, the unit is not — 5 sessions is ~7
+                           # calendar days, so the roll now happens ~2 days earlier)
 # Contract specs (multiplier / tick / $-per-tick) — for logging now, margin-based
 # sizing later. Read live initial margin from tradestation_client.confirm_order().
 FUTURES_SPECS = {

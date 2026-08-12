@@ -2031,15 +2031,25 @@ def _option_expired(expiration: str) -> bool:
         return False
 
 
-def _days_to_expiry(expiration: str) -> Optional[int]:
-    """Calendar days from today to `expiration`, or None if unparseable.
+def _trading_days_to_expiry(expiration: str) -> Optional[int]:
+    """TRADING sessions from today to `expiration`, or None if unparseable.
 
     None (not 0, and not a huge number) so the caller can tell "no idea" apart
     from "expires today". _option_expired already fails OPEN on a bad date; this
     mirrors that — an unreadable date must not trigger a forced liquidation.
+
+    Sessions, not calendar days, because the threshold has to go true on a day we
+    can actually trade. `QQQ 260821C715` is the worked example: expiring Fri
+    2026-08-21, a `<= 5 calendar days` test first went true on **Sunday 08-16**,
+    so the forced close deferred to Monday 08-17 — later AND at a Monday opening
+    bell, holding a 4-DTE contract across a weekend of theta with no ability to
+    react. Counting sessions puts the same threshold on Fri 08-14 instead.
+
+    Note this WIDENS the window in calendar terms: 5 sessions is ~7 calendar days,
+    so OPTION_MIN_DAYS_TO_EXPIRY keeps its value but no longer means what it did.
     """
     try:
-        return (date.fromisoformat(str(expiration)) - date.today()).days
+        return mh.trading_days_until(date.fromisoformat(str(expiration)))
     except (TypeError, ValueError):
         return None
 
@@ -2072,9 +2082,10 @@ def _option_exit_reason(bid: float, entry: Optional[float],
             return (f"profit target — bid {bid:.2f} >= "
                     f"{config.OPTION_PROFIT_TARGET_PCT:.0%} of entry {entry:.2f}")
 
-    days = _days_to_expiry(expiration)
+    days = _trading_days_to_expiry(expiration)
     if days is not None and days <= config.OPTION_MIN_DAYS_TO_EXPIRY:
-        return f"near expiry — {days}d left (<= {config.OPTION_MIN_DAYS_TO_EXPIRY})"
+        return (f"near expiry — {days} trading days left "
+                f"(<= {config.OPTION_MIN_DAYS_TO_EXPIRY})")
     return None
 
 

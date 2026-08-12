@@ -88,6 +88,47 @@ def _is_trading_day(d: date) -> bool:
     return d.weekday() < 5 and d not in MARKET_HOLIDAYS
 
 
+def shift_trading_days(start: date, n: int) -> date:
+    """The date ``n`` trading sessions from ``start``; negative ``n`` walks back.
+
+    ``start`` itself is never counted, so shift_trading_days(Fri, -1) is Thu and
+    shift_trading_days(Fri, +1) is Mon. Terminates because every 7-day window
+    holds at least one non-holiday weekday.
+    """
+    if n == 0:
+        return start
+    step = timedelta(days=1 if n > 0 else -1)
+    remaining, d = abs(n), start
+    while remaining:
+        d += step
+        if _is_trading_day(d):
+            remaining -= 1
+    return d
+
+
+def trading_days_until(target: date, from_date: date = None) -> int:
+    """Trading sessions strictly after ``from_date`` up to and INCLUDING ``target``.
+
+    Counting the target itself is deliberate: an option trades through the close
+    on its expiration date and a futures contract through its expiry, so that day
+    is a session we can still act in. Returns 0 once ``target`` is today or past.
+
+    Why trading days rather than `(target - today).days`: a calendar threshold can
+    go true on a day the market is shut, which silently defers the action to the
+    next session AND lands it on an opening bell. See front_month_contract and
+    strategy._trading_days_to_expiry, both of which count sessions for that reason.
+    """
+    d = from_date or now_et().date()
+    if target <= d:
+        return 0
+    count, probe = 0, d
+    while probe < target:
+        probe += timedelta(days=1)
+        if _is_trading_day(probe):
+            count += 1
+    return count
+
+
 def _third_friday(year: int, month: int) -> date:
     """Return the date of the 3rd Friday of the given month."""
     first = date(year, month, 1)

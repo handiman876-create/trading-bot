@@ -27,6 +27,8 @@ import os
 import tempfile
 from datetime import date, timedelta
 
+import market_hours as mh
+
 import _testlib
 import config
 import strategy
@@ -149,6 +151,16 @@ def _bullish_sig(close=100.0, rsi=50.0):
 def _far()  -> str: return (date.today() + timedelta(days=40)).isoformat()
 def _near() -> str: return (date.today() + timedelta(days=3)).isoformat()
 
+def _sessions_out(n: int) -> str:
+    """An expiration exactly ``n`` TRADING sessions from today.
+
+    Calendar offsets cannot express this test any more: since the expiry rule
+    counts sessions, `today + 6 calendar days` is 4–6 sessions depending on which
+    weekday the suite runs on, so a calendar-based boundary test passes on a
+    Tuesday and fails on a Friday. Anchor on sessions and it is weekday-proof.
+    """
+    return mh.shift_trading_days(date.today(), n).isoformat()
+
 OCC = "NVDA 260821C220"
 
 
@@ -186,11 +198,45 @@ def test_reason_near_expiry():
 
 
 def test_reason_expiry_boundary():
-    """<= MIN_DAYS fires; one day more does not."""
-    at   = (date.today() + timedelta(days=5)).isoformat()
-    over = (date.today() + timedelta(days=6)).isoformat()
+    """<= MIN_DAYS *sessions* fires; one session more does not."""
+    at   = _sessions_out(5)
+    over = _sessions_out(6)
     assert "near expiry" in strategy._option_exit_reason(8.15, 8.15, at)
     assert strategy._option_exit_reason(8.15, 8.15, over) is None
+
+
+def test_expiry_counts_sessions_not_calendar_days():
+    """The whole point of the 2026-08-12 change: a weekend must not be counted.
+
+    QQQ 260821C715 as it actually stood — expiring Fri 2026-08-21, evaluated from
+    Wed 2026-08-12. Calendar arithmetic first goes <= 5 on SUNDAY 08-16 (untradeable,
+    so the close defers to Mon 08-17); sessions put it on Fri 08-14.
+    """
+    exp = date(2026, 8, 21)
+    assert (exp - date(2026, 8, 16)).days == 5          # calendar rule: a Sunday
+    assert not mh._is_trading_day(date(2026, 8, 16))    # ...which we cannot trade
+
+    assert mh.trading_days_until(exp, date(2026, 8, 12)) == 7   # Wed: no exit
+    assert mh.trading_days_until(exp, date(2026, 8, 13)) == 6   # Thu: no exit
+    assert mh.trading_days_until(exp, date(2026, 8, 14)) == 5   # Fri: FIRES
+    assert mh.trading_days_until(exp, date(2026, 8, 17)) == 4   # Mon: already gone
+
+
+def test_expiry_skips_holidays_not_just_weekends():
+    """Thanksgiving 2026-11-26 (Thu) must not count as a session."""
+    exp = date(2026, 12, 4)                              # the Friday after
+    assert mh.is_holiday(date(2026, 11, 26))
+    # 11-27 Fri, 11-30 Mon, 12-01, 12-02, 12-03, 12-04 = 6 sessions; the Thursday
+    # holiday and the 11-28/29 weekend are all skipped.
+    assert mh.trading_days_until(exp, date(2026, 11, 25)) == 6
+    assert (exp - date(2026, 11, 25)).days == 9          # calendar would say 9
+
+
+def test_expiry_day_itself_is_tradeable():
+    """0 sessions left = expires today, and we can still sell into the close —
+    mirrors _option_expired's deliberate `<` rather than `<=`."""
+    assert mh.trading_days_until(date(2026, 8, 21), date(2026, 8, 21)) == 0
+    assert mh.trading_days_until(date(2026, 8, 20), date(2026, 8, 21)) == 0
 
 
 def test_reason_stop_wins_over_target():
@@ -214,7 +260,7 @@ def test_reason_unparseable_expiry_does_not_liquidate():
     """A cosmetic date problem must not force a sale — _option_expired fails open
     for the same reason."""
     assert strategy._option_exit_reason(8.15, 8.15, "not-a-date") is None
-    assert strategy._days_to_expiry("not-a-date") is None
+    assert strategy._trading_days_to_expiry("not-a-date") is None
 
 
 # ── 2. THE LANDMINE: adopted contracts store entry_price 0.0 ──────────────────

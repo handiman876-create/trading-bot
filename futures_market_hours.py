@@ -5,7 +5,7 @@ Mirrors the public surface of ``market_hours`` (now_et / is_market_open /
 seconds_until_open / seconds_until_close) so ``main.py`` can treat either module
 as an interchangeable "clock", and adds the futures-specific calendar:
 symbol construction, the continuous "signal" symbol, and front-month resolution
-with the agreed 5-day-before-expiry quarterly roll.
+with the agreed 5-trading-session-before-expiry quarterly roll.
 
 Session model (equity-index futures, e.g. ES/NQ/RTY):
     Sunday 18:00 ET  ->  Friday 17:00 ET,
@@ -23,7 +23,7 @@ from datetime import date, datetime, time, timedelta
 import pytz
 
 import config
-from market_hours import _third_friday   # reuse: 3rd-Friday expiry math
+from market_hours import _third_friday, shift_trading_days  # reuse: expiry math
 
 _ET = pytz.timezone(config.MARKET_TZ)
 
@@ -168,14 +168,22 @@ def front_month_contract(root: str, from_date: date = None,
                          roll_days: int = _DEFAULT_ROLL_DAYS) -> str:
     """Return the dated front-month contract to trade for ``root``.
 
-    Picks the nearest quarterly contract whose roll date (expiry − ``roll_days``)
-    is still in the future, so we roll to the next quarter ``roll_days`` days
-    before the current front-month expires.
+    Picks the nearest quarterly contract whose roll date is still in the future,
+    so we roll to the next quarter ``roll_days`` **trading sessions** before the
+    current front-month expires.
+
+    Sessions, not calendar days: `expiry - timedelta(days=roll_days)` can land the
+    roll on a Saturday or a holiday, which defers it to the next session and makes
+    the effective roll date drift with the weekday the expiry happens to fall on.
+    Counting sessions pins it. Sep-26 is the worked example — expiry 09-18, the old
+    arithmetic rolled 09-13 (a Sunday, so really Monday 09-14); five sessions back
+    is Fri 09-11. Same rule now drives options expiry exits
+    (strategy._trading_days_to_expiry).
     """
     d = from_date or now_et().date()
     for y, m in _quarterly_slots(d.year):
         expiry = _third_friday(y, m)
-        if d < expiry - timedelta(days=roll_days):
+        if d < shift_trading_days(expiry, -roll_days):
             return build_futures_symbol(root, m, y)
     # Unreachable given the 3-year horizon; fall back to the last slot.
     y, m = list(_quarterly_slots(d.year))[-1]
