@@ -348,13 +348,19 @@ def main() -> None:
                         config.PROFIT_TAKE_RSI_MIN)
         if config.ENABLE_OPTION_EXIT_TARGETS:
             logger.info("Option exits: ENABLED (bid >= %.0f%% of entry -> target; "
-                        "bid <= %.0f%% -> stop; <= %dd to expiry -> close). Priced off "
+                        "bid <= %.0f%% -> stop; <= %d TRADING SESSIONS to expiry -> "
+                        "close, ~%d calendar days). Priced off "
                         "the BID, checked BEFORE the EMA-state exit. Adopted contracts "
                         "(entry_price 0.0) skip target/stop but keep the expiry rule. "
                         "Counters: OPTION TARGET EXIT",
                         config.OPTION_PROFIT_TARGET_PCT * 100,
                         config.OPTION_STOP_LOSS_PCT * 100,
-                        config.OPTION_MIN_DAYS_TO_EXPIRY)
+                        config.OPTION_MIN_DAYS_TO_EXPIRY,
+                        # Calendar equivalent from today, so the banner cannot be
+                        # misread as calendar days — it drifts with the weekday.
+                        (mh.shift_trading_days(mh.now_et().date(),
+                                               config.OPTION_MIN_DAYS_TO_EXPIRY)
+                         - mh.now_et().date()).days)
         else:
             logger.info("Option exits: DISABLED (enable via ENABLE_OPTION_EXIT_TARGETS) "
                         "— options exit on EMA STATE ONLY, so a contract can bleed to "
