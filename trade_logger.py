@@ -24,9 +24,20 @@ def _now_str() -> str:
     return datetime.now(_ET).strftime("%Y-%m-%d %H:%M:%S %Z")
 
 
+# Stop-attribution keys. Declared here (not built ad hoc at the call site) so
+# every record carries the same shape whether or not the caller supplies them —
+# the same uniformity rule the fill_price/signal_price/slippage trio follows.
+# An exit written before this existed simply has them absent, which reads as
+# "unknown", NOT as "the floor was inactive": the analyzer must not count a
+# pre-2026-08-13 exit as evidence either way.
+_STOP_ATTR_KEYS = ("profit_floor_active", "profit_floor_price",
+                   "atr_trail_at_exit", "floor_caused_exit")
+
+
 def log_trade(action: str, symbol: str, quantity: int, price: float,
               order_type: str, order_id=None, notes: str = "",
-              fill_price=None, signal_price=None, slippage=None) -> None:
+              fill_price=None, signal_price=None, slippage=None,
+              stop_attr: dict | None = None) -> None:
     """Append one trade record to the trade log.
 
     `price` stays the signal-bar close for backward compatibility (the ledger
@@ -35,6 +46,13 @@ def log_trade(action: str, symbol: str, quantity: int, price: float,
     fill than signalled); these are None for exits and on a fill-lookup miss.
     The three keys are ALWAYS written on new records (null when absent) so the
     ledger schema is uniform going forward — existing records are never rewritten.
+
+    `stop_attr` carries which floor was holding the stop when a stop-exit fired
+    (see _STOP_ATTR_KEYS). Only the trailing-stop exit path supplies it; every
+    other record writes the keys as null. Without it a stop-out at a profit-floor
+    rung, at a breakeven lock and at a plain ATR trail are indistinguishable in
+    the ledger — all three write the same "trailing stop hit @ X" note — so the
+    ladder could never be evaluated against the trail it overrides.
     """
     record = {
         "timestamp":    _now_str(),
@@ -49,6 +67,7 @@ def log_trade(action: str, symbol: str, quantity: int, price: float,
         "fill_price":   fill_price,
         "slippage":     slippage,
     }
+    record.update({k: (stop_attr or {}).get(k) for k in _STOP_ATTR_KEYS})
     with open(config.TRADE_LOG_FILE, "a") as f:
         f.write(json.dumps(record) + "\n")
     if fill_price is not None:

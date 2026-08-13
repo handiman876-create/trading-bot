@@ -620,18 +620,25 @@ PROFIT_FLOOR_STEPS_DESC = _validate_profit_floor_steps(PROFIT_FLOOR_STEPS)
 
 # Should an armed rung also RAISE the resting broker GTC floor to match?
 #
-# OFF by design pending a decision. The GTC floor is placed once at entry and
-# never moved (see _floor_price), and there is no modify/replace call in the
-# broker client — raising it means cancel-then-place, which opens a window with
-# NOTHING resting behind the position. If the placement leg fails, the position
-# is unprotected until the next restart, because reconcile_broker_floors is
-# one-shot per process (startup only) and will not re-arm mid-session.
+# ON since 2026-08-13. This is what turns the ladder from a bot-managed level
+# into a real resting order: the bot's stop only exists while this process is
+# alive and the market is open, so before this, a locked-in gain had NO overnight
+# gap protection at all — the GTC still sat at its entry-time disaster level.
 #
-# When True the new floor is set a buffer BELOW the rung (the same absolute gap
+# The cost, accepted deliberately: there is no modify/replace in the broker
+# client, so raising means cancel-then-place, and there is a window with NOTHING
+# resting. If the placement leg fails the position is unfloored until the next
+# restart, because reconcile_broker_floors is one-shot per process (startup
+# only). That failure is loud — BROKER FLOOR RAISE ... re-place FAILED, counter
+# _floor_raise_failures — because nothing else will catch it.
+#
+# The new floor is set a buffer BELOW the rung (the same absolute gap
 # BROKER_STOP_FLOOR_BUFFER opens at entry), never AT it — a GTC resting exactly
 # on the bot's stop races it, and a broker stop that wins that race turns a
-# managed exit into a market order.
-ENABLE_PROFIT_FLOOR_BROKER_RAISE = False
+# managed exit into a market order at an untrailed level. That invariant is the
+# whole reason _floor_price refuses to derive from the trailed stop; raising to
+# the rung minus the buffer keeps it.
+ENABLE_PROFIT_FLOOR_BROKER_RAISE = True
 
 # ── Broker-native stop floor (disaster backstop) ──────────────────────────────
 # The bot's ATR stop lives in this process: it only exists while the bot is

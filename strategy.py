@@ -1371,6 +1371,19 @@ def _check_and_trail_stop(symbol: str, held: int, sig: dict,
         exit_side, exit_qty = "sell", held
         exit_action = "SELL"
 
+    # Which source is holding the stop RIGHT NOW. Recomputed every cycle rather
+    # than latched once: a sticky "floor_active = True" would still be set long
+    # after the trail overtook the rung, and every later stop-out would be
+    # mis-credited to the ladder. profit_floor_price is monotonic (it mirrors the
+    # stop's own ratchet) so a rung that un-arms when price falls back still
+    # names the level it left behind — that level is genuinely what is holding
+    # the stop, and the attribution should say so.
+    if rung is not None and rec["stop_price"] == round(rung[0], 4):
+        rec["profit_floor_price"] = round(rung[0], 4)
+    rec["profit_floor_active"] = (
+        rec.get("profit_floor_price") is not None
+        and rec["stop_price"] == rec["profit_floor_price"])
+
     # Trail log — fires only when the stop actually MOVED, i.e. on a new extreme.
     # The unconditional _save_stops below runs every poll for every held name
     # (~55k polls/8 sessions in the logs), so an unguarded line here would bury
@@ -1425,10 +1438,32 @@ def _check_and_trail_stop(symbol: str, held: int, sig: dict,
         _maybe_raise_broker_floor(symbol, abs(held), rec, account_id, rung)
 
     if breached:
+        # Attribution, captured at the breach: was this stop-out CAUSED by the
+        # ladder, or merely one the ladder happened to be sitting on?
+        #
+        # "Caused" is the counterfactual, not a price comparison: the floor is
+        # holding the stop AND the raw ATR trail alone would NOT have fired at
+        # this price. When both would have fired, the trail was going to close
+        # the trade anyway and crediting the ladder would inflate its record.
+        # This is the number the HELPING/HURTING verdict rests on, so it has to
+        # answer "what would have happened without the feature", nothing looser.
+        floor_active = bool(rec.get("profit_floor_active"))
+        trail_would_fire = (price >= raw_trail if direction == "short"
+                            else price <= raw_trail)
+        stop_attr = {
+            "profit_floor_active": floor_active,
+            "profit_floor_price":  rec.get("profit_floor_price"),
+            "atr_trail_at_exit":   round(raw_trail, 4),
+            "floor_caused_exit":   floor_active and not trail_would_fire,
+        }
+        src = ("profit floor" if floor_active else
+               "breakeven lock" if apply_floor and entry
+               and rec["stop_price"] == entry_r else "atr trail")
         logger.warning("STOP-LOSS EXIT %s %s x%d @ %.2f (stop=%.2f entry=%.2f "
-                       "water=%.2f) — exit #%d",
+                       "water=%.2f, held by %s, trail=%.2f) — exit #%d",
                        symbol, direction, exit_qty, price, rec["stop_price"],
-                       rec["entry_price"], water, _stop_exits + 1)
+                       rec["entry_price"], water, src, raw_trail,
+                       _stop_exits + 1)
         # _submit_exit_order clears the floor FIRST and confirms the broker
         # actually executed the exit; `ok` is False when the position is still
         # open, in which case nothing below may run.
@@ -1449,9 +1484,13 @@ def _check_and_trail_stop(symbol: str, held: int, sig: dict,
             # stopped-out name free to re-enter on the next cross the same day.
             _mark_bought(symbol)
             _mark_sold(symbol)
+            # The note names the source too: _exit_reason still buckets this as
+            # "stop" (it substring-matches "trailing stop"), but a human reading
+            # the ledger no longer has to reverse-engineer the level against
+            # entry to tell which floor fired.
             _log_exit_trade(exit_action, symbol, exit_qty, price, order_id,
-                            f"trailing stop hit @ {rec['stop_price']:.2f}",
-                            account_id)
+                            f"trailing stop hit @ {rec['stop_price']:.2f} ({src})",
+                            account_id, stop_attr=stop_attr)
             return True
         logger.error("STOP-LOSS EXIT %s: %s order failed — position still open, "
                      "stop record kept, retrying next cycle", symbol, exit_side)
@@ -1673,7 +1712,8 @@ def _resolve_fill(symbol: str, account_id: str, order_id: Optional[str],
 
 
 def _log_exit_trade(action: str, symbol: str, qty, price: float, order_id,
-                    notes: str, account_id: str) -> None:
+                    notes: str, account_id: str,
+                    stop_attr: Optional[dict] = None) -> None:
     """Resolve the real fill for an EXIT and write the trade record.
 
     One dispatch point for all eight exit paths (stop-loss, profit take, crisis
@@ -1681,10 +1721,16 @@ def _log_exit_trade(action: str, symbol: str, qty, price: float, order_id,
     called log_trade directly with no fill resolution, which is precisely how
     every exit leg ended up signal-priced. Adding it per-site would have meant
     eight chances to forget the argument on the next exit path someone writes.
+
+    `stop_attr` is supplied only by the trailing-stop path — it names which floor
+    was holding the stop. The other seven exits leave it None and the keys are
+    written null, so the schema stays uniform without those paths pretending to
+    know something about a stop they never consulted.
     """
     _, fill_px, slippage = _resolve_fill(symbol, account_id, order_id, price, action)
     log_trade(action, symbol, qty, price, "market", order_id, notes,
-              fill_price=fill_px, signal_price=price, slippage=slippage)
+              fill_price=fill_px, signal_price=price, slippage=slippage,
+              stop_attr=stop_attr)
 
 
 def _enter_long(symbol: str, sig: dict, price: float, account_id: str,

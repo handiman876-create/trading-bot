@@ -331,6 +331,14 @@ def _normalize(raw: dict) -> dict | None:
         "direction":       direction,
         "feature":         feature,
         "estimated_entry": False,
+        # Stop attribution (exits written on/after 2026-08-13). ABSENT on older
+        # records, and absent must stay distinguishable from False — an exit that
+        # predates the ladder is not evidence the ladder was inactive, it is no
+        # evidence at all. Hence None, never a `or False` default.
+        "profit_floor_active": raw.get("profit_floor_active"),
+        "profit_floor_price":  raw.get("profit_floor_price"),
+        "atr_trail_at_exit":   raw.get("atr_trail_at_exit"),
+        "floor_caused_exit":   raw.get("floor_caused_exit"),
     }
 
 
@@ -497,6 +505,10 @@ def _pair_round_trips(events: list):
                 "exit_price_src":  exit_src,
                 "price_basis":     basis,
                 "exit_reason":     _exit_reason(ev.get("notes")),
+                "profit_floor_active": ev.get("profit_floor_active"),
+                "profit_floor_price":  ev.get("profit_floor_price"),
+                "atr_trail_at_exit":   ev.get("atr_trail_at_exit"),
+                "floor_caused_exit":   ev.get("floor_caused_exit"),
                 "pnl":             round(pnl, 2),
                 "pnl_pct":         _pnl_pct(direction, entry_price, exit_price),
                 "win":             pnl > 0,
@@ -844,6 +856,7 @@ def build_report(ledger: dict, stops: dict, data_quality: dict,
         "open_mark":    open_mark,
         "spy":          spy,
         "warnings":     _build_warnings(agg),
+        "profit_floor": _profit_floor_stats(closed),
         "data_quality": data_quality,
     }
 
@@ -858,6 +871,112 @@ def _fmt_pct(v) -> str:
 
 def _fmt_iv(v) -> str:
     return f"{v:.1f}%" if isinstance(v, (int, float)) else "n/a"
+
+
+MIN_FLOOR_TRIPS_FOR_VERDICT = 3
+
+
+def _profit_floor_stats(closed_trips: list) -> dict:
+    """Is the ladder earning its keep, or cutting winners short?
+
+    Reads only stop-reason trips. Three populations, kept strictly separate:
+
+      unknown  — profit_floor_active is None: the exit predates the ladder
+                 (< 2026-08-13) or came from a non-stop path. NOT evidence the
+                 floor was inactive; excluded from every denominator.
+      active   — the ladder was holding the stop when it fired.
+      caused   — active AND the raw ATR trail would NOT have fired at that price,
+                 i.e. the trade would still be open without the ladder.
+
+    HONEST LIMIT: the true dollar impact of a floor-caused exit is what price did
+    AFTERWARDS, and nothing here knows that — the analyzer reads the ledger, not
+    forward bars. So this reports (a) realized P&L on floor-caused exits and (b)
+    'room given up': how far the trail sat beyond the floor at exit, which bounds
+    how much earlier the ladder fired. It does NOT claim a counterfactual P&L.
+    Summing realized P&L and calling it "floor impact" would be wrong in the
+    common case — a floor-caused exit on a WINNER still books a profit, which
+    reads as the ladder helping even if price then doubled.
+    """
+    stops = [t for t in closed_trips if t.get("exit_reason") == "stop"]
+    known = [t for t in stops if t.get("profit_floor_active") is not None]
+    active = [t for t in known if t.get("profit_floor_active")]
+    caused = [t for t in active if t.get("floor_caused_exit")]
+    realized = round(sum(t.get("pnl") or 0 for t in caused), 2)
+    wins = sum(1 for t in caused if t.get("win"))
+    room = 0.0
+    for t in caused:
+        fl, tr, qty = (t.get("profit_floor_price"),
+                       t.get("atr_trail_at_exit"), t.get("qty") or 0)
+        if fl is not None and tr is not None:
+            room += abs(fl - tr) * qty
+
+    # The verdict refuses to judge on a thin sample. A ladder that has fired
+    # twice tells you nothing, and a confident HELPING/HURTING at n=2 is exactly
+    # how a safety net gets pulled for the wrong reason.
+    if len(caused) < MIN_FLOOR_TRIPS_FOR_VERDICT:
+        verdict = "INSUFFICIENT DATA"
+    elif realized > 0 and wins / len(caused) >= 0.5:
+        verdict = "HELPING"
+    elif realized < 0:
+        verdict = "HURTING"
+    else:
+        verdict = "NEUTRAL"
+    return {
+        "stop_exits":       len(stops),
+        "attributed":       len(known),
+        "unattributed":     len(stops) - len(known),
+        "floor_active":     len(active),
+        "floor_caused":     len(caused),
+        "trail_would_fire": len(active) - len(caused),
+        "realized_on_caused": realized,
+        "winners_on_caused":  wins,
+        "room_given_up":    round(room, 2),
+        "verdict":          verdict,
+    }
+
+
+def _profit_floor_lines(st: dict | None) -> list[str]:
+    """Render _profit_floor_stats. Separate from the computation so the numbers
+    land in the JSON report too, rather than existing only as formatted text."""
+    L = ["=== PROFIT FLOOR ANALYSIS ==="]
+    st = st or {}
+    if not st.get("attributed"):
+        n = st.get("unattributed", 0)
+        L.append(f"  no attributed stop exits yet"
+                 + (f" ({n} stop exit(s) predate the ladder, not counted)"
+                    if n else ""))
+        L.append("  the ladder only leaves a trace when a floor-held stop FIRES; "
+                 "rungs that stay inert never appear here")
+        return L
+
+    L.append(f"  attributed stop exits:     {st['attributed']}"
+             + (f"   ({st['unattributed']} older/unattributed, excluded)"
+                if st["unattributed"] else ""))
+    L.append(f"  trades with floor active:  {st['floor_active']} of {st['attributed']}")
+    L.append(f"  floor caused exit:         {st['floor_caused']} of {st['floor_active']}")
+    L.append(f"  trail would have fired:    {st['trail_would_fire']} of {st['floor_active']}")
+    if st["floor_caused"]:
+        L.append(f"  realized on floor-caused:  "
+                 f"{_fmt_money(st['realized_on_caused'])} "
+                 f"({st['winners_on_caused']}/{st['floor_caused']} winners)")
+        L.append(f"  room given up vs trail:    "
+                 f"{_fmt_money(st['room_given_up'])} "
+                 f"(how much further the trail sat; NOT a realized loss)")
+    if st["verdict"] == "INSUFFICIENT DATA":
+        L.append(f"  verdict: INSUFFICIENT DATA — {st['floor_caused']} "
+                 f"floor-caused exit(s), need "
+                 f"{MIN_FLOOR_TRIPS_FOR_VERDICT}+ before this means anything")
+    else:
+        detail = {
+            "HELPING": "floor-caused exits are net profitable",
+            "HURTING": ("floor-caused exits are net negative; the ladder is "
+                        "firing on trades the trail would have held"),
+            "NEUTRAL": "no clear signal either way",
+        }[st["verdict"]]
+        L.append(f"  verdict: {st['verdict']} — {detail}")
+        L.append("  (still not a counterfactual — confirming this needs "
+                 "post-exit price paths the ledger does not carry)")
+    return L
 
 
 def _ab_screen_lines(tracking: dict | None = None) -> list[str]:
@@ -1068,6 +1187,8 @@ def render_txt(report: dict) -> str:
             L.append(f"      - {r['symbol']} {r['direction']} x{r['qty']} "
                      f"@ {r['entry_ts']} — {r['reason']}")
     L.append(f"  new events added to ledger this run: {dq.get('new_events_added', 0)}")
+    L.append("")
+    L.extend(_profit_floor_lines(report.get("profit_floor")))
     L.append("")
     L.append("A/B SCREEN TRACKER")
     L.extend(_ab_screen_lines())

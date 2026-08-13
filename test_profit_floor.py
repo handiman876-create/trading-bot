@@ -42,7 +42,17 @@ def _fake_cancel(account_id, order_id):
 
 
 def _fake_outcome(account_id, order_id):
-    return {"state": _outcome_state}
+    """`state` means opposite things to the two callers that poll it, so the stub
+    must answer per-order rather than globally.
+
+      floor ids ("OLD*")  — _wait_floor_clear: "dead" == the cancel took effect.
+      exit order ids      — _submit_exit_order step 3: "dead" == the broker
+                            REJECTED the exit, so a global "dead" would make
+                            every stop-out silently fail to exit.
+    """
+    if str(order_id).startswith("OLD"):
+        return {"state": _outcome_state}
+    return {"state": "filled"}
 
 
 def _fake_quote(price):
@@ -287,8 +297,8 @@ def test_broker_floor_raise_is_one_shot_per_rung():
     assert strategy._floors_raised == 1
 
 
-def test_broker_floor_raise_off_by_default_leaves_gtc_alone():
-    _reset(quote_price=130.0)                    # flag stays False from _reset
+def test_broker_floor_raise_disabled_leaves_gtc_alone():
+    _reset(quote_price=130.0)   # _reset pins the flag False; config default is now True
     strategy._save_stops({"AAA": _rec(atr=10.0, water=130.0,
                                       broker_order_id="OLD1",
                                       broker_floor_price=70.0)})
@@ -331,6 +341,105 @@ def test_old_floor_filled_mid_raise_places_nothing():
                                    "ACCT", [])
     assert _orders == [], f"nothing may be placed after a fill, got {_orders}"
     assert strategy._floors_raised == 0
+
+
+# ── Exit attribution ──────────────────────────────────────────────────────────
+
+def _capture_trades():
+    """Capture (action, notes, stop_attr) from strategy.log_trade."""
+    seen = []
+    orig = strategy.log_trade
+    strategy.log_trade = lambda a, s, q, p, ot, oid=None, notes="", **kw: seen.append(
+        (a, notes, kw.get("stop_attr")))
+    return seen, orig
+
+
+def test_floor_caused_exit_when_trail_would_not_have_fired():
+    """Stop held by the rung, price above the raw trail -> the ladder CAUSED it."""
+    _reset(quote_price=130.0)
+    strategy._save_stops({"AAA": _rec(atr=10.0, water=130.0)})
+    strategy._check_and_trail_stop("AAA", 10, {"close": 130.0, "atr": 10.0},
+                                   "ACCT", [])          # arms rung at 125
+    strategy.tc.get_quote = _fake_quote(124.0)          # breaches 125, trail is 105
+    seen, orig = _capture_trades()
+    try:
+        exited = strategy._check_and_trail_stop("AAA", 10,
+                                                {"close": 124.0, "atr": 10.0},
+                                                "ACCT", [])
+    finally:
+        strategy.log_trade = orig
+    assert exited is True, "price 124 must breach the 125 floor"
+    assert len(seen) == 1, seen
+    action, notes, attr = seen[0]
+    assert attr["profit_floor_active"] is True, attr
+    assert abs(attr["profit_floor_price"] - 125.0) < 0.01, attr
+    assert abs(attr["atr_trail_at_exit"] - 105.0) < 0.01, attr
+    assert attr["floor_caused_exit"] is True, attr
+    assert "profit floor" in notes, notes
+    assert "trailing stop" in notes, "must stay parseable by _exit_reason"
+
+
+def test_trail_exit_is_not_credited_to_the_floor():
+    """A stop-out the ATR trail would ALSO have caused is not the ladder's."""
+    _reset(quote_price=130.0)
+    strategy._save_stops({"AAA": _rec(atr=1.0, water=130.0)})   # tight trail wins
+    strategy._check_and_trail_stop("AAA", 10, {"close": 130.0, "atr": 1.0},
+                                   "ACCT", [])          # stop = 127.5 (trail)
+    strategy.tc.get_quote = _fake_quote(127.0)
+    seen, orig = _capture_trades()
+    try:
+        strategy._check_and_trail_stop("AAA", 10, {"close": 127.0, "atr": 1.0},
+                                       "ACCT", [])
+    finally:
+        strategy.log_trade = orig
+    _, notes, attr = seen[0]
+    assert attr["profit_floor_active"] is False, attr
+    assert attr["floor_caused_exit"] is False, attr
+    assert "atr trail" in notes, notes
+
+
+def test_short_exit_attribution_does_not_default_to_true():
+    """Regression: a short with NO floor must not read as floor-caused. Comparing
+    exit price against a `profit_floor_price` defaulted to 0 makes every short
+    exit look caused by the ladder."""
+    _reset(quote_price=99.0)
+    strategy._save_stops({"SSS": _rec(direction="short", atr=1.0, water=99.0)})
+    strategy._check_and_trail_stop("SSS", -10, {"close": 99.0, "atr": 1.0},
+                                   "ACCT", [])          # stop = 101.5, no rung
+    strategy.tc.get_quote = _fake_quote(102.0)
+    seen, orig = _capture_trades()
+    try:
+        strategy._check_and_trail_stop("SSS", -10, {"close": 102.0, "atr": 1.0},
+                                       "ACCT", [])
+    finally:
+        strategy.log_trade = orig
+    _, _, attr = seen[0]
+    assert attr["profit_floor_active"] is False, attr
+    assert attr["floor_caused_exit"] is False, attr
+    assert attr["profit_floor_price"] is None, attr
+
+
+def test_floor_active_is_not_sticky_once_trail_overtakes():
+    """The rung sets the stop, then the trail ratchets past it: attribution must
+    hand the credit back to the trail.
+
+    Note where the crossover actually is. The ladder keeps STEPPING as the gain
+    grows, so it does not fall behind at +60% (rung 145 still beats trail 135) —
+    it only stops climbing at the top rung (+50% -> lock 45%). Past that the
+    trail keeps rising and takes over on its own, here at +75%: trail 150 > the
+    capped rung 145. Any test that expects the trail to win earlier is testing a
+    ladder that steps once, which is not this one."""
+    _reset(quote_price=130.0)
+    strategy._save_stops({"AAA": _rec(atr=10.0, water=130.0)})
+    strategy._check_and_trail_stop("AAA", 10, {"close": 130.0, "atr": 10.0},
+                                   "ACCT", [])
+    assert strategy._load_stops()["AAA"]["profit_floor_active"] is True
+    strategy.tc.get_quote = _fake_quote(175.0)          # trail 150 > capped rung 145
+    strategy._check_and_trail_stop("AAA", 10, {"close": 175.0, "atr": 10.0},
+                                   "ACCT", [])
+    rec = strategy._load_stops()["AAA"]
+    assert abs(rec["stop_price"] - 150.0) < 0.01, rec
+    assert rec["profit_floor_active"] is False, rec
 
 
 if __name__ == "__main__":
