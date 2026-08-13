@@ -561,6 +561,78 @@ VIX_CRISIS_SHADOW = True
 ENABLE_BREAKEVEN_LOCK = True
 BREAKEVEN_LOCK_ATR    = 1.0    # favorable excursion (in entry-ATRs) required to arm
 
+# ── Profit floor ladder (percentage stop floors that step up with the gain) ───
+# A ladder of static, ENTRY-anchored floors. Each rung reads: once the position
+# is up `trigger` from entry, its stop may never again fall below `lock` of
+# profit. COMPLEMENTS the ATR trail and the breakeven lock rather than replacing
+# either — the effective stop is the most protective of the three:
+#     long  stop = max(atr_trail, breakeven_floor, profit_floor)
+#     short stop = min(atr_trail, breakeven_floor, profit_floor)
+# so a rung only ever BINDS when the ATR trail is wider than it. That is the
+# case this exists for: a high-ATR name whose trail sits so far back that a large
+# gain can round-trip to nothing. On a tight trail the ladder is inert by
+# construction (all five open positions on 2026-08-13 were inert — the trail was
+# already the higher floor on every one).
+#
+# Applies to longs AND shorts; a short's rungs mirror below entry.
+#
+# EVERY rung MUST have lock < trigger. That gap is exactly what keeps the floor
+# unreachable through the market: when a rung arms, price is at `trigger` and the
+# rung sits at `lock`, strictly behind it. A rung with lock >= trigger would arm
+# a stop at or beyond the current price and force an instant exit — the same
+# failure the breakeven lock's underwater guard exists to prevent. Rungs are
+# validated at import, so a bad edit fails the bot at boot rather than silently
+# stopping out every winner.
+#
+# BAD — DO NOT do this:
+#     (0.15, 0.15)   # lock == trigger: floor lands ON the market, instant exit
+#     (0.20, 0.25)   # lock  > trigger: floor lands THROUGH the market, worse
+ENABLE_PROFIT_FLOOR = True
+PROFIT_FLOOR_STEPS = [
+    (0.15, 0.10),   # +15% gain → lock +10%
+    (0.20, 0.15),   # +20% gain → lock +15%
+    (0.25, 0.20),   # +25% gain → lock +20%
+    (0.30, 0.25),   # +30% gain → lock +25%
+    (0.40, 0.35),   # +40% gain → lock +35%
+    (0.50, 0.45),   # +50% gain → lock +45%
+]
+
+
+def _validate_profit_floor_steps(steps):
+    """Reject rungs that would arm a stop at or through the market, and return
+    the ladder sorted highest-trigger-first.
+
+    Pre-sorting here rather than in the hot path matters: the trail runs every
+    poll for every held name (~55k times over 8 sessions in the logs), and the
+    ladder is a module-level constant that cannot change between polls.
+    """
+    bad = [(t, lk) for t, lk in steps if lk >= t]
+    if bad:
+        raise ValueError(
+            "PROFIT_FLOOR_STEPS rungs must have lock < trigger (a rung with "
+            "lock >= trigger arms the stop at or through the market and forces "
+            "an instant exit); offending rungs: %r" % (bad,))
+    return sorted(steps, reverse=True)
+
+
+# Descending by trigger, so the first rung a gain clears is the highest one.
+PROFIT_FLOOR_STEPS_DESC = _validate_profit_floor_steps(PROFIT_FLOOR_STEPS)
+
+# Should an armed rung also RAISE the resting broker GTC floor to match?
+#
+# OFF by design pending a decision. The GTC floor is placed once at entry and
+# never moved (see _floor_price), and there is no modify/replace call in the
+# broker client — raising it means cancel-then-place, which opens a window with
+# NOTHING resting behind the position. If the placement leg fails, the position
+# is unprotected until the next restart, because reconcile_broker_floors is
+# one-shot per process (startup only) and will not re-arm mid-session.
+#
+# When True the new floor is set a buffer BELOW the rung (the same absolute gap
+# BROKER_STOP_FLOOR_BUFFER opens at entry), never AT it — a GTC resting exactly
+# on the bot's stop races it, and a broker stop that wins that race turns a
+# managed exit into a market order.
+ENABLE_PROFIT_FLOOR_BROKER_RAISE = False
+
 # ── Broker-native stop floor (disaster backstop) ──────────────────────────────
 # The bot's ATR stop lives in this process: it only exists while the bot is
 # running and the market is open. It cannot protect against an overnight gap or

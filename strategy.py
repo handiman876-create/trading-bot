@@ -457,6 +457,9 @@ _cross_sustain_blocks = 0  # gap-valid entry crosses deferred by CROSS_SUSTAIN_M
 _regime_short_blocks = 0   # would-be short entries suppressed by SHORT_MIN_REGIME
 _stops_trailed = 0         # trailing stops that actually moved (new extreme)
 _breakeven_locks = 0       # stops floored at entry after +1 ATR of profit (principal locked)
+_profit_floors = 0         # stops raised to a profit-ladder rung (profit locked, not just principal)
+_floors_raised = 0         # broker GTC floors moved up to match a rung
+_floor_raise_failures = 0  # GTC raises that cancelled but failed to re-place (position unfloored!)
 _history_gaps_held = 0     # polls that evaluated NO stop because history was unavailable
                            # AND the name was held (flat names are not counted)
 _option_expiry_drops    = 0  # stored contracts cleared because their expiration passed
@@ -1131,6 +1134,131 @@ def reconcile_stops(positions: list[dict]) -> None:
         _save_stops(stops)
 
 
+def _profit_floor(rec: dict, price: float) -> Optional[tuple[float, float, float]]:
+    """Highest armed rung of the profit-floor ladder as (floor_price, trigger, lock),
+    or None when no rung is armed (feature off, no entry basis, or gain too small).
+
+    Takes the live `price` the caller is already trailing on — deliberately NOT
+    sig["close"]. _check_and_trail_stop runs off _live_price() and only falls back
+    to the daily bar when that fails; a floor computed from the daily close while
+    the trail beside it uses the live tick would arm off a stale number and could
+    disagree with the very stop it is feeding.
+
+    Entry-anchored and stateless: the rung is a pure function of entry, direction
+    and the current gain, so it never creeps toward the market the way a level
+    recomputed off a trailed stop would. Monotonicity is NOT this function's job —
+    a rung can un-arm when price falls back, and the caller's existing ratchet
+    (stop_price only ever moves favorably) is what makes the floor permanent.
+    """
+    if not config.ENABLE_PROFIT_FLOOR:
+        return None
+    entry = rec.get("entry_price")
+    if not entry or entry <= 0:
+        return None                       # no basis -> cannot size the gain
+    direction = rec.get("direction", "long")
+    gain = ((entry - price) / entry) if direction == "short" \
+        else ((price - entry) / entry)
+    for trigger, lock in config.PROFIT_FLOOR_STEPS_DESC:
+        if gain >= trigger:
+            floor = entry * (1 - lock) if direction == "short" \
+                else entry * (1 + lock)
+            return floor, trigger, lock
+    return None
+
+
+def _maybe_raise_broker_floor(symbol: str, qty: int, rec: dict, account_id: str,
+                              rung: Optional[tuple[float, float, float]]) -> None:
+    """Move the resting GTC floor up to match a newly armed ladder rung.
+
+    Mutates `rec` (broker_order_id / broker_floor_price / broker_floor_lock) so the
+    caller persists it in the same write as the rest of the stop record.
+
+    Two invariants this must not break, both inherited from _floor_price:
+      * The floor sits BEYOND the bot's stop, never on it. The new level is the
+        rung set back by the same absolute gap the buffer opens at entry
+        ((buffer - 1) x mult x atr), so the bot still trips first in normal
+        trading and the GTC stays what it is meant to be — gap insurance.
+      * It only ever moves in the protective direction. Guarded explicitly rather
+        than assumed from rung ordering.
+
+    There is no modify/replace in the broker client, so this is cancel-then-place
+    and there is a window with nothing resting. Ordering is forced: placing first
+    would leave two GTC stops against the same shares, and whichever did not fill
+    becomes an orphan that opens an unintended position on the next print through
+    it (the failure _cancel_broker_floor exists to prevent). Cancel-first trades
+    that for a gap, which is why a failed re-place is logged as loudly as it is:
+    reconcile_broker_floors is startup-only, so nothing re-arms until a restart.
+    """
+    global _floors_raised, _floor_raise_failures
+    if not (config.ENABLE_BROKER_STOP_FLOOR
+            and config.ENABLE_PROFIT_FLOOR_BROKER_RAISE):
+        return
+    if rung is None or not account_id or not qty or qty < 1:
+        return
+    floor_price, _trigger, lock = rung
+    # Idempotence across polls: a rung stays armed every cycle once cleared, so
+    # without this the raise would re-fire on every single poll. Keyed on the
+    # lock actually resting at the broker, not on the rung, so a failed raise
+    # retries next cycle instead of being latched out.
+    if lock <= rec.get("broker_floor_lock", 0.0):
+        return
+    old_id = rec.get("broker_order_id")
+    if not old_id:
+        return                            # nothing resting; reconcile owns re-arm
+
+    direction = rec.get("direction", "long")
+    gap = ((config.BROKER_STOP_FLOOR_BUFFER - 1.0)
+           * rec["atr_mult"] * rec["atr_at_entry"])
+    target = floor_price + gap if direction == "short" else floor_price - gap
+    cur = rec.get("broker_floor_price")
+    if cur is not None and (target >= cur if direction == "short"
+                            else target <= cur):
+        return                            # not an improvement — leave it resting
+
+    if not _cancel_broker_floor(symbol, rec, account_id):
+        return                            # old floor still resting: still protected
+    state = _wait_floor_clear(symbol, old_id, account_id)
+    if state == "filled":
+        # The floor executed while we were raising it — the position is already
+        # closed. Placing anything now would open a NEW position.
+        logger.warning("BROKER FLOOR RAISE %s: old floor %s filled mid-raise — "
+                       "position already closed, not placing a new floor",
+                       symbol, old_id)
+        rec.pop("broker_order_id", None)
+        rec.pop("broker_floor_price", None)
+        return
+    if state == "stuck":
+        logger.error("BROKER FLOOR RAISE %s: old floor %s still resting after "
+                     "cancel — not placing a second stop against the same "
+                     "shares; will retry next cycle", symbol, old_id)
+        return
+
+    side = "buy_to_cover" if direction == "short" else "sell"
+    result = tc.place_equity_order(account_id, symbol, side, qty,
+                                   order_type="stop", duration="gtc",
+                                   stop_price=round(target, 2))
+    if not result:
+        _floor_raise_failures += 1
+        rec.pop("broker_order_id", None)
+        rec.pop("broker_floor_price", None)
+        rec.pop("broker_floor_lock", None)
+        logger.error("BROKER FLOOR RAISE %s: re-place FAILED after cancel — "
+                     "position is now UNFLOORED (no gap protection) and "
+                     "reconcile is startup-only, so it stays that way until a "
+                     "restart; bot-managed stop still active — failures #%d",
+                     symbol, _floor_raise_failures)
+        return
+    rec["broker_order_id"] = result.get("order", {}).get("id")
+    rec["broker_floor_price"] = round(target, 2)
+    rec["broker_floor_lock"] = lock
+    _floors_raised += 1
+    logger.info("BROKER FLOOR RAISE %s %s x%d: %.2f → %.2f GTC (rung locks "
+                "%.0f%% at %.2f, floor set %.2f behind it) order=%s — raises #%d",
+                symbol, side, qty, cur if cur is not None else float("nan"),
+                target, lock * 100, floor_price, gap,
+                rec["broker_order_id"], _floors_raised)
+
+
 def _check_and_trail_stop(symbol: str, held: int, sig: dict,
                           account_id: str, positions: list[dict],
                           regime: str = "risk_on") -> bool:
@@ -1138,7 +1266,7 @@ def _check_and_trail_stop(symbol: str, held: int, sig: dict,
 
     Returns True iff a stop-exit order was placed (caller then returns, skipping
     signal logic for the cycle). False = no exit; continue to EMA-cross logic."""
-    global _stop_exits, _stops_trailed, _breakeven_locks
+    global _stop_exits, _stops_trailed, _breakeven_locks, _profit_floors
 
     price = _live_price(symbol)
     if price is None:
@@ -1200,6 +1328,24 @@ def _check_and_trail_stop(symbol: str, held: int, sig: dict,
 
     apply_floor = crisis_floor or breakeven_lock
 
+    # Profit-floor ladder: an entry-anchored rung that steps up with the gain.
+    # Computed ONCE here, not inside both direction branches — those already
+    # differ only in min vs max, and pushing the ladder into each would be the
+    # same logic dispatched to two sites.
+    rung = _profit_floor(rec, price)
+
+    # Collapse every floor SOURCE into one level so each branch stays a single
+    # min/max. Breakeven (and crisis) contribute `entry`; the ladder contributes
+    # its rung. Most protective wins: highest for a long, lowest for a short.
+    # An armed rung always beats breakeven (lock > 0 ⇒ strictly past entry), so
+    # this reduces to the rung whenever one is armed — the min/max is written out
+    # anyway so that adding a fourth source later cannot silently pick wrong.
+    floor_srcs = [f for f in (entry if apply_floor else None,
+                              rung[0] if rung else None) if f is not None]
+    floor_level = None
+    if floor_srcs:
+        floor_level = min(floor_srcs) if direction == "short" else max(floor_srcs)
+
     # Captured ONCE before the branches: both of them mutate rec["stop_price"],
     # so a log inside each would be the same logic dispatched to two sites.
     old_stop = rec["stop_price"]
@@ -1208,7 +1354,7 @@ def _check_and_trail_stop(symbol: str, held: int, sig: dict,
         # Ratchet DOWN: low-water and stop only ever fall — never raise the stop.
         rec["low_water"] = round(min(rec["low_water"], price), 4)
         raw_trail = rec["low_water"] + mult_atr
-        new_stop = min(raw_trail, entry) if apply_floor else raw_trail  # floor: cap short stop at breakeven
+        new_stop = min(raw_trail, floor_level) if floor_level is not None else raw_trail  # floor: cap short stop at breakeven/rung
         rec["stop_price"] = round(min(rec["stop_price"], new_stop), 4)
         water = rec["low_water"]
         breached = price >= rec["stop_price"]     # price rose into the stop
@@ -1218,7 +1364,7 @@ def _check_and_trail_stop(symbol: str, held: int, sig: dict,
         # Ratchet UP: high-water and stop only ever rise — never lower the stop.
         rec["high_water"] = round(max(rec["high_water"], price), 4)
         raw_trail = rec["high_water"] - mult_atr
-        new_stop = max(raw_trail, entry) if apply_floor else raw_trail  # floor: floor long stop at breakeven
+        new_stop = max(raw_trail, floor_level) if floor_level is not None else raw_trail  # floor: floor long stop at breakeven/rung
         rec["stop_price"] = round(max(rec["stop_price"], new_stop), 4)
         water = rec["high_water"]
         breached = price <= rec["stop_price"]     # price fell into the stop
@@ -1253,6 +1399,30 @@ def _check_and_trail_stop(symbol: str, held: int, sig: dict,
         logger.info("BREAKEVEN LOCK %s %s: floor raised to entry %.2f "
                     "(trail would be %.2f) — locks #%d",
                     symbol, direction, entry, raw_trail, _breakeven_locks)
+
+    # Profit-floor event: log + count once, on the cycle the stop first lands ON
+    # a rung (the raw trail would have left it short). Same transition shape as
+    # the breakeven line above and idempotent for the same reason — once
+    # stop_price sits on the rung, old_stop equals it next cycle. A rung that is
+    # armed but LOSING to a tighter ATR trail never logs, which is the point:
+    # this line means the ladder actually changed the stop, so the counter reads
+    # as "times the ladder earned its keep", not "times it was eligible".
+    rung_r = round(rung[0], 4) if rung else None
+    if rung and old_stop != rung_r and rec["stop_price"] == rung_r:
+        _profit_floors += 1
+        logger.info("PROFIT FLOOR %s %s: stop %.2f → %.2f — +%.0f%% of entry "
+                    "%.2f locked on a +%.0f%% gain (trail would be %.2f) "
+                    "— floors #%d",
+                    symbol, direction, old_stop, rec["stop_price"],
+                    rung[2] * 100, entry, rung[1] * 100, raw_trail,
+                    _profit_floors)
+
+    # Match the resting GTC to the rung. OFF by default
+    # (ENABLE_PROFIT_FLOOR_BROKER_RAISE) — see that flag for why. Skipped on a
+    # breach: the exit path below cancels the floor itself, and raising a floor
+    # we are about to tear down is pure risk.
+    if not breached:
+        _maybe_raise_broker_floor(symbol, abs(held), rec, account_id, rung)
 
     if breached:
         logger.warning("STOP-LOSS EXIT %s %s x%d @ %.2f (stop=%.2f entry=%.2f "
