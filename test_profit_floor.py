@@ -343,6 +343,37 @@ def test_old_floor_filled_mid_raise_places_nothing():
     assert strategy._floors_raised == 0
 
 
+def test_rearm_after_failed_exit_lets_the_ladder_raise_again():
+    """Regression: a floor torn down and RE-ARMED at the entry-time disaster
+    level must not keep the old broker_floor_lock. A surviving lock makes the
+    raise guard return early forever, pinning the GTC at the disaster level for
+    the life of the position with nothing logged."""
+    _reset(quote_price=130.0)
+    config.ENABLE_PROFIT_FLOOR_BROKER_RAISE = True
+    strategy._save_stops({"AAA": _rec(atr=10.0, water=130.0,
+                                      broker_order_id="OLD1",
+                                      broker_floor_price=70.0)})
+    strategy._check_and_trail_stop("AAA", 10, {"close": 130.0, "atr": 10.0},
+                                   "ACCT", [])
+    rec = strategy._load_stops()["AAA"]
+    assert abs(rec["broker_floor_price"] - 120.0) < 0.01, rec
+    assert rec["broker_floor_lock"] == 0.25, rec
+
+    # Tear the floor down the way every exit route does.
+    strategy._forget_broker_floor(rec)
+    assert "broker_floor_lock" not in rec, "lock must not outlive the floor"
+
+    # Re-arm at the entry-time level, then let the ladder raise it again.
+    rec["broker_order_id"], rec["broker_floor_price"] = "OLD2", 70.0
+    strategy._save_stops({"AAA": rec})
+    _orders.clear()
+    strategy._check_and_trail_stop("AAA", 10, {"close": 130.0, "atr": 10.0},
+                                   "ACCT", [])
+    rec = strategy._load_stops()["AAA"]
+    assert len(_orders) == 1, f"the raise must re-fire, got {_orders}"
+    assert abs(rec["broker_floor_price"] - 120.0) < 0.01, rec
+
+
 # ── Exit attribution ──────────────────────────────────────────────────────────
 
 def _capture_trades():

@@ -731,6 +731,30 @@ def _place_broker_floor(symbol: str, qty: int, rec: dict,
                 _floors_placed)
 
 
+def _forget_broker_floor(rec: Optional[dict]) -> None:
+    """Drop every key describing a resting GTC that is no longer resting.
+
+    All THREE must go together, which is why this is a helper and not three pops
+    at each site. broker_floor_lock records which ladder rung the floor was last
+    raised to, and it is the guard that suppresses a repeat raise
+    (_maybe_raise_broker_floor). Both re-arm routes —
+    _rearm_floor_after_failed_exit and reconcile_broker_floors — put the floor
+    back via _place_broker_floor, which places at the ENTRY-TIME disaster level.
+    Leaving the lock behind therefore tells the ladder "that rung is already
+    resting" about a floor now sitting far below it, and the raise never fires
+    again: the position silently keeps the disaster-level floor for its whole
+    life, with no log line saying so.
+
+    Worked example: MSFT raised to 452.81 (lock 0.15); a refused stop exit
+    re-arms it at 369.49; a surviving lock of 0.15 makes every later raise
+    return early. 83 points of gap protection, gone quietly.
+    """
+    if rec is None:
+        return
+    for key in ("broker_order_id", "broker_floor_price", "broker_floor_lock"):
+        rec.pop(key, None)
+
+
 def _cancel_broker_floor(symbol: str, rec: Optional[dict],
                          account_id: Optional[str]) -> bool:
     """Cancel the resting floor behind a position that is leaving. True if gone.
@@ -859,8 +883,7 @@ def _submit_exit_order(symbol: str, side: str, qty: int, account_id: str,
             # the backstop. This is the branch that must never repeat GOOGL:
             # floor down, exit not submitted, nothing rolled back.
             return None, "failed"
-        (rec or {}).pop("broker_order_id", None)
-        (rec or {}).pop("broker_floor_price", None)
+        _forget_broker_floor(rec)
         if cleared == "filled":
             return None, "floor_filled"
 
@@ -1010,8 +1033,7 @@ def reconcile_broker_floors(positions: list[dict], account_id: str) -> None:
             continue
         if rec.get("broker_order_id") in live_ids:
             continue                      # already protected
-        rec.pop("broker_order_id", None)   # stale id: broker says it is gone
-        rec.pop("broker_floor_price", None)
+        _forget_broker_floor(rec)          # stale id: broker says it is gone
         _place_broker_floor(sym, abs(qty), rec, account_id)
         if rec.get("broker_order_id"):
             changed = True
@@ -1224,8 +1246,7 @@ def _maybe_raise_broker_floor(symbol: str, qty: int, rec: dict, account_id: str,
         logger.warning("BROKER FLOOR RAISE %s: old floor %s filled mid-raise — "
                        "position already closed, not placing a new floor",
                        symbol, old_id)
-        rec.pop("broker_order_id", None)
-        rec.pop("broker_floor_price", None)
+        _forget_broker_floor(rec)
         return
     if state == "stuck":
         logger.error("BROKER FLOOR RAISE %s: old floor %s still resting after "
@@ -1239,9 +1260,7 @@ def _maybe_raise_broker_floor(symbol: str, qty: int, rec: dict, account_id: str,
                                    stop_price=round(target, 2))
     if not result:
         _floor_raise_failures += 1
-        rec.pop("broker_order_id", None)
-        rec.pop("broker_floor_price", None)
-        rec.pop("broker_floor_lock", None)
+        _forget_broker_floor(rec)
         logger.error("BROKER FLOOR RAISE %s: re-place FAILED after cancel — "
                      "position is now UNFLOORED (no gap protection) and "
                      "reconcile is startup-only, so it stays that way until a "
