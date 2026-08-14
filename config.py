@@ -588,13 +588,21 @@ BREAKEVEN_LOCK_ATR    = 1.0    # favorable excursion (in entry-ATRs) required to
 #     (0.15, 0.15)   # lock == trigger: floor lands ON the market, instant exit
 #     (0.20, 0.25)   # lock  > trigger: floor lands THROUGH the market, worse
 ENABLE_PROFIT_FLOOR = True
+# The trigger-to-lock gap narrows as the ladder climbs: 5pp on the early rungs
+# (room to breathe through ordinary noise while a trend is still developing),
+# 2pp from +30%, 1pp from +75%. A gain that large is the rare outcome the whole
+# book is paid by, so the priority flips from letting it run to not giving it
+# back. The narrow rungs sit far enough out that on a typical name the ATR trail
+# is the binding floor long before they arm.
 PROFIT_FLOOR_STEPS = [
-    (0.15, 0.10),   # +15% gain → lock +10%
-    (0.20, 0.15),   # +20% gain → lock +15%
-    (0.25, 0.20),   # +25% gain → lock +20%
-    (0.30, 0.25),   # +30% gain → lock +25%
-    (0.40, 0.35),   # +40% gain → lock +35%
-    (0.50, 0.45),   # +50% gain → lock +45%
+    (0.15, 0.10),   # +15% gain  → lock +10%
+    (0.20, 0.15),   # +20% gain  → lock +15%
+    (0.25, 0.20),   # +25% gain  → lock +20%
+    (0.30, 0.28),   # +30% gain  → lock +28%
+    (0.40, 0.38),   # +40% gain  → lock +38%
+    (0.50, 0.49),   # +50% gain  → lock +49%
+    (0.75, 0.74),   # +75% gain  → lock +74%
+    (1.00, 0.99),   # +100% gain → lock +99%
 ]
 
 
