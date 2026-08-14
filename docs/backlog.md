@@ -476,3 +476,49 @@ Specific doubts worth testing once there are closed trades:
 **Acceptable as-is for now** — something is strictly better than the previous
 state (EMA state only, i.e. no premium-based exit at all). Revisit once 5+
 options round trips have closed, and fit rather than guess.
+
+---
+
+## Split profit floor measurement by direction
+
+**Observed (2026-08-14, when `79589ca` made the ladders asymmetric):** the profit
+floor is now two ladders — `PROFIT_FLOOR_STEPS_LONG` (first rung +15%, 5pp gaps
+early) and `PROFIT_FLOOR_STEPS_SHORT` (first rung +8%, 3pp gaps early) — but
+every measurement of the feature is direction-blind. Nothing can currently tell
+whether the short ladder is helping or hurting on its own.
+
+**Why it matters more on the short side.** At +8% with a 3pp gap the short floor
+sits roughly **1 ATR behind price** on a typical name (AAPL's entry ATR is 3.0%
+of entry), so it binds over the ATR trail almost immediately and exits on about
+one ATR of retrace. That is a much more aggressive posture than the long ladder,
+applied to a direction with **no demonstrated edge** — shorts are 0-for-lifetime
+on win rate, `SHORT_MIN_REGIME` is effectively a no-op, and the sentiment-driven
+short session on 2026-07-28 went −$2,389. Shipping an aggressive rule onto an
+unproven direction is exactly when measurement has to come first.
+
+**Direction — two changes, and the second is the one that matters:**
+
+1. **The counter.** `_profit_floors` (strategy.py:460, incremented at :1448) →
+   `_profit_floors_long` / `_profit_floors_short`, split in `_profit_floor()`'s
+   caller where `direction` is already in scope. Reported in the trail log line
+   at strategy.py:1454.
+
+2. **The weekly report — this is the real prerequisite.** The counter is
+   **per-process, resets on every restart, and the weekly report does not read
+   it.** `=== PROFIT FLOOR ANALYSIS ===` is built by `_profit_floor_stats()`
+   (performance_analyzer.py:879) from **ledger trip attribution**, so splitting
+   the counter alone changes nothing the report can see. Partition
+   `_profit_floor_stats` and `_profit_floor_lines` by direction instead. Trips
+   already carry `direction` (performance_analyzer.py:331/390/494), so this needs
+   no new plumbing — but note it splits an already-small sample, and the section
+   already withholds a verdict below 3 floor-caused exits
+   (`MIN_FLOOR_TRIPS_FOR_VERDICT`). Decide whether that threshold applies per
+   direction or to the combined set before splitting, or the report will go
+   silent on both halves.
+
+**Prerequisite for the prerequisite:** there are currently **zero** attributed
+floor exits in the ledger (16 stop exits predate the ladder). Splitting a
+statistic that has no observations yet buys nothing today — build this when the
+first floor-caused exits start landing, and before anyone argues from short-side
+floor numbers. Same control-group problem as the `SHORT_MAX_ATR_PCT` and SPY
+trend confirmation entries above.
