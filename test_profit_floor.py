@@ -8,8 +8,13 @@ touch data/stop_prices.json or place a real order.
 The scenarios are built around ONE deliberate lever: the ATR trail width. The
 ladder is designed to bind only when the trail is WIDER than the rung, so a wide
 ATR (atr=10, mult=2.5 -> 25 points of trail on a 100-point entry) makes the floor
-win, and a tight one (atr=1 -> 2.5 points) makes the trail win. Both directions
-are covered because the ladder mirrors below entry for shorts.
+win, and a tight one (atr=1 -> 2.5 points) makes the trail win.
+
+Longs and shorts run SEPARATE ladders (asymmetric since 2026-08-14), so neither
+direction's expectations can be derived from the other's — the short cases below
+read their values from PROFIT_FLOOR_STEPS_SHORT and must be asserted explicitly.
+The geometry is still mirrored (a short's rung sits below entry); only the
+trigger/lock values differ.
 
 Run:  python3 test_profit_floor.py
 """
@@ -156,29 +161,61 @@ def test_short_rungs_mirror_below_entry():
         "SSS", -10, {"close": 85.0, "atr": 10.0}, "ACCT", [])
     assert exited is False, "short floor must not force an exit"
     rec = strategy._load_stops()["SSS"]
-    # gain = (100-85)/100 = 15% -> lock 10% -> floor = 100 * 0.90 = 90
-    # raw trail = 85 + 25 = 110; min(110, 90) = 90
-    assert abs(rec["stop_price"] - 90.0) < 0.01, rec
+    # gain = (100-85)/100 = 15% -> SHORT ladder locks 13% -> floor = 100*0.87 = 87
+    # (the LONG ladder would lock 10% -> 90; asserting 87 is what proves the
+    # short side reads its own ladder rather than the mirrored long one)
+    # raw trail = 85 + 25 = 110; min(110, 87) = 87
+    assert abs(rec["stop_price"] - 87.0) < 0.01, rec
     assert rec["stop_price"] < 100.0, "short rung must sit BELOW entry"
     assert rec["stop_price"] > 85.0, "short stop must stay ABOVE the market"
     assert strategy._profit_floors == 1, strategy._profit_floors
+
+
+def test_short_arms_at_plus_8_where_a_long_would_not():
+    """The discriminating case: +8% clears the short ladder's first rung but is
+    below the long ladder's first trigger (+15%) entirely."""
+    _reset(quote_price=92.0)
+    strategy._save_stops({"SSS": _rec(direction="short", water=92.0)})
+    strategy._check_and_trail_stop("SSS", -10, {"close": 92.0, "atr": 10.0},
+                                   "ACCT", [])
+    rec = strategy._load_stops()["SSS"]
+    # gain = 8% -> SHORT rung locks 5% -> floor = 95. Under the long ladder NO
+    # rung would arm and the breakeven lock would floor at entry (100) instead.
+    assert abs(rec["stop_price"] - 95.0) < 0.01, rec
+    assert strategy._profit_floors == 1, strategy._profit_floors
+
+
+def test_long_at_plus_8_still_arms_no_rung():
+    """The converse guard: the short ladder must not leak onto longs."""
+    _reset(quote_price=108.0)
+    strategy._save_stops({"AAA": _rec(water=108.0)})
+    strategy._check_and_trail_stop("AAA", 10, {"close": 108.0, "atr": 10.0},
+                                   "ACCT", [])
+    rec = strategy._load_stops()["AAA"]
+    # +8% is 8 points, short of the breakeven lock's 1-ATR (10 point) arm as well,
+    # so the RAW trail is all that is left: 108 - 25 = 83. No rung, no breakeven.
+    assert abs(rec["stop_price"] - 83.0) < 0.01, rec
+    assert rec["profit_floor_active"] is False, rec
+    assert strategy._profit_floors == 0, strategy._profit_floors
 
 
 # ── Composition with the ATR trail (the whole point of the feature) ───────────
 
 def test_tight_trail_beats_the_rung():
     """Floor BELOW the ATR trail: the trail wins, ladder is inert, no log."""
-    _reset(quote_price=130.0)
-    strategy._save_stops({"AAA": _rec(atr=1.0, water=130.0)})
+    _reset(quote_price=125.0)
+    strategy._save_stops({"AAA": _rec(atr=1.0, water=125.0)})
     msgs, orig = _capture_logs()
     try:
-        strategy._check_and_trail_stop("AAA", 10, {"close": 130.0, "atr": 1.0},
+        strategy._check_and_trail_stop("AAA", 10, {"close": 125.0, "atr": 1.0},
                                        "ACCT", [])
     finally:
         strategy.logger.info = orig
     rec = strategy._load_stops()["AAA"]
-    # raw trail = 130 - 2.5 = 127.5; rung (+30% -> lock 25%) = 125 -> trail wins
-    assert abs(rec["stop_price"] - 127.5) < 0.01, rec
+    # raw trail = 125 - 2.5 = 122.5; rung (+25% -> lock 20%) = 120 -> trail wins.
+    # Must sit in the 5pp band: the trail only wins when it is narrower than the
+    # rung gap, and from +30% up the gap is 2pp < the 2.5-point trail here.
+    assert abs(rec["stop_price"] - 122.5) < 0.01, rec
     assert strategy._profit_floors == 0, "inert ladder must not count a fire"
     assert not [m for m in msgs if "PROFIT FLOOR" in m], msgs
 
@@ -194,8 +231,8 @@ def test_wide_trail_loses_to_the_rung():
     finally:
         strategy.logger.info = orig
     rec = strategy._load_stops()["AAA"]
-    # raw trail = 130 - 25 = 105; rung (+30% -> lock 25%) = 125 -> rung wins
-    assert abs(rec["stop_price"] - 125.0) < 0.01, rec
+    # raw trail = 130 - 25 = 105; rung (+30% -> lock 28%) = 128 -> rung wins
+    assert abs(rec["stop_price"] - 128.0) < 0.01, rec
     floors = [m for m in msgs if "PROFIT FLOOR" in m]
     assert len(floors) == 1, f"expected one floor line, got {msgs}"
     assert "trail would be 105.00" in floors[0], floors[0]
@@ -218,12 +255,15 @@ def test_rung_never_loosens_a_higher_stop():
     strategy._save_stops({"AAA": _rec(atr=10.0, water=130.0)})
     strategy._check_and_trail_stop("AAA", 10, {"close": 130.0, "atr": 10.0},
                                    "ACCT", [])
-    assert abs(strategy._load_stops()["AAA"]["stop_price"] - 125.0) < 0.01
-    strategy.tc.get_quote = _fake_quote(126.0)          # +26%: rung drops to 120
-    strategy._check_and_trail_stop("AAA", 10, {"close": 126.0, "atr": 10.0},
+    assert abs(strategy._load_stops()["AAA"]["stop_price"] - 128.0) < 0.01
+    # 129, not 126: the armed stop is now 128, so 126 would BREACH it and exit
+    # the position rather than test the ratchet. 129 un-arms the +30% rung
+    # (falling back to the +25% rung at 120) while staying above the stop.
+    strategy.tc.get_quote = _fake_quote(129.0)          # +29%: rung drops to 120
+    strategy._check_and_trail_stop("AAA", 10, {"close": 129.0, "atr": 10.0},
                                    "ACCT", [])
     rec = strategy._load_stops()["AAA"]
-    assert abs(rec["stop_price"] - 125.0) < 0.01, "stop must not loosen to 120"
+    assert abs(rec["stop_price"] - 128.0) < 0.01, "stop must not loosen to 120"
 
 
 # ── Feature flag ──────────────────────────────────────────────────────────────
@@ -254,10 +294,26 @@ def test_rung_with_lock_at_or_above_trigger_is_rejected():
             raise AssertionError(f"{bad} should have been rejected")
 
 
-def test_shipped_ladder_is_valid_and_sorted_descending():
-    triggers = [t for t, _ in config.PROFIT_FLOOR_STEPS_DESC]
-    assert triggers == sorted(triggers, reverse=True), triggers
-    assert all(lk < t for t, lk in config.PROFIT_FLOOR_STEPS_DESC)
+def test_shipped_ladders_are_valid_and_sorted_descending():
+    """BOTH shipped ladders, so a bad edit to either fails here and at import."""
+    for name, ladder in (("long", config.PROFIT_FLOOR_STEPS_LONG_DESC),
+                         ("short", config.PROFIT_FLOOR_STEPS_SHORT_DESC)):
+        triggers = [t for t, _ in ladder]
+        assert triggers == sorted(triggers, reverse=True), (name, triggers)
+        assert all(lk < t for t, lk in ladder), (name, ladder)
+
+
+def test_short_ladder_stays_within_reach():
+    """A short's gain caps at 100% (the stock at zero), so a short rung above
+    that is dead code. This is the premise the asymmetry exists for."""
+    assert max(t for t, _ in config.PROFIT_FLOOR_STEPS_SHORT) <= 1.0, \
+        config.PROFIT_FLOOR_STEPS_SHORT
+
+
+def test_short_ladder_locks_earlier_than_long():
+    """The asymmetry itself: shorts must arm at a lower gain than longs do."""
+    assert (min(t for t, _ in config.PROFIT_FLOOR_STEPS_SHORT)
+            < min(t for t, _ in config.PROFIT_FLOOR_STEPS_LONG))
 
 
 # ── Broker GTC raise ──────────────────────────────────────────────────────────
@@ -272,11 +328,11 @@ def test_broker_floor_raised_behind_the_rung_not_onto_it():
     strategy._check_and_trail_stop("AAA", 10, {"close": 130.0, "atr": 10.0},
                                    "ACCT", [])
     rec = strategy._load_stops()["AAA"]
-    # rung = 125; gap = (1.2-1) * 2.5 * 10 = 5 -> new floor 120, bot stop 125
+    # rung = 128; gap = (1.2-1) * 2.5 * 10 = 5 -> new floor 123, bot stop 128
     assert _cancels == ["OLD1"], _cancels
     assert len(_orders) == 1, _orders
-    assert _orders[0][1] == "sell" and abs(_orders[0][3] - 120.0) < 0.01, _orders
-    assert abs(rec["broker_floor_price"] - 120.0) < 0.01, rec
+    assert _orders[0][1] == "sell" and abs(_orders[0][3] - 123.0) < 0.01, _orders
+    assert abs(rec["broker_floor_price"] - 123.0) < 0.01, rec
     assert rec["broker_floor_price"] < rec["stop_price"], \
         "GTC must rest BELOW the bot stop, never on it"
     assert rec["broker_order_id"] == "NEW1", rec
@@ -307,7 +363,7 @@ def test_broker_floor_raise_disabled_leaves_gtc_alone():
     rec = strategy._load_stops()["AAA"]
     assert _cancels == [] and _orders == [], (_cancels, _orders)
     assert rec["broker_floor_price"] == 70.0, rec
-    assert abs(rec["stop_price"] - 125.0) < 0.01, "bot-side rung still applies"
+    assert abs(rec["stop_price"] - 128.0) < 0.01, "bot-side rung still applies"
 
 
 def test_failed_replace_leaves_position_unfloored_and_counted():
@@ -324,7 +380,7 @@ def test_failed_replace_leaves_position_unfloored_and_counted():
     rec = strategy._load_stops()["AAA"]
     assert "broker_order_id" not in rec and "broker_floor_price" not in rec, rec
     assert strategy._floor_raise_failures == 1
-    assert abs(rec["stop_price"] - 125.0) < 0.01, "bot stop still protects"
+    assert abs(rec["stop_price"] - 128.0) < 0.01, "bot stop still protects"
 
 
 def test_old_floor_filled_mid_raise_places_nothing():
@@ -356,8 +412,8 @@ def test_rearm_after_failed_exit_lets_the_ladder_raise_again():
     strategy._check_and_trail_stop("AAA", 10, {"close": 130.0, "atr": 10.0},
                                    "ACCT", [])
     rec = strategy._load_stops()["AAA"]
-    assert abs(rec["broker_floor_price"] - 120.0) < 0.01, rec
-    assert rec["broker_floor_lock"] == 0.25, rec
+    assert abs(rec["broker_floor_price"] - 123.0) < 0.01, rec
+    assert rec["broker_floor_lock"] == 0.28, rec
 
     # Tear the floor down the way every exit route does.
     strategy._forget_broker_floor(rec)
@@ -371,7 +427,7 @@ def test_rearm_after_failed_exit_lets_the_ladder_raise_again():
                                    "ACCT", [])
     rec = strategy._load_stops()["AAA"]
     assert len(_orders) == 1, f"the raise must re-fire, got {_orders}"
-    assert abs(rec["broker_floor_price"] - 120.0) < 0.01, rec
+    assert abs(rec["broker_floor_price"] - 123.0) < 0.01, rec
 
 
 # ── Exit attribution ──────────────────────────────────────────────────────────
@@ -390,8 +446,8 @@ def test_floor_caused_exit_when_trail_would_not_have_fired():
     _reset(quote_price=130.0)
     strategy._save_stops({"AAA": _rec(atr=10.0, water=130.0)})
     strategy._check_and_trail_stop("AAA", 10, {"close": 130.0, "atr": 10.0},
-                                   "ACCT", [])          # arms rung at 125
-    strategy.tc.get_quote = _fake_quote(124.0)          # breaches 125, trail is 105
+                                   "ACCT", [])          # arms rung at 128
+    strategy.tc.get_quote = _fake_quote(124.0)          # breaches 128, trail is 105
     seen, orig = _capture_trades()
     try:
         exited = strategy._check_and_trail_stop("AAA", 10,
@@ -399,11 +455,11 @@ def test_floor_caused_exit_when_trail_would_not_have_fired():
                                                 "ACCT", [])
     finally:
         strategy.log_trade = orig
-    assert exited is True, "price 124 must breach the 125 floor"
+    assert exited is True, "price 124 must breach the 128 floor"
     assert len(seen) == 1, seen
     action, notes, attr = seen[0]
     assert attr["profit_floor_active"] is True, attr
-    assert abs(attr["profit_floor_price"] - 125.0) < 0.01, attr
+    assert abs(attr["profit_floor_price"] - 128.0) < 0.01, attr
     assert abs(attr["atr_trail_at_exit"] - 105.0) < 0.01, attr
     assert attr["floor_caused_exit"] is True, attr
     assert "profit floor" in notes, notes
@@ -412,14 +468,17 @@ def test_floor_caused_exit_when_trail_would_not_have_fired():
 
 def test_trail_exit_is_not_credited_to_the_floor():
     """A stop-out the ATR trail would ALSO have caused is not the ladder's."""
-    _reset(quote_price=130.0)
-    strategy._save_stops({"AAA": _rec(atr=1.0, water=130.0)})   # tight trail wins
-    strategy._check_and_trail_stop("AAA", 10, {"close": 130.0, "atr": 1.0},
-                                   "ACCT", [])          # stop = 127.5 (trail)
-    strategy.tc.get_quote = _fake_quote(127.0)
+    # +25%, not +30%: the trail only out-runs the rung inside the 5pp band (see
+    # test_tight_trail_beats_the_rung), and this test needs the trail to own
+    # the stop so the exit is genuinely not the ladder's.
+    _reset(quote_price=125.0)
+    strategy._save_stops({"AAA": _rec(atr=1.0, water=125.0)})   # tight trail wins
+    strategy._check_and_trail_stop("AAA", 10, {"close": 125.0, "atr": 1.0},
+                                   "ACCT", [])          # stop = 122.5 (trail)
+    strategy.tc.get_quote = _fake_quote(122.0)
     seen, orig = _capture_trades()
     try:
-        strategy._check_and_trail_stop("AAA", 10, {"close": 127.0, "atr": 1.0},
+        strategy._check_and_trail_stop("AAA", 10, {"close": 122.0, "atr": 1.0},
                                        "ACCT", [])
     finally:
         strategy.log_trade = orig
@@ -454,22 +513,29 @@ def test_floor_active_is_not_sticky_once_trail_overtakes():
     """The rung sets the stop, then the trail ratchets past it: attribution must
     hand the credit back to the trail.
 
-    Note where the crossover actually is. The ladder keeps STEPPING as the gain
-    grows, so it does not fall behind at +60% (rung 145 still beats trail 135) —
-    it only stops climbing at the top rung (+50% -> lock 45%). Past that the
-    trail keeps rising and takes over on its own, here at +75%: trail 150 > the
-    capped rung 145. Any test that expects the trail to win earlier is testing a
-    ladder that steps once, which is not this one."""
-    _reset(quote_price=130.0)
-    strategy._save_stops({"AAA": _rec(atr=10.0, water=130.0)})
-    strategy._check_and_trail_stop("AAA", 10, {"close": 130.0, "atr": 10.0},
+    Note where the crossover actually is, because the 2026-08-14 rungs moved it.
+    The trail overtakes only when it is NARROWER than the live rung's gap:
+    trail beats floor iff (gain - lock) > mult * atr / entry. The long ladder's
+    widest gap is 5pp, so the wide atr=10 trail used elsewhere in this file (25
+    points = 25%) can no longer overtake at ANY gain — it did before only because
+    the ladder capped at +50%, and it no longer caps there.
+
+    So this uses a NARROW trail (atr=2.5, mult=2.5 -> 6.25 points) and a gain
+    parked BETWEEN rungs, where the floor sits still while the trail keeps
+    rising: at +49% the highest cleared rung is +40% -> lock 38% -> floor 138,
+    while the trail has reached 142.75. A test that expects a wide trail to win
+    is testing the pre-2026-08-14 capped ladder, which is not this one."""
+    _reset(quote_price=120.0)
+    strategy._save_stops({"AAA": _rec(atr=2.5, water=120.0)})
+    strategy._check_and_trail_stop("AAA", 10, {"close": 120.0, "atr": 2.5},
                                    "ACCT", [])
+    # +20% -> lock 15% -> floor 115 beats trail 113.75
     assert strategy._load_stops()["AAA"]["profit_floor_active"] is True
-    strategy.tc.get_quote = _fake_quote(175.0)          # trail 150 > capped rung 145
-    strategy._check_and_trail_stop("AAA", 10, {"close": 175.0, "atr": 10.0},
+    strategy.tc.get_quote = _fake_quote(149.0)   # trail 142.75 > between-rung 138
+    strategy._check_and_trail_stop("AAA", 10, {"close": 149.0, "atr": 2.5},
                                    "ACCT", [])
     rec = strategy._load_stops()["AAA"]
-    assert abs(rec["stop_price"] - 150.0) < 0.01, rec
+    assert abs(rec["stop_price"] - 142.75) < 0.01, rec
     assert rec["profit_floor_active"] is False, rec
 
 

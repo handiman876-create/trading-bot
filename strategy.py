@@ -1180,7 +1180,11 @@ def _profit_floor(rec: dict, price: float) -> Optional[tuple[float, float, float
     direction = rec.get("direction", "long")
     gain = ((entry - price) / entry) if direction == "short" \
         else ((price - entry) / entry)
-    for trigger, lock in config.PROFIT_FLOOR_STEPS_DESC:
+    # Separate ladders, not one mirrored: a short's gain caps at 100% and gives
+    # back faster, so it locks earlier. Geometry below is shared.
+    steps = (config.PROFIT_FLOOR_STEPS_SHORT_DESC if direction == "short"
+             else config.PROFIT_FLOOR_STEPS_LONG_DESC)
+    for trigger, lock in steps:
         if gain >= trigger:
             floor = entry * (1 - lock) if direction == "short" \
                 else entry * (1 + lock)

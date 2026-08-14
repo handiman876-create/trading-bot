@@ -574,7 +574,9 @@ BREAKEVEN_LOCK_ATR    = 1.0    # favorable excursion (in entry-ATRs) required to
 # construction (all five open positions on 2026-08-13 were inert — the trail was
 # already the higher floor on every one).
 #
-# Applies to longs AND shorts; a short's rungs mirror below entry.
+# Applies to longs AND shorts, but from SEPARATE ladders — see the short ladder
+# below for why mirroring the long one is wrong. A short's rungs still mirror
+# below entry geometrically; it is the trigger/lock VALUES that differ.
 #
 # EVERY rung MUST have lock < trigger. That gap is exactly what keeps the floor
 # unreachable through the market: when a rung arms, price is at `trigger` and the
@@ -594,7 +596,7 @@ ENABLE_PROFIT_FLOOR = True
 # book is paid by, so the priority flips from letting it run to not giving it
 # back. The narrow rungs sit far enough out that on a typical name the ATR trail
 # is the binding floor long before they arm.
-PROFIT_FLOOR_STEPS = [
+PROFIT_FLOOR_STEPS_LONG = [
     (0.15, 0.10),   # +15% gain  → lock +10%
     (0.20, 0.15),   # +20% gain  → lock +15%
     (0.25, 0.20),   # +25% gain  → lock +20%
@@ -603,6 +605,37 @@ PROFIT_FLOOR_STEPS = [
     (0.50, 0.49),   # +50% gain  → lock +49%
     (0.75, 0.74),   # +75% gain  → lock +74%
     (1.00, 0.99),   # +100% gain → lock +99%
+]
+
+# Shorts get their OWN ladder rather than the long one mirrored, for two reasons.
+#
+# 1. A short's gain is CAPPED at 100% — that is the stock reaching zero. The long
+#    ladder's top rungs (+75%, +100%) are therefore unreachable in practice, so a
+#    mirrored ladder would spend its tightest rungs on outcomes that never occur
+#    and leave the reachable range covered only by the loose early rungs.
+# 2. Equities drift up. A short is positioned against that drift, so a given
+#    excursion is likelier to be given back than the same excursion on a long.
+#    Locking earlier is the response: the first rung arms at +8% instead of +15%.
+#
+# Consequence to be aware of: at +8% with a 3pp gap, the floor sits about 1 ATR
+# behind a typical short (AAPL's entry ATR is 3.0% of entry), so it will bind over
+# the ATR trail almost immediately and exit on roughly one ATR of retrace. That is
+# the intended trade — shorts give back gains faster — but it is a much more
+# aggressive posture than the long side, and it is why the counter matters.
+#
+# BAD — DO NOT do this:
+#     mirroring PROFIT_FLOOR_STEPS_LONG onto shorts. The +75%/+100% rungs are
+#     dead by construction (see 1), so the short side would silently run on the
+#     5pp early rungs alone — looser protection than the long side, not equal.
+PROFIT_FLOOR_STEPS_SHORT = [
+    (0.08, 0.05),   # +8% gain  → lock +5%
+    (0.12, 0.09),   # +12% gain → lock +9%
+    (0.15, 0.13),   # +15% gain → lock +13%
+    (0.20, 0.18),   # +20% gain → lock +18%
+    (0.25, 0.24),   # +25% gain → lock +24%
+    (0.30, 0.29),   # +30% gain → lock +29%
+    (0.40, 0.39),   # +40% gain → lock +39%
+    (0.50, 0.49),   # +50% gain → lock +49%
 ]
 
 
@@ -617,14 +650,17 @@ def _validate_profit_floor_steps(steps):
     bad = [(t, lk) for t, lk in steps if lk >= t]
     if bad:
         raise ValueError(
-            "PROFIT_FLOOR_STEPS rungs must have lock < trigger (a rung with "
+            "profit floor steps rungs must have lock < trigger (a rung with "
             "lock >= trigger arms the stop at or through the market and forces "
             "an instant exit); offending rungs: %r" % (bad,))
     return sorted(steps, reverse=True)
 
 
 # Descending by trigger, so the first rung a gain clears is the highest one.
-PROFIT_FLOOR_STEPS_DESC = _validate_profit_floor_steps(PROFIT_FLOOR_STEPS)
+# Same validator both sides — the lock < trigger invariant is about geometry
+# against the market, which does not care which way the position faces.
+PROFIT_FLOOR_STEPS_LONG_DESC = _validate_profit_floor_steps(PROFIT_FLOOR_STEPS_LONG)
+PROFIT_FLOOR_STEPS_SHORT_DESC = _validate_profit_floor_steps(PROFIT_FLOOR_STEPS_SHORT)
 
 # Should an armed rung also RAISE the resting broker GTC floor to match?
 #

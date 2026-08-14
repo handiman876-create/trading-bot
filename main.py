@@ -259,6 +259,17 @@ def _log_sentiment_banner(rep: dict) -> None:
                     "blocks new long entries in that sector. Counter: SENTIMENT ADVISORY")
 
 
+def _render_rungs(steps) -> str:
+    """One profit-floor ladder as a banner string: '15%→10%, 20%→15%, ...'.
+
+    Rendered FROM config on both sides rather than hand-written, so the banner
+    cannot drift from the ladder the way the shorting banner once did. A helper
+    rather than an inline comprehension because there are now two ladders to
+    render and a third caller (the analyzer) is the obvious next one.
+    """
+    return ", ".join("%.0f%%→%.0f%%" % (t * 100, lk * 100) for t, lk in steps)
+
+
 def main() -> None:
     _acquire_singleton_lock()          # hard-stop a second instance before any API calls
     signal.signal(signal.SIGINT,  _handle_signal)
@@ -390,15 +401,13 @@ def main() -> None:
                  "longs+shorts, retroactive w/ underwater guard)"
                  % config.BREAKEVEN_LOCK_ATR)
                 if config.ENABLE_BREAKEVEN_LOCK else "DISABLED")
-    # Rungs are rendered FROM config, never hand-written, so the banner cannot
-    # drift from the ladder the way the shorting banner once did.
     logger.info("Profit floor: %s",
-                ("ENABLED steps: %s — longs+shorts; complements the ATR trail "
-                 "and breakeven lock (stop = most protective of the three), so "
-                 "a rung only binds when the trail is wider. Broker GTC raise: "
-                 "%s. Counter: PROFIT FLOOR"
-                 % (", ".join("%.0f%%→%.0f%%" % (t * 100, lk * 100)
-                              for t, lk in config.PROFIT_FLOOR_STEPS),
+                ("ENABLED — asymmetric ladders; complements the ATR trail and "
+                 "breakeven lock (stop = most protective of the three), so a "
+                 "rung only binds when the trail is wider. longs: %s | shorts: "
+                 "%s. Broker GTC raise: %s. Counter: PROFIT FLOOR"
+                 % (_render_rungs(config.PROFIT_FLOOR_STEPS_LONG),
+                    _render_rungs(config.PROFIT_FLOOR_STEPS_SHORT),
                     "ON" if config.ENABLE_PROFIT_FLOOR_BROKER_RAISE else "OFF"))
                 if config.ENABLE_PROFIT_FLOOR else "DISABLED")
     logger.info("Cross gap   : %.2f%% minimum EMA separation on ALL cross signals "
