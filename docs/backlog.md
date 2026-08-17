@@ -544,3 +544,16 @@ path even when alignment is disabled.
 **Prerequisite:** Verify the re-entry
 block actually fires before fixing;
 if it's log-only, lower priority.
+
+**Resolution (2026-08-17):** Log-only.
+_momentum_entry_taken call site at
+strategy.py:2134 is already gated by
+USE_MOMENTUM_ALIGNMENT at line 2131 —
+Python short-circuits, so the latch is
+never read when alignment is off. No
+re-entries are blocked. The real cost
+is _latches_reconstructed incrementing
+on routine cross entries, masking the
+CRL/LII doubling defense. Fix when the
+doubling defense needs a reliable signal.
+Priority: LOW.
