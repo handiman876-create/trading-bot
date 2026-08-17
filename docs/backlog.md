@@ -522,3 +522,25 @@ statistic that has no observations yet buys nothing today — build this when th
 first floor-caused exits start landing, and before anyone argues from short-side
 floor numbers. Same control-group problem as the `SHORT_MAX_ATR_PCT` and SPY
 trend confirmation entries above.
+
+---
+
+## MOMENTUM LATCH FALSE RECONSTRUCTION
+
+**Observed (2026-08-17):** MOMENTUM LATCH
+RECONSTRUCTED fires for SNDK despite
+USE_MOMENTUM_ALIGNMENT = False. No latch
+is ever written when alignment is off,
+so reconstruction is always spurious.
+
+**Direction:** Gate the latch check on
+USE_MOMENTUM_ALIGNMENT. If False, skip
+the reconstruction path entirely.
+
+**Risk:** May block valid re-entries on
+the "Blocking re-entry this rotation"
+path even when alignment is disabled.
+
+**Prerequisite:** Verify the re-entry
+block actually fires before fixing;
+if it's log-only, lower priority.
