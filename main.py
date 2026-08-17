@@ -432,8 +432,11 @@ def main() -> None:
                 "position still open) and on a floor cancel that will not "
                 "confirm (exit withheld — position may be open AND unprotected). "
                 "Both retry next cycle; a REPEATING one never self-clears. Goes "
-                "to bot.log ONLY — there is no alert channel, so nothing pages "
-                "you. Counters: EXIT ORDER REJECTED, BROKER FLOOR stuck")
+                "to bot.log AND %s at the repo root (never rotated — bot.log "
+                "holds ONE day and weekends produce no rotated file at all). No "
+                "push channel, so nothing pages you: check %s on Mondays. "
+                "Counters: EXIT ORDER REJECTED, BROKER FLOOR stuck",
+                config.CRITICAL_ALERT_FILE, config.CRITICAL_ALERT_FILE)
     if config.ENABLE_VIX_FILTER:
         logger.info("VIX filter  : ENABLED — %s, %ds cache; risk_on/cautious/"
                     "defensive/crisis @ <%g/%g/%g/>=%g (crisis>=%g EXTREME); "
