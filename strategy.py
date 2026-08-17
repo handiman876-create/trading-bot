@@ -798,7 +798,10 @@ def _wait_floor_clear(symbol: str, floor_id: str, account_id: str,
     """
     global _floor_clear_waits, _floor_clear_stuck
     for attempt in range(1, tries + 1):
-        outcome = tc.get_order_outcome(account_id, floor_id)
+        # expected_cancel: we just cancelled this floor ourselves, so "dead" is
+        # the SUCCESS we are polling for. Severity only — the returned state is
+        # unchanged, and the exit-confirmation caller below must NOT pass it.
+        outcome = tc.get_order_outcome(account_id, floor_id, expected_cancel=True)
         state = outcome.get("state")
         if state == "filled":
             logger.warning("BROKER FLOOR %s: floor order %s FILLED during exit "
@@ -2512,7 +2515,8 @@ def evaluate_option(
         reason    = _option_exit_reason(exit_price, entry_ref, exp_used)
         if reason:
             if _close_option(account_id, occ_symbol, held, exit_price,
-                             symbol, exp_used, strike, opt_type, sig):
+                             symbol, exp_used, strike, opt_type, sig,
+                             reason=reason):
                 _mark_sold(occ_symbol)
                 _close_option_position(key)
                 if reason.startswith("stop loss"):
@@ -2667,12 +2671,32 @@ def _open_option(account_id, occ_symbol, side, price, symbol, exp, strike, opt_t
     return result
 
 
-def _close_option(account_id, occ_symbol, held, price, symbol, exp, strike, opt_type, sig):
+def _close_option(account_id, occ_symbol, held, price, symbol, exp, strike,
+                  opt_type, sig, reason=None):
+    """Close an option position. `reason` is the PREMIUM rule that fired, when
+    one did (stop loss / profit target / near expiry).
+
+    WHY reason IS A PARAMETER: it used to be computed at the call site, passed
+    only to a logger.warning, and never reach the ledger — so the note said
+    "{symbol} reversal" for every close, including the two that had nothing to do
+    with a reversal. NVDA's -50% premium stop on 2026-08-11 and QQQ's expiry
+    force-close on 08-14 both recorded "reversal" while NVDA's EMAs were still
+    bullish and QQQ was closed purely on days-to-expiry. That made all three
+    premium rules indistinguishable in the ledger and bucketed the stop as a
+    "signal" exit.
+
+    This mirrors the equities convention at the trailing-stop exit: put the real
+    cause IN the note so _exit_reason can bucket it and a human can read it,
+    rather than leaving it to be reverse-engineered.
+    """
     logger.info("SIGNAL SELL_TO_CLOSE %s x%d", occ_symbol, held)
     result = tc.place_option_order(account_id, occ_symbol, "sell_to_close", held)
     if result:
         order_id = result.get("order", {}).get("id")
+        # "option <reason>" is the prefix performance_analyzer._exit_reason keys
+        # off; keep the two in step if either is reworded.
+        cause = f"option {reason}" if reason else f"{symbol} reversal"
         _log_exit_trade("SELL_TO_CLOSE", occ_symbol, held, price, order_id,
-                        f"{symbol} reversal, RSI={sig['rsi']:.1f}, "
+                        f"{cause}, RSI={sig['rsi']:.1f}, "
                         f"strike={strike} {opt_type} exp={exp}", account_id)
     return result

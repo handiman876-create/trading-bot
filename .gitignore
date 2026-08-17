@@ -24,3 +24,6 @@ screen_ab.lock
 .venv/
 bot.log.*
 bot.futures.log.*
+critical_alerts.log
+futures_critical_alerts.log
+test_critical_alerts.log

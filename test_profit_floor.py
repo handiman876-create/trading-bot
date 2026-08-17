@@ -46,7 +46,7 @@ def _fake_cancel(account_id, order_id):
     return _cancel_ok
 
 
-def _fake_outcome(account_id, order_id):
+def _fake_outcome(account_id, order_id, expected_cancel=False):
     """`state` means opposite things to the two callers that poll it, so the stub
     must answer per-order rather than globally.
 

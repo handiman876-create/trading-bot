@@ -808,6 +808,17 @@ APP_LOG_FILE   = f"logs/{_LOG_PREFIX}bot.log"
 TRADE_LOG_FILE = f"logs/{_LOG_PREFIX}trades.log"
 PERF_LOG_FILE  = f"logs/{_LOG_PREFIX}performance.log"
 
+# CRITICAL-only alert sink. Deliberately at the REPO ROOT, not under logs/:
+# /etc/logrotate.d/trading-bot globs `logs/*.log`, so a file there would be
+# copytruncate'd daily and a Saturday CRITICAL would be gone from the live file
+# by the Monday check — precisely the gap this file exists to close. The repo
+# root is matched by no logrotate config on this host (verified against all 14),
+# because the two root logs are named individually rather than globbed.
+#
+# This does NOT page anyone; it only guarantees the record survives. It is a
+# durable sink, not an alert channel.
+CRITICAL_ALERT_FILE = f"{_LOG_PREFIX}critical_alerts.log"
+
 # ── Trade-note markers ────────────────────────────────────────────────────────
 # The analyzer classifies exits by pattern-matching the free-text `notes` field
 # of a trade record. That couples a writer (whoever places the order) to a reader

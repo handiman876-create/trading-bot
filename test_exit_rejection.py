@@ -108,7 +108,7 @@ def _fake_cancel(account_id, order_id):
     return True
 
 
-def _fake_outcome(account_id, order_id):
+def _fake_outcome(account_id, order_id, expected_cancel=False):
     key = "floor" if str(order_id).startswith("FLOOR") else "exit"
     return dict(_outcome[key])
 

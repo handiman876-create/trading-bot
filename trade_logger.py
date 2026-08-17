@@ -8,12 +8,27 @@ import config
 os.makedirs(config.LOG_DIR, exist_ok=True)
 
 # ── Root app logger ───────────────────────────────────────────────────────────
+
+# CRITICAL-only sink, on a path logrotate does not touch, so the record of an
+# exit rejection or a stuck floor outlives daily rotation and the weekend gap
+# (bot.log holds ONE day, and Sat/Sun produce no rotated file at all). Same
+# formatter as the app log so the lines are directly comparable.
+#
+# A FileHandler is used rather than a journal/syslog handler on purpose: conftest
+# Layer 3 re-points FileHandlers into a tmpdir, so the test suite cannot write
+# here. A journal handler would slip past that check entirely and let fixture
+# output — including the fabricated "STOP-LOSS EXIT NVDA ... sell order failed"
+# that once reached the production log — land in a persistent alert sink.
+_critical_handler = logging.FileHandler(config.CRITICAL_ALERT_FILE)
+_critical_handler.setLevel(logging.CRITICAL)
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     handlers=[
         logging.FileHandler(config.APP_LOG_FILE),
         logging.StreamHandler(),
+        _critical_handler,
     ],
 )
 

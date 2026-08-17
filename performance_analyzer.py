@@ -423,17 +423,40 @@ def _pnl_pct(direction: str, entry_price: float, exit_price: float) -> float | N
 def _exit_reason(notes: str) -> str:
     """Why a position was closed, from the exit's notes.
 
-      correction — a hand-placed repair of a bug's damage; the strategy never
-                   signalled it. Checked FIRST: a correction is a correction
-                   regardless of what else the note says.
-      stop       — the trailing stop fired.
-      signal     — the strategy's own exit logic.
+      correction     — a hand-placed repair of a bug's damage; the strategy never
+                       signalled it. Checked FIRST: a correction is a correction
+                       regardless of what else the note says.
+      stop           — the trailing stop fired (ATR trail / breakeven lock /
+                       profit-floor rung; the note names which).
+      option_stop    — an option's -50% PREMIUM stop.
+      option_target  — an option's +50% premium target.
+      option_expiry  — an option force-closed on days-to-expiry.
+      signal         — the strategy's own exit logic.
+
+    WHY THE OPTION BUCKETS EXIST: all three premium rules used to land in
+    "signal", because the note was built from the UNDERLYING's rationale and read
+    "{symbol} reversal" no matter which rule fired. That made them mutually
+    indistinguishable in the ledger, and filed the premium STOP as a non-stop.
+
+    They are deliberately NOT folded into "stop". Options are not stop-managed —
+    they carry no profit_floor_active / atr_trail_at_exit — so putting them in
+    "stop" would add rows that every consumer of that bucket has to filter back
+    out. Separate buckets also let each premium rule be judged on its own, which
+    is the point: one has fired once, one twice, one never.
     """
     n = (notes or "").lower()
     if config.CORRECTION_NOTE_MARKER.lower() in n:
         return "correction"
     if "trailing stop" in n:
         return "stop"
+    # Keyed off the "option <reason>" prefix that strategy._close_option writes.
+    # Order matches _option_exit_reason's own worst-news-first precedence.
+    if "option stop loss" in n:
+        return "option_stop"
+    if "option profit target" in n:
+        return "option_target"
+    if "option near expiry" in n:
+        return "option_expiry"
     return "signal"
 
 

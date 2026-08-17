@@ -553,12 +553,41 @@ _DONE_STATUS_CODES = {"FLL", "CAN", "REJ", "EXP", "OUT", "UROUT", "RPL", "TLC"}
 _FAILED_STATUSES = _DONE_STATUSES - {"filled"}
 _FAILED_STATUS_CODES = _DONE_STATUS_CODES - {"FLL"}
 
+# Terminal because SOMEBODY ASKED — the subset of _FAILED_STATUSES a cancel
+# REQUEST produces. Deliberately NOT all of _FAILED_STATUSES: "rejected" and
+# "expired" are also terminal-without-fill, but they are outcomes nobody asked
+# for, so they stay loud even when the caller was expecting a cancel.
+#
+# WHY THIS EXISTS: the bot cancels its own resting GTC floor constantly — every
+# profit-floor rung raise is a cancel-then-place, and so is every exit and every
+# profit-take resize. Each one came back "UROut" and was logged at ERROR as
+# "DEAD — executed NOTHING", which is true and completely uninformative: we are
+# the ones who killed it. 7 of those fired between 2026-08-12 and 08-17, five on
+# 08-14 alone against a single actual exit, because the rate tracks RUNG RAISES
+# rather than exits — i.e. it grows as the book performs. An ERROR that fires on
+# routine success is how you learn to skim the ERROR channel, and that channel is
+# what the CRITICAL alerting reads.
+_CANCELLED_STATUSES = {"canceled", "cancelled", "out", "urout"}
+_CANCELLED_STATUS_CODES = {"CAN", "OUT", "UROUT"}
+
 
 def _order_is_done(o: dict) -> bool:
     """True if an order reached a terminal state and is no longer working."""
     desc = str(o.get("StatusDescription", "")).strip().lower()
     code = str(o.get("Status", "")).strip().upper()
     return desc in _DONE_STATUSES or code in _DONE_STATUS_CODES
+
+
+def _order_was_cancelled(o: dict) -> bool:
+    """True if this order is terminal because a cancel request took effect.
+
+    Strictly narrower than _order_failed: a rejection or an expiry is terminal
+    without a fill too, but neither is what a cancel request produces, so neither
+    may be waved through as "expected".
+    """
+    desc = str(o.get("StatusDescription", "")).strip().lower()
+    code = str(o.get("Status", "")).strip().upper()
+    return desc in _CANCELLED_STATUSES or code in _CANCELLED_STATUS_CODES
 
 
 def _order_failed(o: dict) -> bool:
@@ -585,8 +614,20 @@ def _order_failed(o: dict) -> bool:
 _ORDER_POLL_BACKOFF = (2, 4, 8)
 
 
-def get_order_outcome(account_id: str, order_id: str) -> dict:
+def get_order_outcome(account_id: str, order_id: str,
+                      expected_cancel: bool = False) -> dict:
     """What actually happened to an order.
+
+    `expected_cancel` says the CALLER asked for this order to die — it had just
+    issued a cancel and is polling for confirmation. It changes the LOG SEVERITY
+    only; every returned value is identical either way, so no caller's logic
+    depends on it. Pass it from the cancel-confirmation path (_wait_floor_clear),
+    never from the exit-confirmation path (_submit_exit_order step 3), where
+    "dead" means the broker REFUSED the exit and must stay loud.
+
+    Intent, not status, is the right axis for this: only the caller knows whether
+    a cancel was requested. A status-based guess would also swallow a cancel the
+    BROKER initiated, which nobody asked for and which needs to be seen.
 
     Returns {"state", "fill_price", "reason", "status"} where `state` is exactly
     one of — and these are NOT interchangeable:
@@ -646,8 +687,15 @@ def get_order_outcome(account_id: str, order_id: str) -> dict:
         # two wasted seconds on the way to the wrong answer.
         if _order_failed(o):
             reason = o.get("RejectReason") or None
-            logger.error("Order %s DEAD (status=%s) — executed NOTHING%s",
-                         order_id, status, f": {reason}" if reason else "")
+            # A cancel the caller ASKED for is routine success, not a fault.
+            # Note the two conditions: expecting a cancel does NOT license
+            # quieting a rejection or an expiry, which reach this branch too.
+            if expected_cancel and _order_was_cancelled(o):
+                logger.info("Order %s cancel CONFIRMED (status=%s) — no "
+                            "execution, as requested", order_id, status)
+            else:
+                logger.error("Order %s DEAD (status=%s) — executed NOTHING%s",
+                             order_id, status, f": {reason}" if reason else "")
             return {"state": "dead", "fill_price": None,
                     "reason": reason, "status": status}
         # Genuinely still working (Received/Sent, no price yet) — the ONE case

@@ -50,6 +50,10 @@ config.LOG_DIR        = _LOG_TMPDIR
 config.APP_LOG_FILE   = os.path.join(_LOG_TMPDIR, "bot.log")
 config.TRADE_LOG_FILE = os.path.join(_LOG_TMPDIR, "trades.log")
 config.PERF_LOG_FILE  = os.path.join(_LOG_TMPDIR, "performance.log")
+# The CRITICAL sink needs the same treatment, and needs it MORE: it is the file a
+# human reads to decide whether the bot is in trouble, so a fabricated fixture
+# CRITICAL landing there is worse than one landing in bot.log.
+config.CRITICAL_ALERT_FILE = os.path.join(_LOG_TMPDIR, "critical_alerts.log")
 
 
 def _redirect_existing_log_handlers() -> int:

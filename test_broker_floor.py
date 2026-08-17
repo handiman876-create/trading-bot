@@ -59,7 +59,7 @@ _floor_outcome = {"state": "dead", "fill_price": None,
                   "reason": None, "status": "UROut"}
 
 
-def _fake_outcome(account_id, order_id):
+def _fake_outcome(account_id, order_id, expected_cancel=False):
     """Stand-in for tc.get_order_outcome.
 
     Exit orders are the ids _fake_place hands out (FLOOR<n>); anything the test
