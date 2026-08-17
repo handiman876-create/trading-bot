@@ -115,6 +115,17 @@ def isolate_bot_state(tmp_path, monkeypatch):
     # test_broker_floor.py sets it True per-test and restores it.
     monkeypatch.setattr(config, "ENABLE_BROKER_STOP_FLOOR", False, raising=False)
 
+    # Same treatment, same reason. The profit-floor ladder is a THIRD stop source
+    # that silently overrides the ATR trail whenever a rung is tighter, so with
+    # the live flag True it changes the answer in tests that are not about it at
+    # all. It did: 79589ca gave shorts an 8%->5% first rung, and two ATR-trail
+    # tests in test_stops.py (a module with zero profit-floor references) started
+    # failing because a short at +10% now floors at 95.00 instead of trailing to
+    # 90 + 2.5*4 = 100.00. The trail was right and the ladder was right; the
+    # tests were measuring both at once.
+    # test_profit_floor.py owns this feature and sets the flag True per-test.
+    monkeypatch.setattr(config, "ENABLE_PROFIT_FLOOR", False, raising=False)
+
     # performance_analyzer, if a test drives its file-writing paths.
     try:
         import performance_analyzer as pa

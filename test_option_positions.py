@@ -145,7 +145,16 @@ def _bearish_sig(close, rsi=50.0):
             "ema_long": close, "bullish_cross": False, "bearish_cross": True}
 
 
-_EXP = "2026-08-21"
+# The default expiration for tests that are NOT about expiry. It must stay
+# comfortably outside OPTION_MIN_DAYS_TO_EXPIRY, so it has to be relative to
+# today — a hardcoded date is a time bomb. "2026-08-21" was hardcoded here and
+# passed for weeks, then broke on 2026-08-17 when the calendar walked into the
+# window: test_legacy_position_is_adopted still ADOPTED the contract, but the
+# expiry rule then closed it in the same call (4 trading days left <= 5) and
+# _close_option_position cleared the store the assertion reads. The failure
+# looked like broken adoption; the adoption was fine.
+# 40 days matches test_option_exits._far() for the same reason.
+_EXP = (date.today() + timedelta(days=40)).isoformat()
 
 
 # ── 1. entry stores the symbol ────────────────────────────────────────────────
