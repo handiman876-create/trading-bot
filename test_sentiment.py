@@ -237,17 +237,47 @@ def test_note_regime_logs_advisory_not_override_when_off():
 
 
 def test_note_regime_still_logs_override_when_on():
+    # fear=6, not the original 4: as of 2026-08-20 the override also has to clear
+    # SENTIMENT_OVERRIDE_MIN_FEAR, and 4 is now a BELOW THRESHOLD cycle (covered
+    # by test_note_regime_logs_below_threshold_not_override). This test is about
+    # the master switch, so it uses a score that clears the floor.
     saved = _with_override(True)
+    saved_floor = getattr(config, "SENTIMENT_OVERRIDE_MIN_FEAR", 0)
+    config.SENTIMENT_OVERRIDE_MIN_FEAR = 6
     try:
         with _LogCap() as cap:
             logging.getLogger("strategy").addHandler(cap._h)
             logging.getLogger("strategy").setLevel(logging.DEBUG)
             strategy.note_regime(16.0, "cautious", vix_regime="risk_on",
-                                 sent_regime="cautious", fear=4, risks=["r"])
+                                 sent_regime="cautious", fear=6, risks=["r"])
             logging.getLogger("strategy").removeHandler(cap._h)
         assert "SENTIMENT OVERRIDE" in cap.text
     finally:
         config.ENABLE_SENTIMENT_OVERRIDE = saved
+        config.SENTIMENT_OVERRIDE_MIN_FEAR = saved_floor
+
+
+def test_note_regime_logs_below_threshold_not_override():
+    """The log must not claim an override the combine did not apply. With the
+    switch ON but the score under the floor, the line is BELOW THRESHOLD — and
+    distinctly NOT the ADVISORY wording, which means the switch is off."""
+    saved = _with_override(True)
+    saved_floor = getattr(config, "SENTIMENT_OVERRIDE_MIN_FEAR", 0)
+    config.SENTIMENT_OVERRIDE_MIN_FEAR = 6
+    try:
+        with _LogCap() as cap:
+            logging.getLogger("strategy").addHandler(cap._h)
+            logging.getLogger("strategy").setLevel(logging.DEBUG)
+            strategy.note_regime(16.0, "risk_on", vix_regime="risk_on",
+                                 sent_regime="cautious", fear=4, risks=["r"])
+            logging.getLogger("strategy").removeHandler(cap._h)
+        assert "SENTIMENT BELOW THRESHOLD" in cap.text
+        assert "SENTIMENT OVERRIDE" not in cap.text
+        assert "SENTIMENT ADVISORY" not in cap.text
+        assert "regime stays risk_on" in cap.text
+    finally:
+        config.ENABLE_SENTIMENT_OVERRIDE = saved
+        config.SENTIMENT_OVERRIDE_MIN_FEAR = saved_floor
 
 
 # ── 7b. headline merge/dedup (multi-ticker) ───────────────────────────────────
@@ -561,3 +591,115 @@ if __name__ == "__main__":
         sa._fetch_headlines = _orig["fetch"]
         sa._call_claude = _orig["call"]
         config.SENTIMENT_REPORT_FILE = _orig["report_file"]
+
+
+# ── 7a3. SENTIMENT_OVERRIDE_MIN_FEAR — the fear floor ─────────────────────────
+# Re-enabled the override 2026-08-20, but gated on the fear SCORE rather than
+# left binary. The floor is on the score, not the regime, because 4/5/6 all map
+# to "cautious" (sentiment_analyzer._regime_from_score) — only the score can
+# tell mild unease from a decisive call.
+import contextlib
+
+
+@contextlib.contextmanager
+def _override(enabled=True, floor=6):
+    saved_on = getattr(config, "ENABLE_SENTIMENT_OVERRIDE", True)
+    saved_floor = getattr(config, "SENTIMENT_OVERRIDE_MIN_FEAR", 0)
+    config.ENABLE_SENTIMENT_OVERRIDE = enabled
+    config.SENTIMENT_OVERRIDE_MIN_FEAR = floor
+    try:
+        yield
+    finally:
+        config.ENABLE_SENTIMENT_OVERRIDE = saved_on
+        config.SENTIMENT_OVERRIDE_MIN_FEAR = saved_floor
+
+
+def test_fear_below_floor_leaves_vix_alone():
+    """The CRWD regression. The -$3,642.08 short was entered 2026-07-28 on
+    fear=4 while VIX read risk_on; the sentiment override to cautious is what
+    satisfied SHORT_MIN_REGIME and armed it. At a floor of 6 that day is
+    VIX-only and the entry never happens."""
+    with _override(floor=6):
+        assert strategy.effective_regime("risk_on", "cautious", 4) == "risk_on"
+        assert strategy.effective_regime("risk_on", "cautious", 5) == "risk_on"
+
+
+def test_fear_at_and_above_floor_overrides():
+    """07-30 read fear=6 and still overrides — the floor is inclusive."""
+    with _override(floor=6):
+        assert strategy.effective_regime("risk_on", "cautious", 6) == "cautious"
+
+
+def test_floor_does_not_drop_the_high_fear_range():
+    """The bug in the obvious implementation. Gating on
+    `sent_regime == "cautious"` would silently exclude fear 7-10 — defensive
+    and crisis, the readings that matter most — giving a rule that fires at 6
+    and then goes quiet in an actual panic. The floor is a >= on the score, so
+    7-10 clear it too."""
+    with _override(floor=6):
+        assert strategy.effective_regime("risk_on", "defensive", 7) == "defensive"
+        assert strategy.effective_regime("risk_on", "defensive", 8) == "defensive"
+        assert strategy.effective_regime("risk_on", "crisis", 9) == "crisis"
+        assert strategy.effective_regime("risk_on", "crisis", 10) == "crisis"
+
+
+def test_sentiment_never_lowers_the_vix_regime():
+    """The second bug in the obvious implementation. Assigning "cautious"
+    outright would let a fear-6 read DEMOTE a VIX defensive/crisis regime and
+    re-open entries VIX had blocked. The combine is a strict max, so a
+    participating-but-calmer sentiment read changes nothing."""
+    with _override(floor=6):
+        assert strategy.effective_regime("defensive", "cautious", 6) == "defensive"
+        assert strategy.effective_regime("crisis", "cautious", 10) == "crisis"
+        # ...and it stays a max when sentiment is suppressed, too.
+        assert strategy.effective_regime("defensive", "cautious", 4) == "defensive"
+
+
+def test_master_switch_still_wins_over_the_floor():
+    """Switch OFF mutes sentiment at any score, including a 10."""
+    with _override(enabled=False, floor=6):
+        assert strategy.effective_regime("risk_on", "crisis", 10) == "risk_on"
+
+
+def test_missing_fear_score_participates():
+    """fear=None is only reachable on a malformed report — the neutral fallback
+    scores 1 with regime risk_on, which makes the combine a no-op anyway. For a
+    malformed report the safe direction is to respect a fearful reading."""
+    with _override(floor=6):
+        assert strategy.effective_regime("risk_on", "cautious", None) == "cautious"
+
+
+def test_floor_of_zero_reproduces_the_old_binary_behaviour():
+    """Back-compat: an unset/0 floor must behave exactly like the pre-2026-08-20
+    binary switch, so the constant can be neutralised without a code change."""
+    with _override(floor=0):
+        assert strategy.effective_regime("risk_on", "cautious", 1) == "cautious"
+
+
+def test_threshold_block_counter_increments_only_when_suppressed():
+    """Observability: the counter must count the overrides the floor is
+    SUPPRESSING, so a reading of 0 proves the floor is inert."""
+    with _override(floor=6):
+        before = strategy._sentiment_threshold_blocks
+        # Sentiment more fearful than VIX, but under the floor → suppressed.
+        strategy.note_regime(15.0, "risk_on", vix_regime="risk_on",
+                             sent_regime="cautious", fear=4)
+        assert strategy._sentiment_threshold_blocks == before + 1
+        # Over the floor → a real override, not a block.
+        strategy.note_regime(15.0, "cautious", vix_regime="risk_on",
+                             sent_regime="cautious", fear=6)
+        assert strategy._sentiment_threshold_blocks == before + 1
+        # Sentiment NOT more fearful → not a block either, at any score.
+        strategy.note_regime(30.0, "defensive", vix_regime="defensive",
+                             sent_regime="cautious", fear=4)
+        assert strategy._sentiment_threshold_blocks == before + 1
+
+
+def test_participation_predicate_matches_the_combine():
+    """The log line and the combine read the same predicate — they cannot
+    disagree about whether an override happened."""
+    with _override(floor=6):
+        for fear in (1, 3, 4, 5, 6, 7, 9, 10, None):
+            heard = strategy.sentiment_participates(fear)
+            combined = strategy.effective_regime("risk_on", "crisis", fear)
+            assert heard == (combined == "crisis"), fear

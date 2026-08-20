@@ -449,6 +449,10 @@ _short_covers = 0
 _latches_reconstructed = 0
 _crisis_exits = 0
 _sentiment_sector_blocks = 0
+_sentiment_threshold_blocks = 0  # cycles where sentiment was MORE fearful than VIX but
+                                 # scored below SENTIMENT_OVERRIDE_MIN_FEAR — i.e. the
+                                 # overrides the fear floor is suppressing. 0 => the
+                                 # floor is inert and the binary switch was equivalent.
 _profit_takes = 0
 _high_vol_stops = 0        # stops armed TIGHTER than normal (ATR/price > 5%)
 _low_vol_stops = 0         # stops armed WIDER  than normal (ATR/price <= 2%)
@@ -1992,17 +1996,62 @@ def _more_fearful(a: str, b: str) -> str:
     return a if _REGIME_RANK.get(a, 0) >= _REGIME_RANK.get(b, 0) else b
 
 
-def effective_regime(vix_regime: str, sent_regime: Optional[str]) -> str:
+def sentiment_participates(fear: Optional[float]) -> bool:
+    """Does the sentiment regime take part in the effective regime this cycle?
+
+    Two gates, in order: the master switch, then the fear-score floor
+    (config.SENTIMENT_OVERRIDE_MIN_FEAR, on the 1-10 score where higher = more
+    fearful). The floor exists because the score carries strictly more
+    information than the regime it maps to — 4, 5 and 6 all read "cautious", so
+    only the score can distinguish mild unease from a decisive call.
+
+    A named predicate rather than an inline comparison because THREE sites need
+    the same answer: effective_regime (what the bot trades), note_regime's
+    OVERRIDE-vs-ADVISORY log line (what the log claims it traded), and the
+    suppression counter. If the log and the combine disagreed, the bot would
+    report an override it did not apply — and that line is emitted every cycle,
+    so one wrong branch becomes hundreds of wrong lines a session.
+
+    `fear=None` (no score available) PARTICIPATES: the neutral fallback report
+    scores 1 with regime risk_on, which makes the combine a no-op anyway, so the
+    only way to reach None is a malformed report — and for a malformed report
+    the safe direction is to respect a fearful reading, not discard it.
+    """
+    if not getattr(config, "ENABLE_SENTIMENT_OVERRIDE", True):
+        return False
+    floor = getattr(config, "SENTIMENT_OVERRIDE_MIN_FEAR", 0)
+    if fear is None:
+        return True
+    return fear >= floor
+
+
+def effective_regime(vix_regime: str, sent_regime: Optional[str],
+                     fear: Optional[float] = None) -> str:
     """The regime every gate should read: VIX combined with sentiment, or VIX
-    alone when config.ENABLE_SENTIMENT_OVERRIDE is False.
+    alone when sentiment does not participate (see sentiment_participates).
 
     A helper rather than an inline conditional because the combine has two
     callers — the live path in main._run_cycle and the startup banner's
     "what width would the next entry arm at" preview. Those drifting apart would
     mean the banner advertises a regime the bot does not actually trade, which is
     the kind of divergence nobody notices until it matters. One switch, one place.
+
+    The combine stays `_more_fearful` — a strict max over _REGIME_RANK — even
+    when the fear floor is in play. The floor decides WHETHER sentiment is heard,
+    never WHAT it says. Two consequences worth stating, because both are easy to
+    get wrong by hand-rolling the condition instead:
+
+      * The high-fear range is NOT dropped. Testing `sent_regime == "cautious"`
+        would silently exclude fear 7-10 (defensive/crisis) — the readings that
+        matter most — leaving a rule that fires at fear 6 and then goes quiet in
+        a panic. The floor is a `>=` on the score precisely so 7-10 pass it too.
+      * Sentiment can only ever RAISE fear, never lower it. Assigning
+        "cautious" outright would let a fear-6 sentiment read DEMOTE a VIX
+        `defensive`/`crisis` regime and re-open entries that VIX had blocked.
+        Anything that reduces fear has to be its own explicit stage (see the SPY
+        trend-confirmation entry in docs/backlog.md).
     """
-    if not getattr(config, "ENABLE_SENTIMENT_OVERRIDE", True):
+    if not sentiment_participates(fear):
         return vix_regime
     return _more_fearful(vix_regime, sent_regime or "risk_on")
 
@@ -2035,7 +2084,7 @@ def note_regime(vix: Optional[float], regime: str, vix_regime: Optional[str] = N
     log a SENTIMENT OVERRIDE when Claude's read is strictly more fearful than the VIX
     read. Counts the effective regime, logs the level, flags transitions, and emits
     the human-readable mode line for the entry-gating regimes."""
-    global _last_logged_regime
+    global _last_logged_regime, _sentiment_threshold_blocks
     _regime_counts[regime if regime in _regime_counts else "unknown"] += 1
     vtxt = f"{vix:.1f}" if isinstance(vix, (int, float)) else "n/a"
     extreme = " EXTREME" if _is_extreme(vix) else ""
@@ -2051,10 +2100,24 @@ def note_regime(vix: Optional[float], regime: str, vix_regime: Optional[str] = N
         # every cycle, so a wrong one becomes hundreds of wrong lines a session.
         # It still logs: the divergence is the whole reason to keep running the
         # overlay, and it is what a later "should we switch it back on?" is judged on.
-        if getattr(config, "ENABLE_SENTIMENT_OVERRIDE", True):
+        #
+        # Three states now, not two, and the branch MUST be the same predicate the
+        # combine used — a fear score under the floor is suppressed by the floor,
+        # not by the master switch, and saying "OVERRIDE" there would report an
+        # action that did not happen.
+        if sentiment_participates(fear):
             logger.warning("SENTIMENT OVERRIDE: %s mode from Claude analysis "
                            "(fear=%s, VIX-regime=%s, risks: %s)", sent_regime, fear,
                            vix_regime, ", ".join(risks or []) or "n/a")
+        elif getattr(config, "ENABLE_SENTIMENT_OVERRIDE", True):
+            _sentiment_threshold_blocks += 1
+            logger.info("SENTIMENT BELOW THRESHOLD (no override): Claude reads %s "
+                        "vs VIX-regime %s, but fear=%s < %s — regime stays %s "
+                        "(threshold blocks #%d). risks: %s",
+                        sent_regime, vix_regime, fear,
+                        getattr(config, "SENTIMENT_OVERRIDE_MIN_FEAR", 0), regime,
+                        _sentiment_threshold_blocks,
+                        ", ".join(risks or []) or "n/a")
         else:
             logger.info("SENTIMENT ADVISORY (no override): Claude reads %s vs "
                         "VIX-regime %s (fear=%s) — regime stays %s. risks: %s",

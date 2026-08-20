@@ -734,7 +734,35 @@ ENABLE_SENTIMENT        = True
 # overlay is unaffected: the daily run, sector blocking via sectors_blocked(),
 # the banner and the report all behave exactly as before. Turning it back on is
 # a one-word change with no other edits.
-ENABLE_SENTIMENT_OVERRIDE = False
+#
+# Re-enabled 2026-08-20, but no longer binary — see SENTIMENT_OVERRIDE_MIN_FEAR.
+ENABLE_SENTIMENT_OVERRIDE = True
+
+# Minimum fear score for sentiment to PARTICIPATE in the effective regime
+# (fear_score is 1-10, higher = more fearful). Below it, sentiment is
+# informational and the regime is the VIX regime alone; at or above it, the
+# effective regime is the more fearful of {VIX, sentiment} exactly as before.
+#
+# The scale, from sentiment_analyzer._regime_from_score — note the threshold is
+# on the SCORE, not the regime, because 4/5/6 all map to the same "cautious":
+#     1-3 risk_on · 4-6 cautious · 7-8 defensive · 9-10 crisis
+#
+# 6 is chosen to sit at the TOP of the cautious band, so a merely-uneasy read
+# does not steer entries but a decisive one still does. That is the CRWD case:
+# the −$3,642.08 short was entered 2026-07-28 10:31:14 EDT on fear=4, and only
+# the sentiment override (VIX read risk_on) put the bot in cautious, which was
+# then the regime SHORT_MIN_REGIME required. At 6 that day is VIX-only and the
+# entry never arms; 07-30's fear=6 still overrides.
+#
+# UNVALIDATED — 6 is a boundary picked from three sessions, which is fitting,
+# not discovery (the same knife-edge objection this repo has already documented
+# twice, at 5.04% for SHORT_MAX_ATR_PCT and 4.98% for DDOG). The threshold is
+# instrumented: `_sentiment_threshold_blocks` counts cycles where sentiment WAS
+# more fearful than VIX but scored below this line, i.e. the overrides this
+# constant is suppressing. If that counter stays 0, the threshold is not doing
+# anything and the binary switch was fine; if it is large, check whether the
+# suppressed cycles were the ones worth acting on before trusting the number 6.
+SENTIMENT_OVERRIDE_MIN_FEAR = 6
 SENTIMENT_REPORT_FILE   = "data/sentiment_report.json"   # generated (gitignored)
 SENTIMENT_MODEL         = "claude-sonnet-4-6"
 SENTIMENT_MAX_TOKENS    = 500

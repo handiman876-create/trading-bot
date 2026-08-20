@@ -138,7 +138,8 @@ def _run_cycle(account_id: str) -> None:
     vix, vix_regime = strategy.current_regime()
     sentiment = sentiment_analyzer.current_sentiment()
     sent_regime = sentiment_analyzer.sentiment_regime(sentiment)
-    regime = strategy.effective_regime(vix_regime, sent_regime)
+    regime = strategy.effective_regime(vix_regime, sent_regime,
+                                       sentiment.get("fear_score"))
     blocked = sentiment_analyzer.sectors_blocked(sentiment)
     if config.ENABLE_VIX_FILTER or config.ENABLE_SENTIMENT:
         strategy.note_regime(vix, regime, vix_regime=vix_regime, sent_regime=sent_regime,
@@ -250,8 +251,26 @@ def _log_sentiment_banner(rep: dict) -> None:
     # MORE-FEARFUL combine unconditionally, which would be a lie about the live
     # regime the moment ENABLE_SENTIMENT_OVERRIDE went False.
     if getattr(config, "ENABLE_SENTIMENT_OVERRIDE", True):
-        logger.info("Combine     : effective regime = MORE FEARFUL of (VIX, sentiment); "
-                    "sentiment 'high' sector → blocks new long entries in that sector")
+        # The floor is part of the rule in force, so it belongs on this line. The
+        # live fear score is printed two lines up; stating the threshold beside it
+        # is what makes the banner answer "is sentiment steering the regime RIGHT
+        # NOW?" without reading config.
+        _floor = getattr(config, "SENTIMENT_OVERRIDE_MIN_FEAR", 0)
+        _fear = rep.get("fear_score")
+        _heard = strategy.sentiment_participates(_fear)
+        logger.info("Combine     : effective regime = MORE FEARFUL of (VIX, sentiment) "
+                    "when fear >= %s, else VIX alone. Live fear=%s → sentiment %s. "
+                    "Sentiment can only RAISE the regime, never lower it. A 'high' "
+                    "sector blocks new long entries regardless of fear. "
+                    "Counter: SENTIMENT BELOW THRESHOLD",
+                    # Deliberately NOT the words "INFO ONLY" — that phrase is the
+                    # established marker for the master switch being OFF, and a
+                    # below-threshold score is a different state with a different
+                    # fix (raise the score vs flip the switch). Reusing it would
+                    # make the two indistinguishable in the log.
+                    _floor, _fear,
+                    "IS steering the regime" if _heard
+                    else "is NOT steering (below threshold)")
     else:
         logger.info("Combine     : INFO ONLY — effective regime = VIX alone "
                     "(ENABLE_SENTIMENT_OVERRIDE=False; sentiment never raises the "
@@ -468,7 +487,8 @@ def main() -> None:
         _eff_reg = _vix_reg
         if config.ENABLE_SENTIMENT:
             _eff_reg = strategy.effective_regime(
-                _vix_reg, sentiment_analyzer.sentiment_regime(_rep))
+                _vix_reg, sentiment_analyzer.sentiment_regime(_rep),
+                (_rep or {}).get("fear_score"))
         # No single number any more: width is regime x volatility band, and the
         # band is per-symbol (ATR/price at entry), which the banner cannot know.
         # Print the whole row for the effective regime instead of one figure that
