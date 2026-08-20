@@ -457,6 +457,8 @@ _cross_sustain_blocks = 0  # gap-valid entry crosses deferred by CROSS_SUSTAIN_M
 _regime_short_blocks = 0   # would-be short entries suppressed by SHORT_MIN_REGIME
 _stops_trailed = 0         # trailing stops that actually moved (new extreme)
 _breakeven_locks = 0       # stops floored at entry after +1 ATR of profit (principal locked)
+_breakeven_lock_exits = 0  # confirmed stop-outs where that entry floor held the stop
+                           # (NOT the same as _breakeven_locks: arm vs fire)
 _profit_floors = 0         # stops raised to a profit-ladder rung (profit locked, not just principal)
 _floors_raised = 0         # broker GTC floors moved up to match a rung
 _floor_raise_failures = 0  # GTC raises that cancelled but failed to re-place (position unfloored!)
@@ -1285,6 +1287,60 @@ def _maybe_raise_broker_floor(symbol: str, qty: int, rec: dict, account_id: str,
                 rec["broker_order_id"], _floors_raised)
 
 
+def _breakeven_reached(rec: dict, entry: Optional[float], direction: str) -> bool:
+    """Has this position's best excursion EVER reached +BREAKEVEN_LOCK_ATR of profit?
+
+    Water-based and therefore breach-safe. high/low water are monotonic, so once
+    this is true it stays true even after price retraces back through entry —
+    which is exactly the state a breakeven-lock stop-out is in.
+
+    Deliberately carries NO `price` clamp. Arming needs one (see the call site);
+    exit attribution must not have one, and that difference is the whole bug this
+    helper exists to keep straight. Both callers share this one definition so the
+    excursion threshold cannot drift between arming and attribution.
+    """
+    if not (config.ENABLE_BREAKEVEN_LOCK and entry):
+        return False
+    trig = config.BREAKEVEN_LOCK_ATR * rec["atr_at_entry"]
+    if direction == "short":
+        return rec["low_water"] <= entry - trig
+    return rec["high_water"] >= entry + trig
+
+
+def _stop_source(rec: dict, entry: Optional[float], crisis_floor: bool,
+                 breakeven_reached: bool) -> str:
+    """Name the source HOLDING the stop right now, by LEVEL IDENTITY.
+
+    One definition for both consumers — the human-readable STOP-LOSS EXIT line
+    and the machine `stop_attr` written to the ledger. They agreed before this
+    existed only because both were wrong the same way; two call sites computing
+    the same attribution independently is how they drift apart.
+
+    Level identity, not a latched flag, for the reason spelled out at the
+    profit_floor_active site: a sticky "this feature armed once" bit stays set
+    long after the trail overtakes the floor, and mis-credits every later
+    stop-out. MSFT 2026-08-17 is the control — exited +$5,499.60 with its stop
+    92 points ABOVE entry while the lock condition had long been satisfied. A
+    condition-set flag calls that winner a breakeven lock; level identity
+    correctly calls it the trail.
+
+    Crisis floor is tested BEFORE the breakeven lock because the two collapse to
+    the same level (`entry`) in floor_srcs, so the label cannot separate them by
+    price alone. Latent today only because VIX_CRISIS_SHADOW is True; without
+    this ordering it becomes a silent mislabel the day that flips.
+    """
+    if rec.get("profit_floor_active"):
+        return "profit floor"
+    # Tolerance, not equality: stop_price is round(_, 4) of a float floor, and a
+    # cent is far below the tick of anything traded here.
+    at_entry = bool(entry) and abs(rec["stop_price"] - entry) < 0.01
+    if at_entry and crisis_floor:
+        return "crisis floor"
+    if at_entry and breakeven_reached:
+        return "breakeven lock"
+    return "atr trail"
+
+
 def _check_and_trail_stop(symbol: str, held: int, sig: dict,
                           account_id: str, positions: list[dict],
                           regime: str = "risk_on") -> bool:
@@ -1293,6 +1349,7 @@ def _check_and_trail_stop(symbol: str, held: int, sig: dict,
     Returns True iff a stop-exit order was placed (caller then returns, skipping
     signal logic for the cycle). False = no exit; continue to EMA-cross logic."""
     global _stop_exits, _stops_trailed, _breakeven_locks, _profit_floors
+    global _breakeven_lock_exits
 
     price = _live_price(symbol)
     if price is None:
@@ -1344,13 +1401,11 @@ def _check_and_trail_stop(symbol: str, held: int, sig: dict,
     #     ever being armed through the market (which would force an instant exit).
     #     It is why retroactive application to pre-rule positions is safe: an
     #     underwater name (DDOG) gates itself out; an in-profit one (CRL) locks.
-    breakeven_lock = False
-    if config.ENABLE_BREAKEVEN_LOCK and entry:
-        trig = config.BREAKEVEN_LOCK_ATR * rec["atr_at_entry"]
-        if direction == "short":
-            breakeven_lock = rec["low_water"]  <= entry - trig and price < entry
-        else:
-            breakeven_lock = rec["high_water"] >= entry + trig and price > entry
+    #   * ARMING uses the clamp; ATTRIBUTION at a breach must not — see
+    #     _breakeven_reached and the `src` computation in the breach branch.
+    breakeven_reached = _breakeven_reached(rec, entry, direction)
+    breakeven_lock = breakeven_reached and (price < entry if direction == "short"
+                                            else price > entry)
 
     apply_floor = crisis_floor or breakeven_lock
 
@@ -1476,15 +1531,34 @@ def _check_and_trail_stop(symbol: str, held: int, sig: dict,
         floor_active = bool(rec.get("profit_floor_active"))
         trail_would_fire = (price >= raw_trail if direction == "short"
                             else price <= raw_trail)
+
+        # ONE attribution, consumed by both the log line and the ledger.
+        #
+        # `breakeven_reached` (water-based) is passed rather than
+        # `breakeven_lock` (or `apply_floor`, which contains it). The latter
+        # carries the arming clamp `price > entry` / `price < entry`, and a stop
+        # resting AT entry can only be breached by price crossing back THROUGH
+        # entry — so the clamp is false on precisely the cycle attribution runs.
+        # Reusing it made the label unreachable: every lock exit in the ledger
+        # reads "atr trail" (QQQ 2026-08-18, stop = entry = 717.26 with the trail
+        # 21 points away). Water is monotonic, so _breakeven_reached survives the
+        # retrace that the clamp cannot.
+        src = _stop_source(rec, entry, crisis_floor, breakeven_reached)
+        lock_held = src == "breakeven lock"
+        # `water_at_exit` is the number the lock's verdict rests on — peak given
+        # back — and it appears NOWHERE else in the ledger, so it has to be
+        # captured here or the report can never be built. Unrecoverable for
+        # pre-fix trips, which is why the analyzer excludes rather than zeroes.
         stop_attr = {
             "profit_floor_active": floor_active,
             "profit_floor_price":  rec.get("profit_floor_price"),
             "atr_trail_at_exit":   round(raw_trail, 4),
             "floor_caused_exit":   floor_active and not trail_would_fire,
+            "breakeven_lock_held": lock_held,
+            "lock_caused_exit":    bool(lock_held and not trail_would_fire),
+            "stop_at_exit":        rec["stop_price"],
+            "water_at_exit":       water,
         }
-        src = ("profit floor" if floor_active else
-               "breakeven lock" if apply_floor and entry
-               and rec["stop_price"] == entry_r else "atr trail")
         logger.warning("STOP-LOSS EXIT %s %s x%d @ %.2f (stop=%.2f entry=%.2f "
                        "water=%.2f, held by %s, trail=%.2f) — exit #%d",
                        symbol, direction, exit_qty, price, rec["stop_price"],
@@ -1497,6 +1571,21 @@ def _check_and_trail_stop(symbol: str, held: int, sig: dict,
                                               account_id, rec)
         if status in ("executed", "floor_filled"):
             _stop_exits += 1
+            # Counts CAUSED, not merely held: an exit the raw trail would have
+            # made anyway is not the lock's. Counted only on a CONFIRMED exit,
+            # alongside _stop_exits — a rejected exit leaves the position open.
+            # Distinct from _breakeven_locks, which counts ARMING events.
+            #
+            # Unlike the ladder's counter this one cannot inflate itself: if the
+            # trail had overtaken entry then stop_price != entry, `src` is
+            # already "atr trail", and we never get here.
+            if stop_attr["lock_caused_exit"]:
+                _breakeven_lock_exits += 1
+                logger.info("BREAKEVEN LOCK EXIT %s %s: stopped at entry %.2f "
+                            "(trail would be %.2f, peak given back %.2f) "
+                            "— lock exits #%d",
+                            symbol, direction, entry, raw_trail,
+                            abs(water - entry), _breakeven_lock_exits)
             # Fourth teardown route. The floor is already down (cleared by
             # _submit_exit_order before submitting); this path holds `stops` and
             # saves it below, and _release_stop would reload/rewrite the file

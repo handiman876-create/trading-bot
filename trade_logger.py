@@ -46,7 +46,9 @@ def _now_str() -> str:
 # "unknown", NOT as "the floor was inactive": the analyzer must not count a
 # pre-2026-08-13 exit as evidence either way.
 _STOP_ATTR_KEYS = ("profit_floor_active", "profit_floor_price",
-                   "atr_trail_at_exit", "floor_caused_exit")
+                   "atr_trail_at_exit", "floor_caused_exit",
+                   "breakeven_lock_held", "lock_caused_exit",
+                   "stop_at_exit", "water_at_exit")
 
 
 def log_trade(action: str, symbol: str, quantity: int, price: float,

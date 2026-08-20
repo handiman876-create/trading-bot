@@ -557,3 +557,169 @@ on routine cross entries, masking the
 CRL/LII doubling defense. Fix when the
 doubling defense needs a reliable signal.
 Priority: LOW.
+
+---
+
+## Breakeven lock exit mislabeled as atr trail
+
+**Observed (2026-08-18):** QQQ stopped out with the stop sitting exactly at
+entry and the ATR trail 21 points below, but the log credited the trail:
+
+```
+2026-08-18 14:54:43  STOP-LOSS EXIT QQQ long x66 @ 717.12
+  (stop=717.26 entry=717.26 water=734.41, held by atr trail, trail=696.00)
+```
+
+The lock armed 2026-08-13 (`BREAKEVEN LOCK QQQ long: floor raised to entry
+717.26 (trail would be 694.55) — locks #1`) and held the stop for five
+sessions. Realized 66 × (717.14 − 717.26) = **−$7.92**, after giving back
+66 × (734.41 − 717.26) = **$1,131.90** of peak excursion.
+
+**Root cause — structural, not an edge case.** `src` at strategy.py:1487
+requires `apply_floor`, which is recomputed live from `breakeven_lock`
+(strategy.py:1347-1353). That test needs `price > entry` for a long
+(`price < entry` for a short) — the exact condition a breach of an
+entry-anchored stop violates. The two are mutually exclusive, so a
+breakeven-lock stop-out can **never** print "breakeven lock", in either
+direction. Every one is credited to the trail, in both the strategy line and
+the `trade:` line.
+
+**Approach is NOT settled — do not implement a persisted
+`breakeven_lock_active` flag without re-reading this.** A latched flag is the
+thing strategy.py:1396-1404 explicitly rejects for the profit floor ("a
+sticky `floor_active = True` would still be set long after the trail overtook
+the rung, and every later stop-out would be mis-credited"). It fails on real
+data: MSFT exited 2026-08-17 for **+$5,499.60** with its stop 92 points above
+entry (`stop=489.94 entry=397.86 trail=489.94`) while the lock condition was
+long since satisfied — a condition-set flag labels that winner "breakeven
+lock". "When the lock first fires" is itself ambiguous between the condition
+going true and the stop actually snapping to entry, and the two readings
+mislabel differently.
+
+**Direction — level identity for the label, recomputed every cycle:**
+
+1. `stop_price == round(entry, 4)` → lock held. This is the same shape as
+   `profit_floor_active` (strategy.py:1405-1408), not a new pattern. MSFT is
+   the negative control: 489.94 ≠ 397.86, so it correctly stays "atr trail".
+2. Guard with `and not crisis_floor`, as the arming site already does at
+   strategy.py:1435. `floor_srcs` (strategy.py:1363-1368) collapses crisis
+   floor and breakeven lock to the *same* level (`entry`), so the label cannot
+   tell them apart without it. Latent only while `VIX_CRISIS_SHADOW = True`
+   (config.py:550) — a silent regression the day that flips. A profit-floor
+   rung can never collide, being strictly past entry (strategy.py:1366).
+3. **Centralize.** This is the third site naming a stop's holding source
+   (:1405, :1435, :1487). Extract one
+   `_stop_source(rec, entry_r, crisis_floor, rung)` returning the label, and
+   have both the log line and the `stop_attr` dict consume it, so the
+   human-readable label and the machine attribution cannot disagree. They
+   agree today only because both are wrong.
+4. Counter `_breakeven_lock_exits`, separate from `_stop_exits` (:443) and
+   `_breakeven_locks` (:459, which counts armings). Count *caused*, reusing
+   the counterfactual at :1479-1483. Note `held ⇒ caused` almost always here:
+   if the trail had overtaken entry, `stop_price != entry_r` and the label is
+   already "atr trail". Unlike the ladder, this counter cannot inflate itself.
+5. Ledger plumbing mirrors the ladder: `_STOP_ATTR_KEYS` (trade_logger.py:49)
+   plus both ingest sites (performance_analyzer.py:341 and :534). New keys
+   `breakeven_lock_held`, `lock_caused_exit`, `stop_at_exit`, `water_at_exit`.
+   `absent ≠ False` applies (trade_logger.py:44-47) — pre-fix exits read
+   unknown, never "lock was inactive".
+
+**Report section**, mirroring `_profit_floor_stats`/`_profit_floor_lines`
+(performance_analyzer.py:899/963) so the numbers land in the JSON too. Three
+corrections to the obvious spec:
+
+- "Times lock armed" **cannot come from `_breakeven_locks`** — it is
+  per-process and resets on restart. It read 0 all day on 2026-08-18 despite
+  the lock demonstrably holding QQQ since 08-13. Aggregate `BREAKEVEN LOCK`
+  lines across `bot.log*` plus the `.gz` archives instead. (Same
+  counter-vs-ledger trap as "Split profit floor measurement by direction".)
+- "Avg gain locked" is **≈ $0 by construction** — the lock floors at *entry*,
+  so a lock-caused exit books roughly zero minus slippage. Reporting its mean
+  is noise dressed as a metric.
+- The number that decides the feature is **peak given back** (`water − entry`
+  at exit). `high_water`/`low_water` appear **nowhere** in the ledger today,
+  which is why `water_at_exit` is in the key list above. Not recoverable for
+  past trips — those must show as excluded, not as $0.
+- Verdict logic must **invert** vs the ladder's: `realized > 0` is
+  unreachable for this feature. Key on peak-given-back against realized — a
+  lock that repeatedly scratches out of positions 1+ ATR in profit is HURTING
+  even though it never books a loss. Reuse `MIN_FLOOR_TRIPS_FOR_VERDICT = 3`.
+
+**"Eligible but never bound" is the statistic worth having, and it is free.**
+Back ATR out of `water − trail` and test the arm threshold. Of the 4 stop
+exits in the retained logs (Aug 8–18), 3 had the lock eligible — CRWV
+(ATR 4.60, threshold 91.59, water 117.22) and MSFT (ATR 9.456, threshold
+407.32, water 513.58) both went to the trail because the floor never bound;
+only QQQ ever bound, and it scratched. *Bound then overtaken* has **zero**
+instances. So spec this on eligibility, derivable at breach from `water`,
+`entry`, `atr_at_entry` with no new persisted state.
+
+**Persisted arming marker: decided against, for now.** It buys exactly one
+report line, and that line's case has no observations while the case that
+does have observations is free. Revisit if a second position ever binds. If
+it is ever added, name it `breakeven_lock_armed_at` (ISO timestamp, set once,
+never cleared) and use it **only** as report metadata, never for the label —
+`_active` naming is what invites the sticky misuse.
+
+**Reconcile, not backfill.** Historical exits carry the wrong label, so
+re-derive rather than one-shot patch (stored values age relative to their
+derivation logic). Feasible for post-08-13 exits: `atr_trail_at_exit` is
+recorded, entry price is on the trip, and the stop level is parseable from
+the notes (`trailing stop hit @ 717.26`). `water_at_exit` is unrecoverable
+for past trips.
+
+**Tests** — homes are test_critical_sink_and_attribution.py and
+test_profit_floor.py: (a) the QQQ regression, entry 717.26 / stop 717.26 /
+trail 696.00 / exit 717.12 → "breakeven lock"; (b) trail above entry
+(`high_water > 755.67` on QQQ's 38.41 `mult_atr`) → "atr trail", the
+latched-flag guard; (c) crisis floor with shadow off → "crisis floor";
+(d) rung armed → "profit floor" wins; (e) absent keys stay unknown through
+both ingest sites; (f) short-side symmetry for (a)-(c).
+
+**Trading impact: none.** Attribution/observability only — no stop level, no
+entry, and no exit changes. The lock behaves identically before and after.
+That is why this was deferred on 2026-08-18 rather than shipped same-night.
+
+Priority: MEDIUM. Blocks any honest verdict on whether the breakeven lock
+earns its keep — it has 4 armings lifetime and its exits are currently
+invisible, credited to the trail.
+
+### STATUS 2026-08-19 — mostly SHIPPED, two items deliberately left
+
+**Built.** `strategy._breakeven_reached` (water-based, no price clamp) and
+`strategy._stop_source` (level identity, crisis-before-lock ordering), both
+consumed by the log line and `stop_attr` so the two cannot disagree.
+`_breakeven_lock_exits` counts *caused*, on confirmed exits only. Ledger keys
+`breakeven_lock_held` / `lock_caused_exit` / `stop_at_exit` / `water_at_exit`
+through `_STOP_ATTR_KEYS` and BOTH analyzer ingest sites. BREAKEVEN LOCK
+ANALYSIS section with the inverted verdict (protected vs peak-given-back, never
+realized P&L). 26 tests in `test_breakeven_lock_label.py`, including the QQQ
+regression — verified to FAIL against the pre-fix `src` expression, not merely
+to pass against the new one.
+
+Two deviations from the direction above, both deliberate:
+
+* Scratch detection is `SCRATCH_BAND_PCT` of notional, not an absolute dollar
+  band. QQQ's −$7.92 across 66 shares is −$0.12 a share; any fixed band tight
+  enough to mean something on a 10-share position misclassifies it.
+* The verdict compares `principal_protected` against `peak_given_back` rather
+  than peak-given-back against realized. Realized is ≈$0 by construction — this
+  document says so itself — so it cannot be one side of a ratio. Protected-vs-
+  surrendered is the same question with a non-degenerate denominator.
+
+**NOT built — still open.**
+
+1. **"Eligible but never bound".** The free statistic identified above, and on
+   the retained logs the one with actual observations (3 of 4 stop exits
+   eligible, only QQQ ever bound, *bound then overtaken* still zero). Needs a
+   log-aggregation pass over `bot.log*` + `.gz`, not a strategy change, so it
+   did not belong in this commit.
+2. **Reconcile for pre-fix exits.** Every stop exit before 2026-08-19 carries
+   the wrong label and is excluded from the new section rather than corrected.
+   Re-derive from `atr_trail_at_exit` + entry + the stop level parsed out of the
+   notes; `water_at_exit` stays unrecoverable, so reconciled trips can populate
+   held/caused but never `peak_given_back` — they must remain excluded from the
+   verdict rather than counted as zero given back.
+
+Until (1) and (2) land the section reports on post-2026-08-19 exits only, and
+will read "no attributed stop exits yet" until the next lock-held stop-out.

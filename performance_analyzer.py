@@ -339,6 +339,13 @@ def _normalize(raw: dict) -> dict | None:
         "profit_floor_price":  raw.get("profit_floor_price"),
         "atr_trail_at_exit":   raw.get("atr_trail_at_exit"),
         "floor_caused_exit":   raw.get("floor_caused_exit"),
+        # Breakeven-lock attribution (exits on/after 2026-08-19). Same
+        # absent-is-unknown contract: before that date the label was
+        # unreachable, so a missing key is not "the lock was inactive".
+        "breakeven_lock_held": raw.get("breakeven_lock_held"),
+        "lock_caused_exit":    raw.get("lock_caused_exit"),
+        "stop_at_exit":        raw.get("stop_at_exit"),
+        "water_at_exit":       raw.get("water_at_exit"),
     }
 
 
@@ -532,6 +539,10 @@ def _pair_round_trips(events: list):
                 "profit_floor_price":  ev.get("profit_floor_price"),
                 "atr_trail_at_exit":   ev.get("atr_trail_at_exit"),
                 "floor_caused_exit":   ev.get("floor_caused_exit"),
+                "breakeven_lock_held": ev.get("breakeven_lock_held"),
+                "lock_caused_exit":    ev.get("lock_caused_exit"),
+                "stop_at_exit":        ev.get("stop_at_exit"),
+                "water_at_exit":       ev.get("water_at_exit"),
                 "pnl":             round(pnl, 2),
                 "pnl_pct":         _pnl_pct(direction, entry_price, exit_price),
                 "win":             pnl > 0,
@@ -880,6 +891,7 @@ def build_report(ledger: dict, stops: dict, data_quality: dict,
         "spy":          spy,
         "warnings":     _build_warnings(agg),
         "profit_floor": _profit_floor_stats(closed),
+        "breakeven_lock": _breakeven_lock_stats(closed),
         "data_quality": data_quality,
     }
 
@@ -999,6 +1011,155 @@ def _profit_floor_lines(st: dict | None) -> list[str]:
         L.append(f"  verdict: {st['verdict']} — {detail}")
         L.append("  (still not a counterfactual — confirming this needs "
                  "post-exit price paths the ledger does not carry)")
+    return L
+
+
+MIN_LOCK_TRIPS_FOR_VERDICT = 3
+
+# What counts as "booked ~$0", as a fraction of position notional rather than an
+# absolute dollar band. QQQ 2026-08-18 is why: -$7.92 across 66 shares is -$0.12
+# a share — unambiguously a scratch — but any fixed dollar threshold small enough
+# to be meaningful on a 10-share position calls it a real loss. Sized to cover
+# stop slippage and commission without swallowing a genuine one.
+SCRATCH_BAND_PCT = 0.002
+
+
+def _breakeven_lock_stats(closed_trips: list) -> dict:
+    """Is the breakeven lock earning its keep, or scratching out live trades?
+
+    Same three-population shape as _profit_floor_stats, and the same refusal to
+    count an unattributed exit as evidence:
+
+      unknown  — breakeven_lock_held is None: the exit predates the attribution
+                 fix (< 2026-08-19) or came from a non-stop path. EVERY lock
+                 exit before that date is unknown, because the label was
+                 unreachable (see strategy._stop_source). Do not read the old
+                 ledger's zero lock exits as "the lock never fired".
+      held     — the entry floor, not the trail, was holding the stop.
+      caused   — held AND the raw ATR trail would NOT have fired at that price.
+
+    THE VERDICT DOES NOT KEY ON REALIZED P&L. A lock exit fires at entry, so it
+    books ~$0 by construction and `realized > 0` is unreachable — judging it the
+    ladder's way marks every success as neutral-at-best. The real trade-off is:
+
+      protected  = |entry - trail| * qty ... the loss avoided, had the trail fired
+      given_back = |water - entry| * qty ... the peak excursion surrendered
+
+    A lock that repeatedly scratches positions out of 1+ ATR of profit is HURTING
+    even though it never books a loss, and that only shows up in given_back.
+
+    HONEST LIMITS. `protected` assumes the trail would eventually have fired;
+    price could equally have recovered past entry, in which case the lock cost
+    the position rather than saving it. `given_back` is peak-to-entry, not
+    peak-to-what-price-did-next. The analyzer reads the ledger, not forward bars,
+    and cannot separate those. water_at_exit did not exist before 2026-08-19, so
+    pre-fix trips are EXCLUDED from given_back rather than counted as zero —
+    zero would read as "gave nothing back", the most favourable possible reading
+    of a trip we know nothing about.
+    """
+    stops = [t for t in closed_trips if t.get("exit_reason") == "stop"]
+    known = [t for t in stops if t.get("breakeven_lock_held") is not None]
+    held = [t for t in known if t.get("breakeven_lock_held")]
+    caused = [t for t in held if t.get("lock_caused_exit")]
+    realized = round(sum(t.get("pnl") or 0 for t in caused), 2)
+    scratches = sum(1 for t in caused
+                    if abs(t.get("pnl") or 0)
+                    < SCRATCH_BAND_PCT * abs((t.get("entry_price") or 0)
+                                             * (t.get("qty") or 0)))
+
+    protected = given_back = 0.0
+    measurable = 0
+    for t in caused:
+        en, tr, qty = (t.get("entry_price"), t.get("atr_trail_at_exit"),
+                       t.get("qty") or 0)
+        if en is not None and tr is not None:
+            protected += abs(en - tr) * qty
+        wa = t.get("water_at_exit")
+        if en is not None and wa is not None:
+            given_back += abs(wa - en) * qty
+            measurable += 1
+
+    if len(caused) < MIN_LOCK_TRIPS_FOR_VERDICT:
+        verdict = "INSUFFICIENT DATA"
+    elif not measurable:
+        verdict = "INSUFFICIENT DATA"
+    elif protected >= given_back:
+        verdict = "HELPING"
+    else:
+        verdict = "HURTING"
+    return {
+        "stop_exits":       len(stops),
+        "attributed":       len(known),
+        "unattributed":     len(stops) - len(known),
+        "lock_held":        len(held),
+        "lock_caused":      len(caused),
+        "trail_would_fire": len(held) - len(caused),
+        "realized_on_caused":  realized,
+        "scratches_on_caused": scratches,
+        "principal_protected": round(protected, 2),
+        "peak_given_back":     round(given_back, 2),
+        "given_back_measured": measurable,
+        "given_back_excluded": len(caused) - measurable,
+        "verdict":          verdict,
+    }
+
+
+def _breakeven_lock_lines(st: dict | None) -> list[str]:
+    """Render _breakeven_lock_stats. Split from the computation for the same
+    reason as the profit floor: the numbers belong in the JSON report too."""
+    L = ["=== BREAKEVEN LOCK ANALYSIS ==="]
+    st = st or {}
+    if not st.get("attributed"):
+        n = st.get("unattributed", 0)
+        L.append("  no attributed stop exits yet"
+                 + (f" ({n} stop exit(s) predate the attribution fix, "
+                    "not counted)" if n else ""))
+        L.append("  before 2026-08-19 the 'breakeven lock' label was "
+                 "unreachable, so an absence here is not evidence the lock "
+                 "never held a stop")
+        return L
+
+    L.append(f"  attributed stop exits:     {st['attributed']}"
+             + (f"   ({st['unattributed']} older/unattributed, excluded)"
+                if st["unattributed"] else ""))
+    L.append(f"  trades with lock holding:  {st['lock_held']} of {st['attributed']}")
+    L.append(f"  lock caused exit:          {st['lock_caused']} of {st['lock_held']}")
+    L.append(f"  trail would have fired:    {st['trail_would_fire']} of {st['lock_held']}")
+    if st["lock_caused"]:
+        L.append(f"  realized on lock-caused:   "
+                 f"{_fmt_money(st['realized_on_caused'])} "
+                 f"({st['scratches_on_caused']}/{st['lock_caused']} scratches "
+                 f"within {SCRATCH_BAND_PCT:.1%} of notional — near-zero is "
+                 f"the DESIGN, not a result)")
+        L.append(f"  principal protected:       "
+                 f"{_fmt_money(st['principal_protected'])} "
+                 f"(what the raw trail sat below entry)")
+        L.append(f"  peak given back:           "
+                 f"{_fmt_money(st['peak_given_back'])} "
+                 f"(excursion surrendered; {st['given_back_measured']} of "
+                 f"{st['lock_caused']} measurable"
+                 + (f", {st['given_back_excluded']} pre-2026-08-19 with no "
+                    "water_at_exit" if st["given_back_excluded"] else "")
+                 + ")")
+        L.append("  neither figure is a counterfactual — both assume price did "
+                 "what it did; the ledger carries no post-exit path")
+    if st["verdict"] == "INSUFFICIENT DATA":
+        if st["lock_caused"] >= MIN_LOCK_TRIPS_FOR_VERDICT:
+            L.append("  verdict: INSUFFICIENT DATA — no lock-caused exit carries "
+                     "water_at_exit, so peak given back cannot be measured")
+        else:
+            L.append(f"  verdict: INSUFFICIENT DATA — {st['lock_caused']} "
+                     f"lock-caused exit(s), need "
+                     f"{MIN_LOCK_TRIPS_FOR_VERDICT}+ before this means anything")
+    else:
+        detail = {
+            "HELPING": ("protected more principal than it surrendered in peak "
+                        "— the floor is converting round-trips into scratches"),
+            "HURTING": ("surrendered more peak excursion than it protected in "
+                        "principal — the lock is scratching out of positions "
+                        "that were meaningfully in profit"),
+        }[st["verdict"]]
+        L.append(f"  verdict: {st['verdict']} — {detail}")
     return L
 
 
@@ -1212,6 +1373,8 @@ def render_txt(report: dict) -> str:
     L.append(f"  new events added to ledger this run: {dq.get('new_events_added', 0)}")
     L.append("")
     L.extend(_profit_floor_lines(report.get("profit_floor")))
+    L.append("")
+    L.extend(_breakeven_lock_lines(report.get("breakeven_lock")))
     L.append("")
     L.append("A/B SCREEN TRACKER")
     L.extend(_ab_screen_lines())
