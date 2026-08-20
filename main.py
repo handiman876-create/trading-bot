@@ -398,7 +398,14 @@ def main() -> None:
     # outside the mode branch (equities and futures stops both floor at entry).
     logger.info("Breakeven   : %s",
                 ("ENABLED (%.1fxATR — floor stop at entry once +1 ATR in profit; "
-                 "longs+shorts, retroactive w/ underwater guard)"
+                 "longs+shorts, retroactive w/ underwater guard). Counters: "
+                 "BREAKEVEN LOCK (armed), BREAKEVEN LOCK EXIT (fired, and only "
+                 "when the raw trail would NOT have). The first is a substring "
+                 "of the second — a trailing space does NOT separate them — so "
+                 "count armings with `grep 'BREAKEVEN LOCK' | grep -v 'LOCK "
+                 "EXIT'`. Both counters are per-process and reset on restart: "
+                 "to answer 'has this ever fired', grep bot.log* plus the .gz "
+                 "archives, never the live counter"
                  % config.BREAKEVEN_LOCK_ATR)
                 if config.ENABLE_BREAKEVEN_LOCK else "DISABLED")
     logger.info("Profit floor: %s",
