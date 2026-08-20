@@ -723,3 +723,80 @@ Two deviations from the direction above, both deliberate:
 
 Until (1) and (2) land the section reports on post-2026-08-19 exits only, and
 will read "no attributed stop exits yet" until the next lock-held stop-out.
+
+---
+
+## FUTURES STOP PROTECTION
+
+**Observed (2026-08-20):** futures positions have **no stop protection of any
+kind**. No ATR trail, no profit floor, no broker-native GTC order. The only two
+ways out are the EMA state exit and the quarterly roll. Confirmed in code:
+`strategy._arm_stop_on_entry` is called only from the equity paths, and
+`place_futures_order` explicitly *refuses* the stop path
+(tradestation_client.py:485-488), so nothing arms a futures stop today.
+
+**Evidence of need:** NQU26 peaked at **+$12,860 (2026-08-13)** and is now
+giving it back. No mechanism locked any of it — the same "winners stop giving
+back gains" failure the breakeven lock and profit floor ladder exist to catch on
+the equity side.
+
+### Four blockers, in priority order
+
+**1. Tick rounding — unblocks (3) and (4).** `_build_order_body` formats both
+trigger and limit prices as `f"{round(p, 2):.2f}"`
+(tradestation_client.py:394-396). That is correct for equities and options and
+**wrong for futures**: ES and NQ tick at 0.25, RTY at 0.10, so a 0.01-rounded
+stop is an invalid price the broker either rejects or silently re-ticks. Fix:
+per-root tick tables in `tradestation_client.py`, and lift the
+`place_futures_order` refusal in the same change so the two can never disagree.
+
+> **Correction to the original framing:** this unblocks futures *only*, not
+> "equities and futures simultaneously". Broker-native stops for equities are
+> already shipped and live — `ENABLE_BROKER_STOP_FLOOR = True` since
+> 2026-08-10 (config.py:706), with confirmed GTC raises/cancels on 08-14 — and
+> they are correctly ticked at 0.01. Nothing on the equity side is waiting on
+> this.
+
+**2. Stop file namespacing.** `STOP_PRICE_FILE = "data/stop_prices.json"` is a
+single hardcoded path (config.py:282) shared by the equities and futures
+processes, which are separate processes with separate locks. There is no file
+locking, so concurrent writes are last-writer-wins. Fix: either split per
+process (`stop_prices_equities.json` / `stop_prices_futures.json`) or add file
+locking.
+
+> **Latent, not active.** Because nothing arms futures stops today, the futures
+> process never writes this file, so no records are being lost right now. This
+> is a **prerequisite of (3)**, not an independent live bug — it must land
+> *before* the first futures stop is armed, not after.
+
+**3. ATR instrument decision.** Signals come off `@ES` (the continuous
+contract); the position is in `ESU26` (a dated contract). ATR and entry price
+therefore sit on different price bases, and the gap between them jumps at every
+roll. Because the equity machinery persists `atr_at_entry` and `atr_mult` at
+entry and trails at that fixed width for the position's whole life, a
+basis-mismatched ATR is baked in permanently rather than self-correcting.
+**Decide the basis before implementing** — continuous for ATR with dated for
+price is the tempting default and is exactly the mismatch.
+
+**4. Rung calibration.** The equity percentage rungs are not transferable. 1%
+on ES is ~$3,200 of notional against a much smaller figure on a 5%-of-equity
+stock position, so the long/short ladders (`PROFIT_FLOOR_STEPS_LONG` first rung
++15%, `PROFIT_FLOOR_STEPS_SHORT` +8%) mean something entirely different per
+contract. A futures-specific ladder is needed — and per the asymmetric-ladder
+precedent, do not derive it arithmetically from the equity values.
+
+### Suggested sequence
+
+1. Tick rounding (unblocks broker GTC for futures).
+2. Stop file namespacing.
+3. Pilot the ATR trail on **one root only** (ES).
+4. Broker-native GTC for futures.
+5. Profit floor ladder, futures-specific percentages.
+
+**Priority: HIGH** — futures currently carry no gap protection at all, and
+unlike equities they trade nearly around the clock, so "gap" here includes the
+Sunday open and every session break.
+
+**Prerequisite: NONE for tick rounding.** It is self-contained in
+`tradestation_client.py` and testable without arming anything (see
+`test_futures_orders.py`).
