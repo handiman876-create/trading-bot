@@ -15,6 +15,36 @@ zgrep "\[CRITICAL\]" ~/trading-bot/logs/bot.log.*.gz
 grep "\[CRITICAL\]" ~/trading-bot/logs/bot.log.1 2>/dev/null
 ```
 
+### Durable sink check (`critical_alerts.log`)
+
+`config.CRITICAL_ALERT_FILE` is a second, rotation-proof copy of every
+`[CRITICAL]` record, written by the handler at `trade_logger.py:22`. It lives in
+the repo root, NOT `logs/`, precisely so logrotate's `logs/*.log` glob cannot
+truncate it. Check it as well as `bot.log` — it is the only copy that survives a
+weekend rotation.
+
+```bash
+f=~/trading-bot/critical_alerts.log
+if   [ ! -e "$f" ]; then echo "MISSING — sink not writing, investigate"
+elif [ -s "$f" ];   then cat "$f"
+else                     echo "empty - good!"
+fi
+```
+
+**Wrong pattern — DO NOT USE:**
+
+```bash
+cat ~/trading-bot/critical_alerts.log || echo "empty - good!"   # ← never fires
+[ -s file ] && cat file || echo "empty - good!"                 # ← lies when MISSING
+```
+
+The first is the `cat`-succeeds-on-empty trap already documented under Options
+Positions: an existing empty file makes `cat` exit 0, so the fallback is dead
+code and you learn nothing. The second fixes that but introduces a worse bug —
+`-s` is false for *missing* as well as *empty*, so a sink that was never created
+(or got deleted) reports **"empty - good!"**. That is the failure mode this file
+exists to prevent, reported as health. Test `-e` before `-s`, always.
+
 **Wrong pattern — DO NOT USE:**
 
 ```bash
@@ -65,10 +95,11 @@ skips them.
 Both retry next cycle, and **a repeating one never self-clears.** Counters:
 `EXIT ORDER REJECTED`, `BROKER FLOOR stuck` — both 0 lifetime as of 2026-08-17.
 
-**Nothing pages you.** These go to `bot.log` only; there is no alert channel yet.
-This manual check is currently the entire detection mechanism. Wiring
-`[CRITICAL]` to journald (persistent, rotation- and reboot-proof) plus an
-outbound channel is open work — see `backlog.md`.
+**Nothing pages you.** As of 2026-08-17 the durable sink above closes the
+*retention* half of this gap — a CRITICAL now survives rotation and reboot — but
+it is a sink, not an alert channel. No outbound notification exists, so these
+manual checks remain the entire detection mechanism. Wiring an outbound channel
+is still open work — see `backlog.md`.
 
 ### Stop File Check
 
