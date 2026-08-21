@@ -628,6 +628,22 @@ PROFIT_FLOOR_STEPS_LONG = [
 #     dead by construction (see 1), so the short side would silently run on the
 #     5pp early rungs alone — looser protection than the long side, not equal.
 PROFIT_FLOOR_STEPS_SHORT = [
+    # MICRO-RUNGS (added 2026-08-21). These are far tighter than anything else in
+    # either ladder and the gap is what makes them so, not the trigger. Measured
+    # against the three open shorts, whose entry ATR runs 3.0-4.6% of entry:
+    #
+    #   +2% → lock +1%  = 1pp gap ≈ 0.33 ATR of room (AAPL: ATR 3.05% of entry)
+    #   +5% → lock +3%  = 2pp gap ≈ 0.66 ATR
+    #
+    # For comparison the previous first rung (+8% → +5%) opens 3pp ≈ 1 ATR, which
+    # the note below already calls "much more aggressive than the long side". A
+    # third of an ATR is inside ordinary intraday noise, so once the +2% rung arms
+    # the position exits on the next small retrace — and the caller's ratchet makes
+    # that permanent, so a single 2% dip locks the floor for the life of the trade.
+    # Deliberate: catches the give-back that the 8% rung sits too far out to see.
+    # Watch the _profit_floors counter against realized short P&L to judge it.
+    (0.02, 0.01),   # +2% gain  → lock +1%
+    (0.05, 0.03),   # +5% gain  → lock +3%
     (0.08, 0.05),   # +8% gain  → lock +5%
     (0.12, 0.09),   # +12% gain → lock +9%
     (0.15, 0.13),   # +15% gain → lock +13%
@@ -682,6 +698,31 @@ PROFIT_FLOOR_STEPS_SHORT_DESC = _validate_profit_floor_steps(PROFIT_FLOOR_STEPS_
 # managed exit into a market order at an untrailed level. That invariant is the
 # whole reason _floor_price refuses to derive from the trailed stop; raising to
 # the rung minus the buffer keeps it.
+# Close profitable shorts before the weekend (added 2026-08-21).
+#
+# A short carries unbounded weekend gap risk in the direction it is exposed to,
+# and equities drift up — the same asymmetry that gives shorts their own tighter
+# profit-floor ladder above. Friday close is the one moment where flattening a
+# winner costs only the remaining upside and removes two days of unhedgeable gap.
+#
+# Applies to SHORTS ONLY and only when the position is in profit by at least
+# FRIDAY_SHORT_CLOSE_MIN_GAIN. A losing short is deliberately left alone: closing
+# it would realize the loss to avoid a gap that is as likely to help as hurt.
+#
+# BAD — DO NOT do this:
+#     extending this to longs. A long's weekend gap risk is bounded at -100% and
+#     sits WITH the market's drift, so flattening every profitable long on a
+#     Friday would just pay spread and commission to re-enter on Monday.
+# Late in the session, not at the open. Without a time gate the rule fires on the
+# first Friday poll at 09:30 and gives up a whole session of a working short to
+# avoid a gap that is still 6.5 hours away — and it would do so on a stub daily
+# bar, the same noise the entry gate exists to reject. 15:45 leaves 15 minutes to
+# fill before the close while making the "weekend gap" framing actually true.
+ENABLE_FRIDAY_SHORT_CLOSE = True
+FRIDAY_SHORT_CLOSE_MIN_GAIN = 0.005   # +0.5% — must clear round-trip costs
+FRIDAY_SHORT_CLOSE_AFTER_HOUR = 15    # ET
+FRIDAY_SHORT_CLOSE_AFTER_MIN = 45     # ET  -> fires from 15:45 ET onward
+
 ENABLE_PROFIT_FLOOR_BROKER_RAISE = True
 
 # ── Broker-native stop floor (disaster backstop) ──────────────────────────────

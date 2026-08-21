@@ -446,6 +446,12 @@ _entries_delayed = 0
 _momentum_align_entries = 0
 _short_entries = 0
 _short_covers = 0
+_friday_short_closes = 0   # profitable shorts flattened ahead of a weekend gap.
+                           # Counted separately from _short_covers (which it also
+                           # increments) so the weekend rule can be judged on its
+                           # own: a rule that never fires is dead weight, and one
+                           # that fires on every short is just an early exit with
+                           # extra steps.
 _latches_reconstructed = 0
 _crisis_exits = 0
 _sentiment_sector_blocks = 0
@@ -511,6 +517,41 @@ def _load_stops() -> dict:
 
 def _save_stops(stops: dict) -> None:
     _save_json(_STOPS_PATH, stops)
+
+
+def _is_friday_close_window() -> bool:
+    """True on a Friday, from FRIDAY_SHORT_CLOSE_AFTER_{HOUR,MIN} ET onward.
+
+    now_et() rather than datetime.now(): the box runs UTC, where the last five
+    hours of a Friday session are already Saturday. Reading the local weekday
+    would have skipped the window entirely between 20:00 and 21:00 UTC and then
+    fired it on Saturday, when the market is shut.
+
+    The time half is what makes this a weekend rule rather than a Friday-open
+    rule — see the config note. Both halves are checked against the same clock
+    reading so a poll spanning 15:44:59.9 cannot see Friday and 15:45 separately.
+    """
+    now = mh.now_et()
+    if now.weekday() != 4:                   # Mon=0 ... Fri=4
+        return False
+    return (now.hour, now.minute) >= (config.FRIDAY_SHORT_CLOSE_AFTER_HOUR,
+                                      config.FRIDAY_SHORT_CLOSE_AFTER_MIN)
+
+
+def _entry_price_for(symbol: str) -> Optional[float]:
+    """Entry price from the stop record, or None when there is no usable basis.
+
+    Same source the profit-floor ladder anchors on, so a gain measured here and
+    a rung armed there cannot disagree. Returns None for an absent record or a
+    non-positive entry (adopted options carry entry 0.0 — see
+    project_options_not_stop_managed) so callers decline rather than computing a
+    gain against zero.
+    """
+    rec = _load_stops().get(symbol)
+    if not isinstance(rec, dict):
+        return None
+    entry = rec.get("entry_price")
+    return entry if entry and entry > 0 else None
 
 
 def _live_price(symbol: str) -> Optional[float]:
@@ -2141,6 +2182,7 @@ def evaluate_stock(symbol: str, account_id: str, positions: list[dict],
                    blocked_symbols=frozenset()) -> None:
     global _momentum_align_entries, _short_entries, _short_covers, _entries_delayed
     global _crisis_exits, _sentiment_sector_blocks, _regime_short_blocks
+    global _friday_short_closes
 
     history = tc.get_historical(symbol, days=90)
     if not history:
@@ -2227,6 +2269,36 @@ def evaluate_stock(symbol: str, account_id: str, positions: list[dict],
                             f"EMA bearish, RSI={sig['rsi']:.1f}", account_id)
             _note_state_only_exit(symbol, sig, "bearish_cross")
         return
+
+    # FRIDAY SHORT CLOSE — flatten a PROFITABLE short before the weekend, ahead
+    # of the EMA-based cover below so it fires even while the trend is still
+    # bearish (i.e. while the short is working). Longs are untouched: their gap
+    # risk is bounded and sits with the market's drift.
+    #
+    # Gain is measured off the stop record's entry_price, not the session open,
+    # so it is the same basis the profit-floor ladder uses. No entry_price means
+    # no basis to size the gain, so the rule declines rather than guessing.
+    if (config.ENABLE_FRIDAY_SHORT_CLOSE and held < 0
+            and _is_friday_close_window() and not _already_bought_today(symbol)):
+        entry = _entry_price_for(symbol)
+        gain = ((entry - price) / entry) if entry else None
+        if gain is not None and gain > config.FRIDAY_SHORT_CLOSE_MIN_GAIN:
+            qty = abs(held)
+            logger.info("FRIDAY SHORT CLOSE %s x%d — gain=%.2f%% > %.2f%% "
+                        "(entry=%.2f price=%.2f); flattening ahead of the "
+                        "weekend gap", symbol, qty, gain * 100,
+                        config.FRIDAY_SHORT_CLOSE_MIN_GAIN * 100, entry, price)
+            order_id, status = _signal_exit(symbol, "buy_to_cover", qty, account_id)
+            if status != "failed":
+                _short_covers += 1
+                _friday_short_closes += 1
+                _mark_bought(symbol)
+                _log_exit_trade("BUY_TO_COVER", symbol, qty, price, order_id,
+                                f"friday short close, gain={gain * 100:.2f}%",
+                                account_id)
+                _note_state_only_exit(symbol, sig, "friday_short_close")
+                logger.info("friday short closes #%d", _friday_short_closes)
+            return
 
     # COVER — close a short whenever the trend is bullish (mirror of SELL).
     if held < 0 and _exit_short_signal(sig, symbol) and not _already_bought_today(symbol):
