@@ -15,8 +15,10 @@ thread.
 """
 
 import logging
+import re
 import threading
 import time
+from decimal import Decimal, ROUND_HALF_UP
 from typing import Optional
 from urllib.parse import quote
 
@@ -344,6 +346,98 @@ _ORDER_TYPES = {"market": "Market", "limit": "Limit", "stop": "StopMarket"}
 # Futures use plain BUY/SELL to open long/short — no BUYTOCOVER/SELLSHORT.
 _FUTURES_ACTIONS = {"buy": "BUY", "sell": "SELL"}
 
+# ── Tick rounding ────────────────────────────────────────────────────────────
+#
+# Trigger and limit prices must sit on the instrument's tick grid. Equities and
+# options tick at 0.01; futures do not, and a price off the grid is either
+# rejected or SILENTLY RE-TICKED by the broker — a stop resting at a price
+# nobody chose. That risk is why place_futures_order refused every stop until
+# this landed.
+#
+# Roots are matched, not sliced. A prefix slice is wrong in both directions:
+#
+#   BAD — DO NOT do this:
+#       root = symbol[:2]                     # 'RTYU26' -> 'RT', misses RTY
+#       root = symbol[:3][:2]                 # same, and makes a 3-char
+#                                             # 'RTY' table key unreachable
+#
+#   Both also mis-tick real EQUITIES by prefix collision: ESTC (Elastic), ESS,
+#   ESNT and NQIV all yield 'ES'/'NQ', so an ESTC stop at 89.37 would be sent
+#   as 89.25. That is the dangerous direction — it does not raise, it just moves
+#   the stop 12 cents.
+_FUTURES_CONTRACT = re.compile(r"^([A-Z0-9]{2,3})([FGHJKMNQUVXZ])(\d{2})$")
+_FUTURES_CONTINUOUS = re.compile(r"^@([A-Z0-9]{2,3})$")
+
+# Per-root tick sizes. Keyed on the FULL root, so 3-char roots are reachable.
+_TICK_SIZE = {
+    "ES":  0.25,   "MES": 0.25,   # E-mini / Micro S&P 500
+    "NQ":  0.25,   "MNQ": 0.25,   # E-mini / Micro Nasdaq 100
+    "RTY": 0.10,   "M2K": 0.10,   # E-mini / Micro Russell 2000
+}
+_EQUITY_TICK = 0.01
+
+
+class UnknownFuturesTick(ValueError):
+    """Raised for a futures contract whose root has no known tick size.
+
+    Deliberately NOT a 0.01 fallback. Defaulting an unknown futures root to the
+    equity tick is exactly the silent mis-ticking that the place_futures_order
+    refusal existed to prevent — it would quietly reintroduce the bug for every
+    root not in _TICK_SIZE (YM, CL, GC, ZB...). The wrappers below catch this
+    and return None, so an unpriceable order places nothing at all.
+    """
+
+
+def _futures_root(symbol: str) -> Optional[str]:
+    """Root of a futures symbol ('NQU26' -> 'NQ', '@ES' -> 'ES'), else None.
+
+    None means "not a futures symbol" — equities, options and anything
+    unrecognised — and the caller uses the 0.01 equity tick for those.
+    """
+    if not symbol:
+        return None
+    s = symbol.strip().upper()
+    m = _FUTURES_CONTINUOUS.match(s) or _FUTURES_CONTRACT.match(s)
+    return m.group(1) if m else None
+
+
+def _tick_size(symbol: str) -> float:
+    root = _futures_root(symbol)
+    if root is None:
+        return _EQUITY_TICK
+    try:
+        return _TICK_SIZE[root]
+    except KeyError:
+        raise UnknownFuturesTick(
+            f"no tick size known for futures root {root!r} (symbol {symbol!r}); "
+            f"add it to _TICK_SIZE rather than letting it round to "
+            f"{_EQUITY_TICK} and rest off-grid"
+        ) from None
+
+
+def _round_to_tick(price: float, symbol: str = "") -> str:
+    """Snap `price` to `symbol`'s tick grid and format it for the request body.
+
+    Returns a STRING, matching every other field in the body (Quantity is
+    str()) and the f-string this replaced. Returning a float would put
+    3021.7000000000003-class artifacts on the wire.
+
+    Decimal with ROUND_HALF_UP, not round(): Python's round() is half-to-even,
+    so round(100.005 / 0.01) is 10000 and a 100.005 stop would round DOWN to
+    100.00. Money rounding should not depend on the parity of the last digit.
+
+    Nearest-tick, not direction-aware. A protective stop ideally rounds AWAY
+    from the market (floor for a long's stop, ceil for a short's) so rounding
+    can never tighten it; nearest can move it half a tick, which on ES is
+    $6.25/contract. Left as a follow-up because it needs the position's
+    direction threaded in, and half a tick is inside the slippage already
+    logged on every fill.
+    """
+    tick = Decimal(str(_tick_size(symbol)))
+    snapped = (Decimal(str(price)) / tick).quantize(
+        Decimal("1"), rounding=ROUND_HALF_UP) * tick
+    return f"{snapped:.2f}"
+
 
 def _build_order_body(
     account_id:  str,
@@ -365,11 +459,15 @@ def _build_order_body(
     trigger. The wrappers below catch the raise and return None, so a bad call
     now places nothing at all — the only safe failure for an order.
 
-    Trigger/limit prices are rounded to a 0.01 tick, correct for equities and
-    options. FUTURES TICK DIFFERENTLY (ES/NQ 0.25, RTY 0.10) and would be
-    rejected or silently re-ticked by the broker, so place_futures_order refuses
-    the stop path until per-root tick rounding exists. Nothing arms futures stops
-    today (strategy._arm_stop_on_entry is called only from the equity paths).
+    Trigger/limit prices are snapped to the instrument's tick grid by
+    _round_to_tick — 0.01 for equities and options, per-root for futures
+    (ES/NQ/MES/MNQ 0.25, RTY/M2K 0.10). A futures root with no known tick raises
+    UnknownFuturesTick, which the wrappers turn into None, so an unpriceable
+    order places nothing rather than resting off-grid.
+
+    Note that enabling futures stops here only makes them POSSIBLE. Nothing arms
+    one yet: strategy._arm_stop_on_entry is still called only from the equity
+    paths, so the futures side remains unprotected until that is wired.
     """
     kind = order_type.lower()
     ts_type = _ORDER_TYPES.get(kind)
@@ -391,9 +489,9 @@ def _build_order_body(
         "Route":       "Intelligent",
     }
     if kind == "limit":
-        body["LimitPrice"] = f"{round(limit_price, 2):.2f}"
+        body["LimitPrice"] = _round_to_tick(limit_price, symbol)
     if kind == "stop":
-        body["StopPrice"] = f"{round(stop_price, 2):.2f}"
+        body["StopPrice"] = _round_to_tick(stop_price, symbol)
     return body
 
 
@@ -482,17 +580,16 @@ def place_futures_order(
     if action is None:
         logger.error("Unknown futures side: %s", side)
         return None
-    # Refused, not silently mis-ticked: _build_order_body rounds to 0.01, but ES
-    # and NQ tick at 0.25 and RTY at 0.10, so a rounded stop is an invalid price.
-    # Nothing arms futures stops today; lift this once per-root tick rounding
-    # lands, together in one change so the two can never disagree.
-    if order_type.lower() == "stop" or stop_price is not None:
-        logger.error("Futures stop orders are not supported yet (%s): needs "
-                     "per-root tick rounding (ES/NQ 0.25, RTY 0.10)", symbol)
-        return None
+    # Stops are supported as of the tick-rounding change. THREE edits had to land
+    # together and any two without the third fails silently:
+    #   1. _round_to_tick in _build_order_body  (else the stop rests off-grid)
+    #   2. removing the refusal that used to sit here
+    #   3. forwarding stop_price on the call below — it was previously DROPPED,
+    #      so lifting the refusal alone yielded "stop order requires stop_price"
+    #      from _build_order_body, swallowed by the except into a generic None.
     try:
         return _place_order(account_id, symbol, action, quantity,
-                            order_type, duration, limit_price)
+                            order_type, duration, limit_price, stop_price)
     except Exception as exc:
         logger.error("Futures order failed %s %s %s: %s", side, quantity, symbol, exc)
         return None
