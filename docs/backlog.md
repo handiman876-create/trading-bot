@@ -800,3 +800,41 @@ Sunday open and every session break.
 **Prerequisite: NONE for tick rounding.** It is self-contained in
 `tradestation_client.py` and testable without arming anything (see
 `test_futures_orders.py`).
+
+---
+
+## Direction-aware tick rounding
+
+**Observed (2026-08-21, 5135c33):** `_round_to_tick` uses ROUND_HALF_UP
+(nearest tick), but protective stops should round AWAY from the market:
+
+  * Long stop (rests below market)  -> round DOWN
+  * Short stop (rests above market) -> round UP
+
+Nearest-tick can move a stop half a tick toward the market ($6.25/contract on
+ES, $6.25 on NQ, $5.00 on RTY), tightening protection slightly. The error is
+bounded at half a tick and is as likely to loosen as tighten, so it is a
+correctness tidy-up rather than a live risk.
+
+**Direction:** Thread position direction into `_build_order_body` and select
+ROUND_FLOOR (long) or ROUND_CEILING (short). ~10 lines.
+
+Note the direction is NOT the same as `trade_action`, which `_build_order_body`
+already receives. A protective stop for a LONG is a SELL, and for a SHORT is a
+BUY — so the mapping inverts relative to the obvious reading, and getting it
+backwards would tighten every stop by up to a tick instead of loosening it. For
+equities the actions disambiguate (SELL vs BUYTOCOVER); for futures they do not,
+because _FUTURES_ACTIONS collapses both to plain BUY/SELL. So futures need the
+position side passed explicitly, not inferred from the action.
+
+**Prerequisite:** None (standalone fix).
+**Priority:** LOW (half-tick = $6.25 on ES), but do it before futures stops are
+actually armed — `strategy._arm_stop_on_entry` is still equity-only, so no
+futures stop rests at a rounded price yet and the bug is currently latent.
+
+**Also outstanding from 5135c33:** the tick-rounding code itself has no
+committed tests. It was verified interactively (ES/NQ/RTY/equity/unknown-root,
+body build, stop_price forwarding, UnknownFuturesTick) but none of that landed
+in `test_futures_orders.py`. Worth adding, especially the ESTC-style
+prefix-collision case, which is the regression most likely to be reintroduced by
+someone "simplifying" the regex back to a slice.
