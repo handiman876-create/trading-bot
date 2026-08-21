@@ -21,11 +21,33 @@ is the direct regression; it fails on the pre-fix code.
 
 GEOMETRY
 --------
-atr=3 on a 100 entry with mult=2.5 gives a 7.5-point trail and a 3-point
-(1 ATR) lock trigger. That spread is deliberate: the excursion needed to arm the
-lock (3%) stays UNDER the profit ladder's first rung (+15% long, +8% short), so
-these cases exercise the lock with the ladder left ON, rather than switching a
-second feature off and testing a configuration the bot never runs.
+The lock arms at +1 ATR, so whether it owns the stop at all depends on ATR as a
+FRACTION OF ENTRY versus the profit ladder's first rung. Every case here is
+sized so the lock wins that race, because the point is to exercise the lock with
+the ladder left ON rather than switching a second feature off and testing a
+configuration the bot never runs.
+
+  LONG  — atr=3 on a 100 entry: lock trigger 3%, first long rung +15%. Lock
+          first. Any name with ATR under 15% of price behaves this way, which
+          is all of them in practice.
+  SHORT — atr=1.5 on a 100 entry: lock trigger 1.5%, first short rung +2%
+          (the micro-rung added 2026-08-21, af8c960). Lock first only while
+          ATR/entry < 2%.
+
+THE SHORT LOCK IS SUPERSEDED ON HIGH-ATR NAMES — this is accepted behaviour, not
+a bug. The +2% micro-rung arms before the lock whenever ATR/entry > 2%, and it
+locks +1% where the lock only pins breakeven, so the ladder is strictly more
+protective there. Every short open on 2026-08-21 is in that regime:
+
+    AAPL   1 ATR = 3.05% of entry  -> micro-rung arms first
+    AVGO   1 ATR = 4.57% of entry  -> micro-rung arms first
+    GOOGL  1 ATR = 3.29% of entry  -> micro-rung arms first
+
+So on the current book the short half of this feature is effectively dead, and a
+stop-out that would once have logged "breakeven lock" now logs as a profit-floor
+exit. The low-ATR geometry below keeps the ATTRIBUTION path under test for the
+day a sub-2%-ATR short is opened; it is not a claim that the lock is load-bearing
+for shorts today. The long side is unaffected.
 
 Run:  python3 test_breakeven_lock_label.py
 """
@@ -231,20 +253,37 @@ def test_long_lock_exit_is_labelled_lock():
 
 
 def test_short_lock_exit_is_labelled_lock():
-    """Mirror image: low_water 96 clears 1 ATR, floor pins at 100, price breaks
-    back UP through entry to breach it."""
-    _reset(quote_price=96.0)
-    strategy._save_stops({"SSS": _rec(direction="short", water=96.0)})
-    strategy._check_and_trail_stop("SSS", -10, {"close": 96.0, "atr": 3.0},
+    """Mirror image: low_water 98.2 clears 1 ATR, floor pins at 100, price breaks
+    back UP through entry to breach it.
+
+    ATR IS 1.5 HERE, NOT 3.0 — deliberately, and the value is load-bearing.
+    The +2% short micro-rung (af8c960) arms on a 2% excursion; a 3.0 ATR needs a
+    3% excursion to arm the lock, so the rung would already own the stop at 99.0
+    and this test would be measuring the ladder while claiming to measure the
+    lock. At atr=1.5 the lock triggers at 1.5% and the 1.8% excursion below sits
+    in the 1.5%-2.0% window where the lock still wins.
+
+      entry 100.0, atr 1.5, mult 2.5  -> raw trail offset 3.75
+      low_water 98.2                  -> 1.8% excursion
+                                         >= 1 ATR (1.5%)  -> lock ARMS
+                                         <  2%            -> micro-rung does NOT
+      raw trail 98.2 + 3.75 = 101.95  -> floor 100.0 is lower, so it owns the stop
+
+    Widening this ATR back to 3.0 puts the micro-rung in charge and the exit
+    stops being attributable to the lock — see the GEOMETRY note at the top.
+    """
+    _reset(quote_price=98.2)
+    strategy._save_stops({"SSS": _rec(direction="short", atr=1.5, water=98.2)})
+    strategy._check_and_trail_stop("SSS", -10, {"close": 98.2, "atr": 1.5},
                                    "ACCT", [])
     rec = strategy._load_stops()["SSS"]
     assert abs(rec["stop_price"] - 100.0) < 0.01, ("short floor at entry", rec)
 
-    strategy.tc.get_quote = _fake_quote(100.5)    # breaches 100; trail is 103.5
+    strategy.tc.get_quote = _fake_quote(100.5)   # breaches 100; trail is 101.95
     seen, orig = _capture_trades()
     try:
         exited = strategy._check_and_trail_stop("SSS", -10,
-                                                {"close": 100.5, "atr": 3.0},
+                                                {"close": 100.5, "atr": 1.5},
                                                 "ACCT", [])
     finally:
         strategy.log_trade = orig
@@ -252,7 +291,29 @@ def test_short_lock_exit_is_labelled_lock():
     _, notes, attr = seen[0]
     assert "breakeven lock" in notes, notes
     assert attr["lock_caused_exit"] is True, attr
-    assert abs(attr["atr_trail_at_exit"] - 103.5) < 0.01, attr
+    assert abs(attr["atr_trail_at_exit"] - 101.95) < 0.01, attr
+
+
+def test_short_micro_rung_supersedes_the_lock_on_a_high_atr_name():
+    """The accepted supersession, pinned so it cannot regress silently.
+
+    Same setup as above but with atr=3.0 — the realistic case, matching every
+    short open on 2026-08-21 (ATR/entry 3.05%-4.57%). The 4% excursion clears the
+    +2% micro-rung, which pins the floor at 99.0 (locking +1%) rather than the
+    lock's 100.0 (breakeven). Strictly more protective, so it wins the
+    most-protective-of-three comparison.
+
+    If this ever asserts 100.0 again, the micro-rung has been removed or moved
+    above 1 ATR and the short lock is load-bearing once more.
+    """
+    _reset(quote_price=96.0)
+    strategy._save_stops({"SSS": _rec(direction="short", atr=3.0, water=96.0)})
+    strategy._check_and_trail_stop("SSS", -10, {"close": 96.0, "atr": 3.0},
+                                   "ACCT", [])
+    rec = strategy._load_stops()["SSS"]
+    assert abs(rec["stop_price"] - 99.0) < 0.01, (
+        "the +2% micro-rung should own the stop at a 4% excursion, not the "
+        "breakeven lock's 100.0", rec)
 
 
 # ── Negative cases: what must NOT be credited to the lock ────────────────────
