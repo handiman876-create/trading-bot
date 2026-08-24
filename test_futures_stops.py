@@ -49,7 +49,8 @@ except ModuleNotFoundError:
 # assignment because each one re-stubs what it uses in its own _reset(); this
 # module stubs MORE of tc than they do, so it has to clean up after itself.
 _TC_ATTRS = ("place_futures_order", "place_equity_order", "cancel_order",
-             "get_order", "get_order_outcome", "get_quote")
+             "get_order", "get_order_outcome", "get_quote",
+             "get_working_orders")
 
 
 if pytest is not None:
@@ -154,6 +155,8 @@ def _reset(quote_price=None):
     strategy.tc.cancel_order = _fake_cancel
     strategy.tc.get_order_outcome = _fake_outcome
     strategy.tc.get_order = _fake_get_order
+    strategy.tc.get_working_orders = lambda aid: []
+    strategy._floors_reconciled = False
     strategy.tc.get_quote = (lambda s: {"last": quote_price}) if quote_price \
         else (lambda s: None)
     _testlib.safe_remove(strategy._STOPS_PATH)
@@ -400,6 +403,39 @@ def test_futures_state_exit_cancels_the_gtc_before_selling():
     market = [o for o in _futures_orders if o[3] == "market"]
     assert len(market) == 1 and market[0][:3] == ("NQU26", "sell", 1), _futures_orders
     assert "NQU26" not in strategy._load_stops(), "stop record survived the exit"
+
+
+def test_floor_reconcile_does_not_latch_on_an_empty_stop_file():
+    """The bug that shipped with futures stops on 2026-08-24.
+
+    reconcile_broker_floors is a one-shot per process and runs BEFORE the
+    per-symbol evaluation that bootstraps records for adopted positions. On the
+    first cycle of a fresh deploy the stop file is empty, so there is nothing to
+    re-arm — and latching there spends the process's only attempt on an empty
+    file, leaving every adopted position with a bot stop but NO resting GTC
+    until someone restarts. ES/NQ/RTY all came up unfloored exactly this way."""
+    _reset(quote_price=29102.00)
+    positions = [{"symbol": "NQU26", "quantity": 1, "cost_basis": NQ_MARGIN}]
+
+    # Cycle 1: file is empty (nothing bootstrapped yet).
+    strategy.reconcile_broker_floors(positions, "ACCT")
+    assert strategy._floors_reconciled is False, (
+        "latched on an empty stop file — adopted positions will never be floored")
+    assert _futures_orders == [], _futures_orders
+
+    # Bootstrap creates the record, as the eval loop would.
+    strategy._check_and_trail_stop("NQU26", 1, {"close": 29102.00, "atr": NQ_ATR},
+                                   "ACCT", positions)
+    assert "NQU26" in strategy._load_stops()
+
+    # Cycle 2: now there IS something to re-arm, and the floor gets placed.
+    strategy.reconcile_broker_floors(positions, "ACCT")
+    gtc = [o for o in _futures_orders if o[3] == "stop"]
+    assert len(gtc) == 1, f"no GTC floor placed on the retry: {_futures_orders}"
+    assert gtc[0][0] == "NQU26", gtc[0]
+    assert strategy._load_stops()["NQU26"].get("broker_order_id"), \
+        "floor placed but the id was not persisted"
+    assert strategy._floors_reconciled is True, "clean pass should latch"
 
 
 def test_futures_exit_failure_leaves_the_record_alone():

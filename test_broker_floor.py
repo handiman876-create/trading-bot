@@ -360,13 +360,38 @@ def test_reconcile_bails_when_working_order_fetch_fails():
 
 
 def test_reconcile_runs_once_per_process():
+    """A CLEAN pass latches, and the second call is a no-op.
+
+    Uses a NON-EMPTY stop file on purpose. This test used to pass `{}`, which
+    made it pass for the wrong reason once an empty file became a deferral
+    rather than a clean pass: reconcile runs before the eval loop that
+    bootstraps records, so latching on an empty file burns the process's only
+    attempt and leaves adopted positions unfloored (see
+    test_futures_stops.test_floor_reconcile_does_not_latch_on_an_empty_stop_file).
+    The one-shot behaviour under test is unchanged; only the scaffolding is.
+    """
     _reset()
-    strategy._save_stops({})
-    strategy.reconcile_broker_floors([], "ACCT")
+    stops = {"HELD": _rec(100.0, 4.0, 2.5, "long", 90.0)}
+    stops["HELD"]["broker_order_id"] = "LIVE1"
+    strategy._save_stops(stops)
+    _working.append({"order_id": "LIVE1", "symbol": "HELD",
+                     "order_type": "StopMarket"})
+    strategy.reconcile_broker_floors([{"symbol": "HELD", "quantity": 10}], "ACCT")
     assert strategy._floors_reconciled is True
     _working.append({"order_id": "X", "symbol": "Y", "order_type": "StopMarket"})
     strategy.reconcile_broker_floors([], "ACCT")   # second call: no-op
     assert _cancelled == [], _cancelled
+
+
+def test_reconcile_defers_on_an_empty_stop_file():
+    """Empty file = nothing to re-arm yet, so do not spend the one shot on it."""
+    _reset()
+    strategy._save_stops({})
+    strategy.reconcile_broker_floors([], "ACCT")
+    assert strategy._floors_reconciled is False, (
+        "latched on an empty stop file — a position bootstrapped later in the "
+        "same cycle would never get a resting floor")
+    assert _placed == [], _placed
 
 
 def test_reconcile_disabled_flag_does_nothing():

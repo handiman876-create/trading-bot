@@ -1129,6 +1129,24 @@ def reconcile_broker_floors(positions: list[dict], account_id: str) -> None:
                        "failed — not cancelling or re-arming on an unknown state")
         return
     stops = _load_stops()
+    # Do NOT latch on an empty stop file. This pass runs once per process, before
+    # the per-symbol evaluation that BOOTSTRAPS records for adopted positions —
+    # so on the first cycle after a fresh deploy there is nothing yet to re-arm,
+    # and latching here would spend the process's only attempt on an empty file
+    # and leave every adopted position with no resting GTC until the next
+    # restart. Exactly that happened to ES/NQ/RTY when futures stops shipped
+    # (2026-08-24): three positions bootstrapped fine and got no floor.
+    #
+    # Returning WITHOUT latching costs one extra working-orders fetch per cycle
+    # for as long as the file stays empty, which is only while the account is
+    # flat. Orphan cleanup is not skipped by this: a resting stop behind no
+    # record and no position cannot exist unless we have some record, and if the
+    # file is empty every id is unknown to us, which the orphan pass already
+    # declines to touch.
+    if not stops:
+        logger.info("BROKER FLOOR reconcile deferred: no stop records yet "
+                    "(nothing to re-arm) — retrying next cycle")
+        return
     held = {p.get("symbol"): int(p.get("quantity", 0)) for p in positions
             if p.get("symbol")}
     known_ids = {r.get("broker_order_id") for r in stops.values()
