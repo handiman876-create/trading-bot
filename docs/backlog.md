@@ -838,3 +838,51 @@ body build, stop_price forwarding, UnknownFuturesTick) but none of that landed
 in `test_futures_orders.py`. Worth adding, especially the ESTC-style
 prefix-collision case, which is the regression most likely to be reintroduced by
 someone "simplifying" the regex back to a slice.
+
+---
+
+## Futures profit floor: % rungs unreachable
+
+**Observed (2026-08-24):** The profit-floor ladder thresholds are percentages of
+ENTRY PRICE, and `PROFIT_FLOOR_STEPS_LONG`'s first rung is +15%. NQU26's entire
+peak run was **+2.66% of price = +$15,695** on ~$44k of margin. No rung can ever
+arm on an index future: leverage produces large dollar P&L at tiny percentage
+moves, so a ladder keyed on percent-of-entry is structurally dead here. Same trap
+applies to anything else keyed on percent-of-entry — `PROFIT_TAKE_PCT` (+12%) is
+equally unreachable.
+
+This is why futures currently scratch at entry instead of banking a gain: with the
+ladder inert, the breakeven lock is the only floor, and it locks at exactly entry.
+Measured against the Aug 16-24 NQU26 tape, every ATR multiple from 1.5x to 3.0x
+produced the identical $0 outcome for that reason.
+
+**Direction:** dollar-based rungs, or per-root percentages ~30x tighter.
+
+  Option A — global +0.5% trigger -> lock 0.3%. Per contract that is:
+      NQ   trigger 147.7 pts = $2,955   lock  88.6 pts = $1,773
+      ES   trigger  38.2 pts = $1,909   lock  22.9 pts = $1,145
+      RTY  trigger  15.3 pts = $  763   lock   9.2 pts = $  458
+
+  Option B — dollar thresholds per root:
+      NQ   +$5,000 -> lock $3,000
+      ES   +$2,000 -> lock $1,200
+      RTY  +$1,000 -> lock   $600
+
+  These two converge, which is the argument for B: expressed as percentages,
+  B is 0.85%/0.51% on NQ, 0.52%/0.31% on ES, 0.66%/0.39% on RTY — i.e. Option A's
+  shape, but calibrated per root instead of one number that means a different
+  dollar amount on each contract. Prefer B.
+
+  On the actual NQU26 run, Option B's single rung would have locked ~+$3,000
+  instead of the $0 the breakeven lock produced.
+
+**Prerequisite:** point value per root. That is `config.FUTURES_SPECS[root]
+["multiplier"]` (ES 50, NQ 20, RTY 50) — NOT `_arm_stop_on_entry`, which never
+touches multipliers; it works purely in price space and is unaware a contract
+multiplier exists. Any dollar-denominated rung needs the multiplier threaded into
+`_profit_floor`, which today also works purely in price space and takes only
+`rec` and `price`. That plumbing is the actual work here, not the thresholds.
+
+**Priority:** MEDIUM. Gap risk is already covered by the resting GTC floors as of
+99c117a; this is about profit capture on trending futures moves, which is where
+the $27,485 NQU26 give-back actually went.
