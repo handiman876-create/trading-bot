@@ -671,6 +671,40 @@ def _bootstrap_stop(symbol: str, held: int, sig: dict, positions: list[dict],
                            "stored entry price (refusing a cost-basis estimate — "
                            "it would be off by the x100 multiplier)", symbol)
             return None
+    elif tc.is_futures_symbol(symbol):
+        # Third units mismatch in the same family as the option x100 above, and
+        # the reason this branch is not just `else`. TradeStation reports TotalCost
+        # for a futures position as the MARGIN requirement, not price x multiplier:
+        # NQU26 held at a real 29,546.50 fill reports 43,972.00, and ESU26 at
+        # 7,635.75 reports 28,098.00. basis/|qty| therefore yields an "entry" that
+        # is ~1.5x the price for NQ and ~3.7x for ES. For a LONG that puts
+        # high_water at the bogus entry and the stop 3 ATR below it — still tens
+        # of thousands of points above the market — so the record is breached on
+        # its first cycle and market-sells a position that was never in trouble.
+        # That is the option bug's exact shape, one instrument over.
+        #
+        # We anchor on the LIVE PRICE instead of refusing outright (the option
+        # branch's choice), because refusing leaves the position with no stop at
+        # all, and an adopted-at-today's-price stop is both safe and immediately
+        # useful: it sits 3 ATR below the market and ratchets from here.
+        #
+        # THE COST, stated plainly: entry_price is today's price, not the real
+        # fill, so every entry-anchored feature reads from the wrong basis for
+        # this record — the profit-floor ladder, the breakeven lock, and the P&L
+        # the ledger reports at exit. `bootstrapped: True` is what marks it, and
+        # performance_analyzer._inject_bootstrap_entries already treats such
+        # entries as ESTIMATED. A real fix needs the fill persisted at entry
+        # (which _arm_stop_on_entry now does for every NEW futures position), so
+        # this branch only ever applies to the three contracts already open when
+        # futures stops shipped.
+        entry = price
+        logger.warning("STOP BOOTSTRAP %s: anchoring entry on the LIVE PRICE "
+                       "%.2f — refusing cost_basis, which is MARGIN for futures "
+                       "(basis=%s would read as entry and arm an instantly "
+                       "breached stop). entry_price is an ESTIMATE: profit floor, "
+                       "breakeven lock and exit P&L are all off the true fill "
+                       "for this record.",
+                       symbol, price, _cost_basis(positions, symbol))
     else:
         basis = _cost_basis(positions, symbol)
         entry = (basis / abs(held)) if (basis and held) else price
@@ -727,6 +761,50 @@ _floor_rearms = 0
 _floors_reconciled = False
 
 
+# ── Instrument routing for the shared stop machinery ──────────────────────────
+# The trailing-stop code below is instrument-agnostic arithmetic (water-marks,
+# ratchets, floors, attribution) but it has to place real orders, and equities
+# and futures use different endpoints. Both helpers exist so that dispatch
+# happens in exactly TWO places instead of at the five order call sites that
+# would otherwise each need an `if is_futures` — the same mistake that put the
+# floor-cancel ordering wrong at five sites at once (see _submit_exit_order).
+#
+# Options are deliberately NOT routed here: they are not stop-managed at all
+# (evaluate_option exits on EMA state), and a contract reaching these helpers
+# would mean the OCC watchlist filter has leaked again. Such a symbol is neither
+# futures nor a valid stop candidate, so it takes the equity branch and fails
+# loudly at the broker rather than being silently priced on the wrong grid.
+
+def _exit_order_for(symbol: str, account_id: str, side: str,
+                    qty: int) -> Optional[dict]:
+    """Submit the market order that CLOSES a stop-managed position.
+
+    Futures have no short path yet, so a futures exit is always a plain "sell";
+    the equity side keeps its buy_to_cover for shorts. Returns the raw broker
+    result (or None) exactly as the underlying wrapper does.
+    """
+    if tc.is_futures_symbol(symbol):
+        return tc.place_futures_order(account_id, symbol, "sell", qty)
+    return tc.place_equity_order(account_id, symbol, side, qty)
+
+
+def _stop_order_for(symbol: str, account_id: str, side: str, qty: int,
+                    stop_price: float) -> Optional[dict]:
+    """Submit the resting GTC stop that backstops a position overnight.
+
+    Tick snapping is the broker layer's job (_round_to_tick, per-root for
+    futures), so nothing here rounds `stop_price` — doing it twice is how a
+    protective level drifts inside itself.
+    """
+    if tc.is_futures_symbol(symbol):
+        return tc.place_futures_order(account_id, symbol, "sell", qty,
+                                      order_type="stop", duration="gtc",
+                                      stop_price=stop_price)
+    return tc.place_equity_order(account_id, symbol, side, qty,
+                                 order_type="stop", duration="gtc",
+                                 stop_price=stop_price)
+
+
 def _floor_price(entry: float, atr: float, mult: float, direction: str) -> float:
     """The static GTC backstop level: the INITIAL ATR stop distance, widened by
     BROKER_STOP_FLOOR_BUFFER so the bot's stop always trips first.
@@ -759,9 +837,7 @@ def _place_broker_floor(symbol: str, qty: int, rec: dict,
     floor = _floor_price(rec["entry_price"], rec["atr_at_entry"],
                          rec["atr_mult"], rec["direction"])
     side = "buy_to_cover" if rec["direction"] == "short" else "sell"
-    result = tc.place_equity_order(account_id, symbol, side, qty,
-                                   order_type="stop", duration="gtc",
-                                   stop_price=floor)
+    result = _stop_order_for(symbol, account_id, side, qty, floor)
     if not result:
         logger.error("BROKER FLOOR %s: placement FAILED — position holds its "
                      "bot-managed stop only (no gap protection until reconcile)",
@@ -938,7 +1014,7 @@ def _submit_exit_order(symbol: str, side: str, qty: int, account_id: str,
             return None, "floor_filled"
 
     # 2. Submit the exit.
-    result = tc.place_equity_order(account_id, symbol, side, qty)
+    result = _exit_order_for(symbol, account_id, side, qty)
     order_id = (result or {}).get("order", {}).get("id")
     if not result or not order_id:
         _rearm_floor_after_failed_exit(symbol, rearm_qty, rec, account_id)
@@ -1309,9 +1385,7 @@ def _maybe_raise_broker_floor(symbol: str, qty: int, rec: dict, account_id: str,
         return
 
     side = "buy_to_cover" if direction == "short" else "sell"
-    result = tc.place_equity_order(account_id, symbol, side, qty,
-                                   order_type="stop", duration="gtc",
-                                   stop_price=round(target, 2))
+    result = _stop_order_for(symbol, account_id, side, qty, round(target, 2))
     if not result:
         _floor_raise_failures += 1
         _forget_broker_floor(rec)
@@ -1843,7 +1917,8 @@ def _slippage_sign(action: str) -> float:
 
 def _resolve_fill(symbol: str, account_id: str, order_id: Optional[str],
                   signal_price: float, action: str) -> tuple:
-    """Resolve the ACTUAL price for a just-placed equity order (entry OR exit).
+    """Resolve the ACTUAL price for a just-placed equity or futures order
+    (entry OR exit).
 
     Queries the broker (tc.get_order) for the fill and returns
     (resolved_price, fill_price, slippage):
@@ -2825,17 +2900,39 @@ def evaluate_future(root: str, account_id: str, positions: list[dict],
     # the new front month. Skip the rest of this cycle for this root.
     stale = _stale_futures_position(positions, root, trade_symbol)
     if stale:
+        stale_symbol = stale.get("symbol")
         qty = abs(int(stale.get("quantity", 0)))
         logger.info("ROLL: flattening expiring %s x%d before trading %s",
-                    stale.get("symbol"), qty, trade_symbol)
-        result = tc.place_futures_order(account_id, stale.get("symbol"), "sell", qty)
-        if result:
-            order_id = result.get("order", {}).get("id")
-            _log_exit_trade("SELL", stale.get("symbol"), qty, price, order_id,
+                    stale_symbol, qty, trade_symbol)
+        # Through _signal_exit, not a bare place_futures_order: the expiring
+        # contract now carries a resting GTC floor of its own, and that floor
+        # RESERVES the contract the roll is trying to sell. Submitting first and
+        # tearing the floor down after is the deterministic refusal GOOGL hit.
+        order_id, status = _signal_exit(stale_symbol, "sell", qty, account_id)
+        if status != "failed":
+            _log_exit_trade("SELL", stale_symbol, qty, price, order_id,
                             f"{root} roll: flatten expiring contract", account_id)
+        else:
+            logger.error("ROLL %s: flatten FAILED — expiring contract still "
+                         "open, retrying next cycle", stale_symbol)
         return
 
     qty = config.FUTURES_CONTRACTS
+
+    # Trailing stop, BEFORE the signal logic — same ordering and the same shared
+    # machinery as evaluate_stock, so futures get the ratchet, the regime/band
+    # width, the breakeven lock and the profit-floor ladder without a second
+    # implementation. Returns True when it placed an exit, in which case the
+    # signal logic must not also run this cycle.
+    #
+    # NOTE on the entry-anchored features: they are only as good as entry_price.
+    # New futures entries record the real fill (_arm_stop_on_entry below), but the
+    # three contracts open when this shipped are adopted by _bootstrap_stop at the
+    # live price — see the futures branch there for what that distorts.
+    if config.USE_TRAILING_STOP and held != 0:
+        if _check_and_trail_stop(trade_symbol, held, sig, account_id,
+                                 positions, regime):
+            return
 
     # SELL — flatten the long on bearish STATE, before the entry gate, same as
     # equities. Uses the FUTURES clock: the ES daily bar runs 18:00 -> 17:00 ET,
@@ -2843,13 +2940,19 @@ def evaluate_future(root: str, account_id: str, positions: list[dict],
     if held > 0 and _exit_long_signal(sig, trade_symbol) \
             and not _already_sold_today(trade_symbol):
         logger.info("SIGNAL SELL %s x%d", trade_symbol, held)
-        result = tc.place_futures_order(account_id, trade_symbol, "sell", held)
-        if result:
+        # Floor-first via _signal_exit (see the roll branch above): a bare market
+        # sell is refused while this contract's own GTC floor is still resting.
+        # _signal_exit also releases the stop record, so a state exit no longer
+        # leaves an orphan behind for reconcile to prune.
+        order_id, status = _signal_exit(trade_symbol, "sell", held, account_id)
+        if status != "failed":
             _mark_sold(trade_symbol)
-            order_id = result.get("order", {}).get("id")
             _log_exit_trade("SELL", trade_symbol, held, price, order_id,
                             f"{root} EMA bearish, RSI={sig['rsi']:.1f}", account_id)
             _note_state_only_exit(trade_symbol, sig, "bearish_cross")
+        else:
+            logger.error("SIGNAL SELL %s FAILED — position still open, retrying "
+                         "next cycle", trade_symbol)
         return
 
     if not fmh.entries_allowed():
@@ -2860,8 +2963,8 @@ def evaluate_future(root: str, account_id: str, positions: list[dict],
     if _already_bought_today(trade_symbol) or _already_sold_today(trade_symbol):
         return
 
-    # VIX regime gate — futures have no momentum slot or bot-managed stop, so the
-    # filter reduces to blocking new entries in defensive/crisis (the roll-flatten
+    # VIX regime gate — futures have no momentum slot, so the filter reduces to
+    # blocking new entries in defensive/crisis (the roll-flatten, trailing stop
     # and state exit above are de-risking and stay ungated).
     # (futures have no short path, so block_shorts is unused here)
     block_new_entries, _, _ = _apply_regime_rules(regime)
@@ -2874,14 +2977,32 @@ def evaluate_future(root: str, account_id: str, positions: list[dict],
         if result:
             _mark_bought(trade_symbol)
             order_id = result.get("order", {}).get("id")
-            # Futures carry no bot-managed stop (see note above), so the fill is
-            # not used to arm one — but resolve it anyway to record real fill vs
-            # signal slippage in the trade log, same as the equity entries.
-            _, fill_px, slippage = _resolve_fill(trade_symbol, account_id, order_id,
-                                                 price, "BUY")
+            # Resolve the real fill BEFORE arming, so the stop is anchored on the
+            # price we actually got rather than the signal price — the equity
+            # lesson from 5f26dcd, and it matters more here: one NQ point is $20,
+            # and the last NQU26 entry slipped 20.5 points ($410) against us.
+            entry_px, fill_px, slippage = _resolve_fill(
+                trade_symbol, account_id, order_id, price, "BUY")
             log_trade("BUY", trade_symbol, qty, price, "market", order_id,
                       f"{root} EMA cross up, RSI={sig['rsi']:.1f}",
                       fill_price=fill_px, signal_price=price, slippage=slippage)
+            # Arm the stop. Width comes from _get_atr_mult, i.e. the SAME
+            # regime x volatility-band table equities use. All three index roots
+            # sit in the low-vol band (ATR/price: ES ~1.0%, NQ ~1.8%, RTY ~1.4%,
+            # against a 2% threshold), so in risk_on they arm at 3.0x ATR. On NQ
+            # that is a ~1,600-point / ~$32,000 stop distance per contract: wide,
+            # because the band table was calibrated on single-name equities where
+            # a 4.5%-of-price stop is ordinary and there is no contract
+            # multiplier behind it. The breakeven lock, not the ATR width, is
+            # what does the real work at this size — measured against the
+            # Aug 16-24 NQU26 tape, every multiple from 1.5x to 3.0x produced the
+            # identical scratch-at-entry outcome. Revisit the width with a
+            # futures-specific band row once there are futures stop exits to
+            # judge it on; do NOT fit it to the three positions that motivated it.
+            _arm_stop_on_entry(trade_symbol, entry_px, sig.get("atr"),
+                               regime=regime, signal_price=price,
+                               fill_price=fill_px, slippage=slippage,
+                               qty=qty, account_id=account_id)
 
 
 def _open_option(account_id, occ_symbol, side, price, symbol, exp, strike, opt_type, sig):

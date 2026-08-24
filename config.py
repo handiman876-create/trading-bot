@@ -273,13 +273,25 @@ OPTION_MIN_DAYS_TO_EXPIRY  = 5      # close with <= this many TRADING SESSIONS l
 
 # ── Stop Loss (bot-managed trailing stop) ─────────────────────────────────────
 # Bot-managed (not broker-native) ATR trailing stop, checked every cycle in
-# strategy.evaluate_stock BEFORE the EMA-cross signal. Paper-trading choice for
-# now; switch to a broker Sell Stop order when we go live. See stop_prices.json
+# strategy.evaluate_stock and strategy.evaluate_future BEFORE the EMA-cross
+# signal. A resting broker GTC floor sits behind it (ENABLE_BROKER_STOP_FLOOR)
+# for the overnight gap the bot-managed level cannot cover. See stop_prices.json
 # for the persisted per-position state (entry, ATR-at-entry, ratcheting stop).
 USE_TRAILING_STOP    = True   # master switch; False = no stop checks at all
 STOP_LOSS_ATR_MULT   = 2.5    # default/fallback ATR multiple (= risk_on width)
 STOP_LOSS_ATR_PERIOD = 14     # ATR lookback (Wilder), computed once at entry
-STOP_PRICE_FILE      = "data/stop_prices.json"   # generated (gitignored)
+
+# PER-PROCESS, not shared. The equities and futures bots are separate processes
+# reading the same repo, and reconcile_stops prunes every record whose symbol is
+# absent from ITS OWN positions list. On one shared file the equities cycle would
+# therefore delete each futures record within a minute of it being written (and
+# re-bootstrap it with a reset water-mark, silently loosening the stop). Before
+# futures had stops at all, main.py papered over this by returning from the
+# futures branch BEFORE reconcile_stops; now that both sides arm, the file itself
+# has to be split. The suffix (not a prefix) keeps the equities path byte-for-byte
+# unchanged — "data/stop_prices.json" — so the four live records and their resting
+# GTC order ids survive the upgrade with no migration step.
+STOP_PRICE_FILE      = f"data/stop_prices{_PROC_SUFFIX}.json"   # generated (gitignored)
 
 # Regime-based ATR multiplier — the stop WIDTH a position is armed with depends on
 # the market regime AT ENTRY. The chosen multiple is persisted per position

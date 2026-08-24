@@ -150,6 +150,28 @@ def _run_cycle(account_id: str) -> None:
     equity    = balance.get("total_equity") if balance else None
     log_performance(account_id, balance, positions)
 
+    # Prune trailing-stop records for positions we no longer hold (once per cycle,
+    # before per-symbol evaluation). Guarded internally against an empty/failed
+    # positions fetch too.
+    #
+    # Runs in BOTH modes now, and that is only safe because STOP_PRICE_FILE
+    # carries _PROC_SUFFIX: each process prunes against its own positions list in
+    # its own file. It used to sit below the futures early-return precisely
+    # because the file was shared, and pruning equity stops against a futures
+    # positions list (or the reverse) deletes every record and re-bootstraps it
+    # with a reset water-mark — silently loosening a ratcheted stop. If the
+    # per-process file split is ever undone, this call has to move back down.
+    strategy.reconcile_stops(positions)
+
+    # Broker-native stop floors: cancel any GTC stop left resting behind a
+    # position we no longer hold, and re-arm a held position whose floor the
+    # broker says is gone. Self-latching to a single pass per process, so this
+    # costs one working-orders fetch at startup and nothing thereafter. No-op
+    # while ENABLE_BROKER_STOP_FLOOR is False. Also both modes: the futures
+    # account has its own id and its own working orders, so the two processes
+    # cannot see or cancel each other's floors.
+    strategy.reconcile_broker_floors(positions, account_id)
+
     if MODE == "futures":
         for root in config.FUTURES_WATCHLIST:
             try:
@@ -157,19 +179,6 @@ def _run_cycle(account_id: str) -> None:
             except Exception as exc:
                 logger.error("Error evaluating future %s: %s", root, exc)
         return
-
-    # Prune trailing-stop records for positions we no longer hold (once per cycle,
-    # before per-symbol evaluation). Equities-only — the futures process shares
-    # this stop file, and pruning against futures positions would wipe every
-    # equity stop. Guarded internally against an empty/failed positions fetch too.
-    strategy.reconcile_stops(positions)
-
-    # Broker-native stop floors: cancel any GTC stop left resting behind a
-    # position we no longer hold, and re-arm a held position whose floor the
-    # broker says is gone. Self-latching to a single pass per process, so this
-    # costs one working-orders fetch at startup and nothing thereafter. No-op
-    # while ENABLE_BROKER_STOP_FLOOR is False.
-    strategy.reconcile_broker_floors(positions, account_id)
 
     # Momentum slot + rotation id, read once per cycle. is_momentum drives the
     # one-shot alignment entry; generation re-arms the latch each new rotation.

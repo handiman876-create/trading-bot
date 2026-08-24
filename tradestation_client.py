@@ -401,6 +401,20 @@ def _futures_root(symbol: str) -> Optional[str]:
     return m.group(1) if m else None
 
 
+def is_futures_symbol(symbol: str) -> bool:
+    """True for a futures symbol — dated contract ('NQU26') or continuous ('@ES').
+
+    WHY THIS IS PUBLIC AND LIVES HERE, not in config beside is_occ_symbol: the
+    regexes it needs (_FUTURES_CONTRACT / _FUTURES_CONTINUOUS) are already here
+    for tick sizing, and config cannot import this module (this module imports
+    config). Re-deriving the pattern in config to match is_occ_symbol's location
+    would be a second copy of the one thing that must never disagree — which
+    instrument an order is for. strategy imports this module, so the routing
+    helpers there can reach it directly.
+    """
+    return _futures_root(symbol) is not None
+
+
 def _tick_size(symbol: str) -> float:
     root = _futures_root(symbol)
     if root is None:
@@ -465,9 +479,11 @@ def _build_order_body(
     UnknownFuturesTick, which the wrappers turn into None, so an unpriceable
     order places nothing rather than resting off-grid.
 
-    Note that enabling futures stops here only makes them POSSIBLE. Nothing arms
-    one yet: strategy._arm_stop_on_entry is still called only from the equity
-    paths, so the futures side remains unprotected until that is wired.
+    Futures stops became POSSIBLE here and are now actually ARMED: evaluate_future
+    calls strategy._arm_stop_on_entry on a confirmed BUY fill and routes the
+    resting GTC through strategy._stop_order_for, which dispatches here on
+    is_futures_symbol. The stop is still nearest-tick, not direction-aware — see
+    _round_to_tick and docs/backlog.md.
     """
     kind = order_type.lower()
     ts_type = _ORDER_TYPES.get(kind)

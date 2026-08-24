@@ -13,7 +13,10 @@ momentum.lock
 performance.lock
 sentiment.lock
 data/momentum_watchlist.json
-data/stop_prices.json
+# Glob, not the bare filename: STOP_PRICE_FILE carries _PROC_SUFFIX, so the
+# futures process writes data/stop_prices.futures.json alongside the equities
+# one. A literal path here would have committed live position state.
+data/stop_prices*.json
 data/momentum_entries.json
 data/trade_ledger.json
 data/sentiment_report.json
