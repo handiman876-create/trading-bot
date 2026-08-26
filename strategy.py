@@ -469,7 +469,8 @@ _stops_trailed = 0         # trailing stops that actually moved (new extreme)
 _breakeven_locks = 0       # stops floored at entry after +1 ATR of profit (principal locked)
 _breakeven_lock_exits = 0  # confirmed stop-outs where that entry floor held the stop
                            # (NOT the same as _breakeven_locks: arm vs fire)
-_profit_floors = 0         # stops raised to a profit-ladder rung (profit locked, not just principal)
+_profit_floors_long  = 0   # stops raised to a LONG-ladder rung (profit locked, not just principal)
+_profit_floors_short = 0   # same on the SHORT ladder — counted separately, see _bump_profit_floor
 _floors_raised = 0         # broker GTC floors moved up to match a rung
 _floor_raise_failures = 0  # GTC raises that cancelled but failed to re-place (position unfloored!)
 _history_gaps_held = 0     # polls that evaluated NO stop because history was unavailable
@@ -481,6 +482,35 @@ _option_target_exits    = 0  # contracts closed at OPTION_PROFIT_TARGET_PCT
 _option_stop_exits      = 0  # contracts closed at OPTION_STOP_LOSS_PCT
 _option_expiry_exits    = 0  # contracts closed with <= OPTION_MIN_DAYS_TO_EXPIRY left
 _occ_stop_prunes        = 0  # OCC-keyed stop records dropped (options are not stop-managed)
+
+
+def _bump_profit_floor(direction: str) -> int:
+    """Count one profit-floor arming against the ladder that produced it, and
+    return that ladder's new count for the log line.
+
+    Split long/short because the two ladders are different instruments, not two
+    settings of one: the short side's first rung is +2% -> lock +1% (a 1pp gap,
+    ~0.2-0.3 ATR of room) against the long side's +15% -> lock +10%. A single
+    total therefore cannot answer the only open question about the short
+    micro-rungs — do they earn their keep — because a long-ladder fire and a
+    short-ladder fire mean completely different things and summing them hides
+    the split. See docs/profit-floor-analysis.md.
+
+    Direction -> counter lives HERE ALONE. The increment site, the startup banner
+    and the tests all read through this one mapping rather than each spelling out
+    `if direction == "short"`, which is exactly how three copies of a rule drift
+    apart.
+
+    Anything not "short" counts long, matching the `rec.get("direction", "long")`
+    default used everywhere else for legacy records written before the key
+    existed.
+    """
+    global _profit_floors_long, _profit_floors_short
+    if direction == "short":
+        _profit_floors_short += 1
+        return _profit_floors_short
+    _profit_floors_long += 1
+    return _profit_floors_long
 
 
 def _load_json(path: str) -> dict:
@@ -1485,8 +1515,10 @@ def _check_and_trail_stop(symbol: str, held: int, sig: dict,
 
     Returns True iff a stop-exit order was placed (caller then returns, skipping
     signal logic for the cycle). False = no exit; continue to EMA-cross logic."""
-    global _stop_exits, _stops_trailed, _breakeven_locks, _profit_floors
+    global _stop_exits, _stops_trailed, _breakeven_locks
     global _breakeven_lock_exits
+    # _profit_floors_long/_short are NOT declared global here on purpose — they
+    # are only ever mutated through _bump_profit_floor(), which owns them.
 
     price = _live_price(symbol)
     if price is None:
@@ -1638,15 +1670,21 @@ def _check_and_trail_stop(symbol: str, held: int, sig: dict,
     # armed but LOSING to a tighter ATR trail never logs, which is the point:
     # this line means the ladder actually changed the stop, so the counter reads
     # as "times the ladder earned its keep", not "times it was eligible".
+    #
+    # The counter suffix is direction-tagged ("— long floors #3" / "— short
+    # floors #1") so the split survives into the log, where the only durable
+    # record of a fire lives: the in-process counters reset on every restart, and
+    # bot.log holds one day. "PROFIT FLOOR" stays the message prefix so existing
+    # greps and docs keep working, and "floors #" is still a substring of both.
     rung_r = round(rung[0], 4) if rung else None
     if rung and old_stop != rung_r and rec["stop_price"] == rung_r:
-        _profit_floors += 1
+        floors_n = _bump_profit_floor(direction)
         logger.info("PROFIT FLOOR %s %s: stop %.2f → %.2f — +%.0f%% of entry "
                     "%.2f locked on a +%.0f%% gain (trail would be %.2f) "
-                    "— floors #%d",
+                    "— %s floors #%d",
                     symbol, direction, old_stop, rec["stop_price"],
                     rung[2] * 100, entry, rung[1] * 100, raw_trail,
-                    _profit_floors)
+                    direction, floors_n)
 
     # Match the resting GTC to the rung. OFF by default
     # (ENABLE_PROFIT_FLOOR_BROKER_RAISE) — see that flag for why. Skipped on a

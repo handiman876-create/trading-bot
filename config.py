@@ -653,7 +653,11 @@ PROFIT_FLOOR_STEPS_SHORT = [
     # the position exits on the next small retrace — and the caller's ratchet makes
     # that permanent, so a single 2% dip locks the floor for the life of the trade.
     # Deliberate: catches the give-back that the 8% rung sits too far out to see.
-    # Watch the _profit_floors counter against realized short P&L to judge it.
+    # Watch the _profit_floors_short counter (split from _profit_floors on
+    # 2026-08-26 precisely so this question is answerable) against realized short
+    # P&L to judge it. First data point: AVGO 08-19 -> 08-26, the +2% rung was
+    # the ONLY mechanism near price and closed it +$437.57 at 36% of MFE —
+    # docs/profit-floor-analysis.md.
     (0.02, 0.01),   # +2% gain  → lock +1%
     (0.05, 0.03),   # +5% gain  → lock +3%
     (0.08, 0.05),   # +8% gain  → lock +5%

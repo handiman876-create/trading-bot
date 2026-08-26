@@ -80,7 +80,8 @@ def _reset(quote_price=None):
     _outcome_state = "dead"
     _order_result = {"order": {"id": "NEW1"}}
     strategy._stop_exits = 0
-    strategy._profit_floors = 0
+    strategy._profit_floors_long = 0
+    strategy._profit_floors_short = 0
     strategy._floors_raised = 0
     strategy._floor_raise_failures = 0
     strategy._signaled_buy_today.clear()
@@ -111,6 +112,20 @@ def _rec(direction="long", entry=100.0, atr=10.0, mult=2.5, water=None,
     return rec
 
 
+def _floors():
+    """(long, short) profit-floor counts as a tuple.
+
+    Every counter assertion below reads this rather than one counter, so each
+    test proves BOTH that its own ladder counted AND that the other ladder did
+    not — cross-contamination is checked at every site for free instead of in one
+    dedicated test that only covers one direction pair. The counters are split
+    because the two ladders are different instruments (short's first rung is a
+    1pp gap at +2%, long's is 5pp at +15%), so a combined total cannot say
+    whether the short micro-rungs earn their keep.
+    """
+    return (strategy._profit_floors_long, strategy._profit_floors_short)
+
+
 # ── Rung selection (the ladder itself, independent of the trail) ──────────────
 
 def test_long_at_plus_15_activates_first_rung():
@@ -123,7 +138,7 @@ def test_long_at_plus_15_activates_first_rung():
     rec = strategy._load_stops()["AAA"]
     # raw trail = 115 - 25 = 90; breakeven floor = 100; rung = 110 -> rung wins
     assert abs(rec["stop_price"] - 110.0) < 0.01, rec
-    assert strategy._profit_floors == 1, strategy._profit_floors
+    assert _floors() == (1, 0), _floors()   # long ladder only
 
 
 def test_long_at_plus_25_takes_the_higher_rung():
@@ -149,7 +164,7 @@ def test_long_at_plus_14_arms_no_rung():
         strategy.logger.info = orig
     rec = strategy._load_stops()["AAA"]
     assert abs(rec["stop_price"] - 100.0) < 0.01, rec   # breakeven, not a rung
-    assert strategy._profit_floors == 0, strategy._profit_floors
+    assert _floors() == (0, 0), _floors()
     assert not [m for m in msgs if "PROFIT FLOOR" in m], msgs
 
 
@@ -168,7 +183,7 @@ def test_short_rungs_mirror_below_entry():
     assert abs(rec["stop_price"] - 87.0) < 0.01, rec
     assert rec["stop_price"] < 100.0, "short rung must sit BELOW entry"
     assert rec["stop_price"] > 85.0, "short stop must stay ABOVE the market"
-    assert strategy._profit_floors == 1, strategy._profit_floors
+    assert _floors() == (0, 1), _floors()   # short ladder only
 
 
 def test_short_arms_at_plus_8_where_a_long_would_not():
@@ -182,7 +197,42 @@ def test_short_arms_at_plus_8_where_a_long_would_not():
     # gain = 8% -> SHORT rung locks 5% -> floor = 95. Under the long ladder NO
     # rung would arm and the breakeven lock would floor at entry (100) instead.
     assert abs(rec["stop_price"] - 95.0) < 0.01, rec
-    assert strategy._profit_floors == 1, strategy._profit_floors
+    assert _floors() == (0, 1), _floors()   # short ladder only
+
+
+def test_long_and_short_fires_count_on_separate_counters():
+    """The split itself: one long fire and one short fire in the same process
+    land on different counters, and each log line names its own direction.
+
+    This is the prerequisite for judging the short micro-rungs (AVGO 2026-08-26
+    was the first floor-caused short exit; the report needs 3 before it will
+    report a verdict). With a single total, a long-ladder fire at +15% and a
+    short-ladder fire at +2% are indistinguishable, so the total can never say
+    which ladder is doing the work."""
+    _reset(quote_price=115.0)
+    strategy._save_stops({"AAA": _rec(water=115.0)})
+    msgs, orig = _capture_logs()
+    try:
+        strategy._check_and_trail_stop("AAA", 10, {"close": 115.0, "atr": 10.0},
+                                       "ACCT", [])
+        assert _floors() == (1, 0), _floors()
+
+        # Same process, no reset: a short fire must not touch the long counter.
+        strategy.tc.get_quote = _fake_quote(85.0)
+        strategy._save_stops({"SSS": _rec(direction="short", water=85.0)})
+        strategy._check_and_trail_stop("SSS", -10, {"close": 85.0, "atr": 10.0},
+                                       "ACCT", [])
+    finally:
+        strategy.logger.info = orig
+    assert _floors() == (1, 1), _floors()
+
+    floors = [m for m in msgs if "PROFIT FLOOR" in m]
+    assert len(floors) == 2, floors
+    # Each line carries its own ladder's count, not a shared running total —
+    # both read #1. The suffix is the only durable per-direction record: the
+    # counters reset on restart and bot.log holds one day.
+    assert "— long floors #1" in floors[0], floors[0]
+    assert "— short floors #1" in floors[1], floors[1]
 
 
 def test_long_at_plus_8_still_arms_no_rung():
@@ -196,7 +246,7 @@ def test_long_at_plus_8_still_arms_no_rung():
     # so the RAW trail is all that is left: 108 - 25 = 83. No rung, no breakeven.
     assert abs(rec["stop_price"] - 83.0) < 0.01, rec
     assert rec["profit_floor_active"] is False, rec
-    assert strategy._profit_floors == 0, strategy._profit_floors
+    assert _floors() == (0, 0), _floors()   # the short ladder must not leak here
 
 
 # ── Composition with the ATR trail (the whole point of the feature) ───────────
@@ -216,7 +266,7 @@ def test_tight_trail_beats_the_rung():
     # Must sit in the 5pp band: the trail only wins when it is narrower than the
     # rung gap, and from +30% up the gap is 2pp < the 2.5-point trail here.
     assert abs(rec["stop_price"] - 122.5) < 0.01, rec
-    assert strategy._profit_floors == 0, "inert ladder must not count a fire"
+    assert _floors() == (0, 0), "inert ladder must not count a fire"
     assert not [m for m in msgs if "PROFIT FLOOR" in m], msgs
 
 
@@ -246,7 +296,7 @@ def test_rung_does_not_re_fire_on_later_polls():
     for _ in range(3):
         strategy._check_and_trail_stop("AAA", 10, {"close": 130.0, "atr": 10.0},
                                        "ACCT", [])
-    assert strategy._profit_floors == 1, strategy._profit_floors
+    assert _floors() == (1, 0), _floors()
 
 
 def test_rung_never_loosens_a_higher_stop():
@@ -278,7 +328,7 @@ def test_disabled_has_no_effect():
     rec = strategy._load_stops()["AAA"]
     # breakeven floor at entry still applies; the rung (125) does not
     assert abs(rec["stop_price"] - 105.0) < 0.01, rec    # raw trail, > entry
-    assert strategy._profit_floors == 0, strategy._profit_floors
+    assert _floors() == (0, 0), _floors()
 
 
 # ── Config validation ─────────────────────────────────────────────────────────

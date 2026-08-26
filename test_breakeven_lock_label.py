@@ -112,7 +112,8 @@ def _reset(quote_price=None):
     _cancel_ok = True
     _order_result = {"order": {"id": "NEW1"}}
     strategy._stop_exits = 0
-    strategy._profit_floors = 0
+    strategy._profit_floors_long = 0
+    strategy._profit_floors_short = 0
     strategy._breakeven_locks = 0
     strategy._breakeven_lock_exits = 0
     strategy._signaled_buy_today.clear()

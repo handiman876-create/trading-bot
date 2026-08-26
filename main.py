@@ -440,10 +440,19 @@ def main() -> None:
                 ("ENABLED — asymmetric ladders; complements the ATR trail and "
                  "breakeven lock (stop = most protective of the three), so a "
                  "rung only binds when the trail is wider. longs: %s | shorts: "
-                 "%s. Broker GTC raise: %s. Counter: PROFIT FLOOR"
+                 "%s. Broker GTC raise: %s. Counter: PROFIT FLOOR (long: %d, "
+                 "short: %d this process) — split per direction because the two "
+                 "ladders are different instruments (short first rung +2%%->1%% "
+                 "is a 1pp gap; long is +15%%->10%%), so a combined total cannot "
+                 "say whether the short micro-rungs earn their keep. Both read "
+                 "0 at startup by definition; the durable per-direction record "
+                 "is the log suffix `— long floors #N` / `— short floors #N`, so "
+                 "grep bot.log* plus the .gz archives, never the live counter"
                  % (_render_rungs(config.PROFIT_FLOOR_STEPS_LONG),
                     _render_rungs(config.PROFIT_FLOOR_STEPS_SHORT),
-                    "ON" if config.ENABLE_PROFIT_FLOOR_BROKER_RAISE else "OFF"))
+                    "ON" if config.ENABLE_PROFIT_FLOOR_BROKER_RAISE else "OFF",
+                    strategy._profit_floors_long,
+                    strategy._profit_floors_short))
                 if config.ENABLE_PROFIT_FLOOR else "DISABLED")
     logger.info("Cross gap   : %.2f%% minimum EMA separation on ALL cross signals "
                 "(long entry/exit, short entry/cover, options, futures); a "
