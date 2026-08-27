@@ -886,3 +886,63 @@ multiplier exists. Any dollar-denominated rung needs the multiplier threaded int
 **Priority:** MEDIUM. Gap risk is already covered by the resting GTC floors as of
 99c117a; this is about profit capture on trending futures moves, which is where
 the $27,485 NQU26 give-back actually went.
+
+### The lock arithmetic proves the fix is a trailing floor, not a tuned multiplier
+
+Added 2026-08-27, after the first two futures breakeven locks armed live (NQU26
+08-26, override 991.03 pts; ESU26 08-27, override 140.56 pts).
+
+The lock arithmetic proves the fix. `lock = entry` protects **$0** by
+construction, and it *always* dominates the trail over the whole 1–3 ATR range:
+
+    lock  = entry
+    trail = entry + run − mult·ATR                      (long; mirror for short)
+    lock binds ⟺ run < mult·ATR        lock arms ⟺ run ≥ BREAKEVEN_LOCK_ATR·ATR
+
+With `BREAKEVEN_LOCK_ATR = 1.0` and a 3.0x futures trail, the lock strictly
+dominates for every excursion in **[1·ATR, 3·ATR)** — a 3x-wide window that a
+position must cross *before* the trail can bind at all. So the fix is **NOT
+multiplier tuning** but a water-based trailing floor:
+
+    floor = max(entry, water − k·ATR)                   (long)
+    floor = min(entry, water + k·ATR)                   (short)
+
+i.e. the futures profit floor expressed as a **trailing** mechanism rather than a
+ladder. The `max(entry, …)` keeps the breakeven lock as the hard lower bound, so
+this is strictly an improvement on the current behaviour, never a loosening.
+
+**The dollar-based rung proposal above (Option B) is a step-function
+approximation of this** — same shape, quantised to one or two fixed thresholds.
+That is an argument for building the trailing form directly: it needs no
+per-root threshold table, and it inherits the ATR normalisation that Option A was
+reaching for with its per-root percentages.
+
+**k is the only knob, and it is bounded by the arming window.** The floor clears
+entry only when `run > k·ATR`, so `k` must sit below the run being captured —
+which is exactly the same 1-ATR neighbourhood the lock arms in. Measured against
+the live 08-27 state (`data/stop_prices.futures.json`, multipliers ES/NQ/RTY =
+50/20/50):
+
+| leg | run/ATR | k=0.25 | k=0.5 | k=0.75 | k=1.0 |
+|---|---|---|---|---|---|
+| ESU26 | 1.14 | $3,155 | $2,272 | $1,390 | $507 |
+| NQU26 | 1.16 | $9,124 | $6,628 | $4,132 | $1,636 |
+| RTYU26 | 0.55 | $567 | $90 | below entry | below entry |
+
+k≈0.5 lands in Option B's intended range on ES and NQ ($2,272 vs $1,200 target;
+$6,628 vs $3,000) while capturing almost nothing on RTY, whose run never reached
+1 ATR — the same reason RTY is the one leg that has not locked. Note this table
+is the *current* excursion on three open legs in one direction and one regime;
+it sizes the mechanism, it does not fit k. Do not tune k on it.
+
+**Not futures-specific.** The identical window is why AMD (07-29), PLTR (08-04)
+and QQQ (08-13→hit 08-18) all scratched on equities with $1.1k–$5.4k of open gain
+unprotected. If this is built, build it for both asset classes; the futures
+`multiplier` plumbing described above is only needed for the *dollar-denominated*
+variant, and a water-based floor in ATR space does not need it at all — which
+removes this item's stated prerequisite.
+
+Cross-refs: "Breakeven lock exit mislabeled as atr trail" (line 563) — a
+water-based floor makes that attribution bug worse, because the floor would sit
+above entry and the `stop == entry` tell used to detect lock-caused exits stops
+working. Fix attribution first, or at least in the same change.
