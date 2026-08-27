@@ -946,3 +946,57 @@ Cross-refs: "Breakeven lock exit mislabeled as atr trail" (line 563) — a
 water-based floor makes that attribution bug worse, because the floor would sit
 above entry and the `stop == entry` tell used to detect lock-caused exits stops
 working. Fix attribution first, or at least in the same change.
+
+#### Build sequence (specced 2026-08-27, build target: week of 2026-08-31)
+
+Spec is settled: `floor = max(entry, water − k·atr_at_entry)`, `k ≈ 0.5`.
+**Blocked on the attribution fix at line 563 — build that first.** All line
+numbers below verified against `strategy.py` on 2026-08-27.
+
+1. **`_stop_source()` (strategy.py:1477)** — teach it a floor type that sits
+   *above* entry, not at it. Today it returns `"breakeven lock"` from
+   `at_entry and breakeven_reached`; a water floor is neither `at_entry` nor the
+   ladder, so it would fall through and be credited to `"atr trail"` — the exact
+   line-563 bug, one level worse. This is why attribution lands first.
+
+2. **New `_check_water_floor(rec, price)`** — returns the candidate floor;
+   apply when `floor > current_stop` (long; `<` for short), then raise the
+   resting broker GTC. **Reuse, do not reimplement:** `_floor_price(entry, atr,
+   mult, direction)` (:838) already does entry ± mult·ATR in price space and
+   should be generalised to take an anchor (entry *or* water) rather than
+   copied; `_maybe_raise_broker_floor()` (:1369) already owns the GTC-raise path
+   including the cancel/replace ordering. Signature should mirror
+   `_profit_floor(rec, price)` (:1333) so both floors compose the same way.
+   (Two call sites for the same logic is the pattern that has bitten this repo
+   3× — put the anchor-generalised helper in place on day one.)
+
+3. **Config:** `ENABLE_WATER_FLOOR = True`, `WATER_FLOOR_K = 0.5`, alongside
+   `ENABLE_BREAKEVEN_LOCK` / `BREAKEVEN_LOCK_ATR` (config.py:573-574).
+
+4. **Wire into `_check_and_trail_stop()` (strategy.py:1511) — equities AND
+   futures.** Single code path, no `_IS_FUTURES` branch: the mechanism is pure
+   price space, so it needs no per-root multiplier and no split.
+
+5. **Counter + report line.** A new safety net needs its own counter or we
+   cannot tell later whether it earned its keep — follow `_bump_profit_floor()`
+   (:487) and the `_profit_floors_long/short` split already specced at line 482,
+   i.e. direction-split from the start rather than retrofitted.
+
+6. **Tests:** the three equities regressions — AMD 07-29 (short, $5,445 open at
+   the low, protected $0), PLTR 08-04 (long, $3,525 open, realised −$6),
+   QQQ 08-13→08-18 (long, $1,131.90 peak, realised −$7.92) — plus the two
+   futures cases ESU26 and NQU26. Each asserts the floor binds *above* entry and
+   that `_stop_source` attributes the exit to the water floor, not the trail.
+   Add RTYU26 as the negative case: 0.55 ATR run, floor must stay at entry and
+   the water floor must NOT arm. Every positive case needs its paired negative.
+
+7. **Then update this item's status to PARTLY DONE** — the % rungs are still
+   unreachable; the water floor supersedes the *need* for dollar rungs (Option A
+   and B above become obsolete, not done).
+
+**Caveat on the $2,272 / $6,628 figures.** Those are open unrealised on three
+live legs, and both ES and NQ carry **estimated** adopted entries (true fills
+7,635.75 and 29,546.50 — see the futures-stops note). Since the floor is anchored
+on `entry`, a wrong entry puts the floor at the wrong price and those dollar
+figures inherit the error. They size the mechanism; they are not a forecast, and
+they are not a k-fit.
