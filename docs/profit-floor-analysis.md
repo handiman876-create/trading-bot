@@ -8,6 +8,11 @@ carries the per-trip stories the counters can't hold.
 The report withholds a verdict below `MIN_FLOOR_TRIPS_FOR_VERDICT` = 3
 floor-caused exits. **We are at 1.** Nothing below is a validated result.
 
+Count armings and exits separately. The ladder has **armed twice** (AVGO
+2026-08-26, CRWV 2026-08-28) and **caused one exit** (AVGO). Only the second
+number moves the verdict, and only the second number is in the report — see
+"The arming that no counter sees" below for why that is a measurement gap.
+
 ---
 
 ## Trip 1 — AVGO short, 2026-08-19 → 2026-08-26
@@ -83,6 +88,92 @@ as resting on one poll.
 
 ---
 
+## Arming 2 — CRWV short, 2026-08-28 (intraday)
+
+**The second micro-rung arming, and explicitly NOT a floor-caused exit.** The
+floor tightened the stop by 9.37 points and then a different mechanism — the
+Friday weekend-gap close — fired first. The ladder's trip count stays at **1**.
+
+| | |
+|---|---|
+| Entry | 2026-08-28 10:30:59 EDT, `SELL_SHORT` 556 @ **86.01** (fill; signal 86.07, slippage +0.06) |
+| Entry ATR | 6.82 = **7.93%** of entry, trail multiple **1.50x** (regime `risk_on` × high vol band) |
+| Best price | low_water **84.24** → +2.058%, polled MFE **$984.12** (1.77 × 556) |
+| Floor armed | 11:52:45 EDT — +2% rung, stop 94.52 → **85.15** (`short floors #1`) |
+| Broker GTC | cancel 969230209 → raise 98.28 → **87.19** (2.04 behind the rung), order 969263437 (`cancels #2` / `raises #1`) |
+| Exit | 15:45:25 EDT, `BUY_TO_COVER` @ **84.17** (fill; signal 84.14, slippage +0.03) |
+| Exit cause | **`friday_short_close`** — gain 2.17% > 0.50% threshold, NOT the floor |
+| Realized | **+$1,023.04** (+2.139%), order 969317271 |
+| ATR trail at exit | **94.52** — 10.35 away, would NOT have fired |
+| Floor at exit | 85.15 — sat **0.98 above** the exit price, never touched |
+| Breakeven lock | never armed (needs 79.19 = entry − 1 ATR; best was 84.24) |
+
+Ledger record carries `exit_reason: "friday_short_close"` and
+`floor_caused_exit: null` — see the gap section below; the null is not a "no".
+
+### Three things this trip confirms
+
+1. **The 5-cent arming margin is not a one-off.** The +2% rung needs price
+   ≤ 84.2898 (86.01 × 0.98). Best low_water was **84.24** — it cleared by
+   **$0.0498**. AVGO cleared its trigger by $0.0616. Both armings in the ladder's
+   history have hung on under 7 cents. Whatever else is true, this ladder's
+   arming rate is dominated by tape noise at the trigger, not by trade quality.
+2. **The "instant scratch" failure mode still has not appeared.** The rung armed
+   at 11:52 and the position was not closed by it 3h 53m later, having improved
+   from 84.24 to a 84.17 fill. Here 1pp of lock is only **0.126 ATR** (0.8601 /
+   6.82) — *tighter* than AVGO's 0.22 ATR, so this was the more hostile test of
+   the geometry, and it still held. Two for two.
+3. **The trail remains inert at 1.5x on a 7.9%-of-entry ATR.** It sat 10.35 away
+   at exit and never came within 9 points of the floor. Consistent with the
+   futures finding: above ~1.5x the trail is not a live mechanism.
+
+### Where this trip differs from AVGO: MFE capture
+
+AVGO captured 36% of MFE and that drove the whole "is the 1pp gap too tight"
+question. CRWV captured **104%** — realized $1,023.04 against a polled MFE of
+$984.12, because the cover filled at 84.17, *below* the best price the 60-second
+poll ever recorded (84.24).
+
+That over-100% number is not the ladder outperforming. It is a measurement
+artifact worth naming: **poll-sampled MFE is a lower bound on true MFE, not a
+ceiling.** The 60s poll can miss the actual low entirely. So AVGO's "36% of MFE"
+is itself an overestimate of capture — true MFE was at least as good as polled,
+probably better, making the real capture fraction *lower* than 36%. This
+strengthens rather than weakens the open question below, and it means MFE-based
+capture ratios should never be quoted to more than one significant figure.
+
+Note also that the exit here was not the ladder's decision, so this trip says
+nothing about what the 1pp gap does when left to run. It is not a data point on
+the capture question — only on arming and on holding after arm.
+
+### The arming that no counter sees
+
+`_profit_floor_stats` reads `closed_trips` filtered to
+`exit_reason == "stop"` (`performance_analyzer.py:935`). CRWV exits as
+`friday_short_close`, so it is excluded from **every** population in that
+report — `floor_active` included. The weekly report therefore still says
+"trades with floor active: 1 of 4" after a session in which the floor armed,
+moved a stop 9.37 points, and raised a broker GTC order.
+
+Compounding it: `strategy.py:2427`'s friday-close `_log_exit_trade` call does not
+pass the floor fields at all (unlike the stop path), so the event carries
+`profit_floor_active: null`. **A `null` here is indistinguishable from "no floor
+existed"** — which is why this doc, not the ledger, is currently the only record
+that the floor was armed on CRWV.
+
+The consequence is directional and it is the bad direction: armings that end in
+a non-stop exit are invisible, so the report systematically **understates how
+often the ladder engages** while correctly counting when it exits. Anyone reading
+`floor_active: 1 of 4` would conclude the ladder rarely engages. It has engaged
+on 2 of the last 2 profitable shorts.
+
+This is a reporting gap, not a trading bug — no money moved wrongly. It is
+folded into the breakeven-lock attribution fix already scoped in `backlog.md`,
+which is the prerequisite gate for the water-based floor; fixing exit attribution
+piecemeal here would collide with it.
+
+---
+
 ## Open question: 36% MFE capture
 
 The ladder locked +1% out of a +2.54% best move and the exit landed just above
@@ -104,15 +195,23 @@ across many trips, is a ceiling on the whole short book.
 
 **Do not tune this on n=1.** What would make the question answerable:
 
-1. **Split the `PROFIT FLOOR` counter long vs short.** Still unsplit as of
-   2026-08-26 (`_profit_floors`, `strategy.py:472`), so the counter cannot tell
-   you whether the short ladder specifically earns its keep — which is the only
-   question here.
+1. ~~**Split the `PROFIT FLOOR` counter long vs short.**~~ **DONE** — `41290a5`.
+   First live read of the split counter is CRWV 2026-08-28 (`short floors #1`).
 2. Get to 3+ floor-caused exits so the report stops withholding a verdict.
+   **Still at 1.** CRWV armed but did not exit on the floor, so it does not
+   count — and note that armings ending in a non-stop exit are not merely
+   uncounted, they are unrecorded (see "The arming that no counter sees").
+   At 2 armings per 2 profitable shorts and 1 exit in 2 armings, the binding
+   constraint on reaching n=3 is how often a *floor* rather than some other
+   mechanism gets to close the trade.
 3. Then compare realized-on-caused against MFE-at-arm-time, per direction. The
    report deliberately does not compute dollar impact (true impact is what price
    did after the exit, which the ledger does not carry) — this comparison is the
-   honest substitute.
+   honest substitute. Quote the ratio to **one significant figure only**: CRWV
+   showed polled MFE can be beaten by the fill, so these ratios carry poll-
+   sampling error in the optimistic direction.
 
-Until then: **the short ladder worked.** It is the only mechanism that has ever
-closed a trade green on its own.
+Until then: **the short ladder worked, once.** AVGO remains the only trade the
+floor has ever closed green on its own. CRWV is not a second instance of that —
+it is a second instance of the ladder *arming*, which is a weaker claim and the
+one the counters were built to keep separate.

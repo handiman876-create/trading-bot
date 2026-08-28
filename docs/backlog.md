@@ -623,6 +623,27 @@ mislabel differently.
    `breakeven_lock_held`, `lock_caused_exit`, `stop_at_exit`, `water_at_exit`.
    `absent ≠ False` applies (trade_logger.py:44-47) — pre-fix exits read
    unknown, never "lock was inactive".
+6. **Non-stop exit paths must carry the stop attribution too.** Surfaced by CRWV
+   2026-08-28 (docs/profit-floor-analysis.md, "Arming 2"): the profit floor
+   armed, moved the stop 9.37 points and raised a broker GTC, then the Friday
+   weekend-gap rule closed the position. The friday-close `_log_exit_trade` call
+   (strategy.py:2427) passes no floor/lock fields, so the event stores
+   `profit_floor_active: null` — and by `absent ≠ False` that is *unknown*, not
+   *inactive*, yet it reads identically to a trade that never had a floor.
+   Then `_profit_floor_stats` filters `exit_reason == "stop"`
+   (performance_analyzer.py:935), dropping the trip from `floor_active` as well
+   as from `floor_caused`. Net effect: **an arming that ends in a non-stop exit
+   is invisible**, so engagement is understated while causation stays correct —
+   the report said "floor active: 1 of 4" after a session with an arming in it.
+   Every non-stop exit site that can close a stop-managed position has this hole
+   (friday close :2427, EMA signal exits :2372/:2399/:2442, profit take :1860,
+   stale-symbol :2969). Do NOT fix by widening the `== "stop"` filter — that
+   would credit the ladder for exits it did not cause, which is the error this
+   whole section exists to remove. Fix by attaching attribution at every exit
+   site (the `_stop_source` helper in point 3 is the natural home, per
+   "centralize dispatched logic on day one") and by splitting the report's
+   populations into *armed* vs *caused*, denominated over all exits rather than
+   stop exits only.
 
 **Report section**, mirroring `_profit_floor_stats`/`_profit_floor_lines`
 (performance_analyzer.py:899/963) so the numbers land in the JSON too. Three

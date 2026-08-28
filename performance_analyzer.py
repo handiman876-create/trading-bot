@@ -438,6 +438,7 @@ def _exit_reason(notes: str) -> str:
       option_stop    — an option's -50% PREMIUM stop.
       option_target  — an option's +50% premium target.
       option_expiry  — an option force-closed on days-to-expiry.
+      friday_short_close — a profitable short flattened ahead of the weekend gap.
       signal         — the strategy's own exit logic.
 
     WHY THE OPTION BUCKETS EXIST: all three premium rules used to land in
@@ -450,6 +451,17 @@ def _exit_reason(notes: str) -> str:
     "stop" would add rows that every consumer of that bucket has to filter back
     out. Separate buckets also let each premium rule be judged on its own, which
     is the point: one has fired once, one twice, one never.
+
+    friday_short_close gets its own bucket for the SAME reason, and it is worth
+    stating plainly because the mistake above was about to repeat: the rule is a
+    calendar override, not a read of the trend. It fires while the short is still
+    working, deliberately ahead of the EMA cover below it, so filing it as
+    "signal" would credit the strategy's trend logic with an exit the trend logic
+    argued against — and would make the weekend-gap rule impossible to judge on
+    its own record. It is NOT "stop" either: no stop fired. The profit floor may
+    well have been armed and closer to price than the trail (CRWV 2026-08-28 was
+    exactly that), but the floor did not fire, and pricing this as a stop would
+    hand the ladder credit for an exit the calendar caused.
     """
     n = (notes or "").lower()
     if config.CORRECTION_NOTE_MARKER.lower() in n:
@@ -464,6 +476,10 @@ def _exit_reason(notes: str) -> str:
         return "option_target"
     if "option near expiry" in n:
         return "option_expiry"
+    # Matches the note strategy.py's friday-short-close path writes verbatim
+    # ("friday short close, gain=X%"); keep the two in step if either changes.
+    if "friday short close" in n:
+        return "friday_short_close"
     return "signal"
 
 

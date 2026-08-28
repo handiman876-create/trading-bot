@@ -191,6 +191,32 @@ def test_exit_reason_stop_and_signal_unchanged():
     assert pa._exit_reason("") == "signal"
 
 
+def test_exit_reason_friday_short_close():
+    """The weekend-gap rule gets its own bucket. Before this, its note matched
+    nothing and fell through to "signal", crediting the trend logic with an exit
+    it argued against (the rule fires while the short is still working)."""
+    assert pa._exit_reason(
+        "friday short close, gain=2.17%") == "friday_short_close"
+
+
+def test_friday_close_note_matches_strategy_note():
+    """Cross-module contract: strategy.py WRITES this note and the analyzer READS
+    it. Rebuild the note the same way strategy.py does rather than pasting a
+    copy, so a reword there fails here instead of silently re-filing the exit as
+    a plain signal."""
+    gain = 0.0217
+    note = f"friday short close, gain={gain * 100:.2f}%"
+    assert pa._exit_reason(note) == "friday_short_close", note
+
+
+def test_friday_short_close_is_not_a_stop():
+    """It must stay OUT of the "stop" bucket: profit-floor and breakeven-lock
+    attribution both read stop-reason trips only, and CRWV 2026-08-28 had the
+    floor armed and nearer price than the trail. Filing it as a stop would hand
+    the ladder credit for an exit the calendar caused."""
+    assert pa._exit_reason("friday short close, gain=2.17%") != "stop"
+
+
 def test_correction_wins_over_stop_marker():
     """A correction stays a correction even if the note also mentions a stop —
     checked first, deliberately."""
