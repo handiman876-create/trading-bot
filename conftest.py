@@ -126,6 +126,17 @@ def isolate_bot_state(tmp_path, monkeypatch):
     # test_profit_floor.py owns this feature and sets the flag True per-test.
     monkeypatch.setattr(config, "ENABLE_PROFIT_FLOOR", False, raising=False)
 
+    # Same treatment, same reason, and it bit harder than the other two: the
+    # water floor is a FOURTH stop source and, unlike the ladder, it arms on any
+    # position whose run has cleared WATER_FLOOR_K ATRs — which is most fixtures
+    # that move price far enough to trail at all. Turning it on live took the
+    # suite from 3 known failures to 40, across test_stops.py, the breakeven-lock
+    # modules and the futures stops, none of which reference it. Every one was the
+    # feature working: the floor is simply more protective than the level those
+    # tests pinned.
+    # test_water_floor.py owns this feature and sets the flag True per-test.
+    monkeypatch.setattr(config, "ENABLE_WATER_FLOOR", False, raising=False)
+
     # performance_analyzer, if a test drives its file-writing paths.
     try:
         import performance_analyzer as pa

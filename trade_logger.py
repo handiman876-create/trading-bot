@@ -48,7 +48,12 @@ def _now_str() -> str:
 _STOP_ATTR_KEYS = ("profit_floor_active", "profit_floor_price",
                    "atr_trail_at_exit", "floor_caused_exit",
                    "breakeven_lock_held", "lock_caused_exit",
-                   "stop_at_exit", "water_at_exit")
+                   "stop_at_exit", "water_at_exit",
+                   # Water floor (2026-08-31). `absent != False` applies here
+                   # too: every exit before this date reads UNKNOWN, not "the
+                   # water floor was inactive" — it did not exist to be active.
+                   "water_floor_active", "water_floor_price",
+                   "water_caused_exit")
 
 
 def log_trade(action: str, symbol: str, quantity: int, price: float,

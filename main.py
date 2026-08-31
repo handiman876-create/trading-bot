@@ -454,6 +454,29 @@ def main() -> None:
                     strategy._profit_floors_long,
                     strategy._profit_floors_short))
                 if config.ENABLE_PROFIT_FLOOR else "DISABLED")
+    logger.info("Water floor : %s",
+                ("ENABLED (k=%.2f ATR behind the best excursion; equities AND "
+                 "futures, one path). REPLACES rather than complements the ATR "
+                 "trail: both are anchored to the same water mark and k=%.2f < "
+                 "%.1fx, so once a position is >%.2f ATR past entry its effective "
+                 "trail is %.2f ATR wide, at EVERY excursion — not just inside the "
+                 "breakeven window. Arms at %.2f ATR, BEFORE the breakeven lock's "
+                 "%.1f ATR, and is strictly more protective once armed, so the "
+                 "lock now only binds on positions where the floor is blocked. "
+                 "TWO GUARDS: not armed unless strictly past entry (else it would "
+                 "steal the lock's label), and never armed through the market "
+                 "(else a retroactive apply is an instant exit — it would have "
+                 "closed ESU26 and NQU26 on 2026-08-31). Counter: WATER FLOOR "
+                 "(long: %d, short: %d this process); durable record is the log "
+                 "suffix `— long water floors #N` / `— short water floors #N`, so "
+                 "grep bot.log* plus the .gz archives, never the live counter"
+                 % (config.WATER_FLOOR_K, config.WATER_FLOOR_K,
+                    config.STOP_LOSS_ATR_MULT, config.WATER_FLOOR_K,
+                    config.WATER_FLOOR_K, config.WATER_FLOOR_K,
+                    config.BREAKEVEN_LOCK_ATR,
+                    strategy._water_floors_long,
+                    strategy._water_floors_short))
+                if config.ENABLE_WATER_FLOOR else "DISABLED")
     logger.info("Cross gap   : %.2f%% minimum EMA separation on ALL cross signals "
                 "(long entry/exit, short entry/cover, options, futures); a "
                 "suppressed EXIT is deferred, not cancelled — states re-derive "

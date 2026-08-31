@@ -573,6 +573,81 @@ VIX_CRISIS_SHADOW = True
 ENABLE_BREAKEVEN_LOCK = True
 BREAKEVEN_LOCK_ATR    = 1.0    # favorable excursion (in entry-ATRs) required to arm
 
+# ── Water floor (a TRAILING floor anchored to the best excursion) ─────────────
+#     long  floor = max(entry, high_water - WATER_FLOOR_K * atr_at_entry)
+#     short floor = min(entry, low_water  + WATER_FLOOR_K * atr_at_entry)
+#
+# WHY THIS EXISTS. The breakeven lock floors a winner at `entry`, which protects
+# $0 by construction, and it provably DOMINATES the ATR trail for every
+# excursion in [BREAKEVEN_LOCK_ATR*ATR, atr_mult*ATR) — a window 2.5-3 ATR wide
+# that a position must cross before the trail can bind at all. Inside that window
+# the best available stop is breakeven, so a large open gain round-trips to a
+# scratch. Every observed case sits there: AMD 07-29 (~$5.4k open, protected $0),
+# PLTR 08-04 (~$3.5k, realised -$6), QQQ 08-13->08-18 ($1,131.90 peak given back,
+# realised -$7.92), and the two futures locks NQU26/ESU26. No multiplier tuning
+# can fix it — the window is where the lock is the MOST protective source, so
+# widening or narrowing the trail does not change which one binds.
+#
+# The fix is to make the floor TRAIL the water instead of sitting at entry. It is
+# strictly an improvement on the lock, never a loosening: `max(entry, ...)` keeps
+# breakeven as the hard lower bound, so the worst case is identical to today.
+#
+# K IS THE ONLY KNOB, AND IT IS BOUNDED BY THE ARMING WINDOW. The floor clears
+# entry only when the run exceeds K*ATR, so K must sit below the run being
+# captured — the same ~1-ATR neighbourhood the lock arms in. k=0.5 was chosen
+# because it clears entry on the observed cases while leaving RTYU26 (0.55 ATR
+# run) below entry, i.e. inert on a position that never really ran.
+#
+# DO NOT TUNE K ON THE $2,272 / $6,628 ES/NQ FIGURES in docs/backlog.md. Those
+# are open unrealised on three live legs in ONE direction and ONE regime, and
+# both legs carry ESTIMATED adopted entries — an entry-anchored number inherits
+# that error. They size the mechanism; they do not fit the parameter.
+#
+# Equities AND futures, one code path, no _IS_FUTURES branch: the mechanism is
+# pure price space, so it needs no per-root multiplier (which is what made the
+# earlier dollar-rung proposal need one).
+#
+# ── READ THIS BEFORE CHANGING K: AN ARMED WATER FLOOR REPLACES THE ATR TRAIL ──
+# The floor and the trail are anchored to the SAME water mark:
+#     trail = water - STOP_LOSS_ATR_MULT * atr
+#     floor = water - WATER_FLOOR_K      * atr
+# so the floor is tighter whenever K < atr_mult — which the validator below
+# ENFORCES. An armed water floor therefore never loses to the trail, and beats it
+# by a constant (atr_mult - K) * atr at every excursion.
+#
+# The practical consequence, which the "close the breakeven window" framing does
+# NOT convey: once a position is more than K*ATR past entry, its effective
+# trailing stop is K*ATR wide, not atr_mult*ATR. At K=0.5 vs a 2.5x trail that is
+# a 5x tighter stop on every winner, applied at ALL excursions — not just inside
+# the [1*ATR, mult*ATR) window the evidence base (AMD/PLTR/QQQ) came from. A
+# position up 10 ATR is exited on a 0.5 ATR retrace.
+#
+# That is a deliberate trade — it is exactly how the give-back is prevented — but
+# it also means K is not a minor tuning knob: it IS the trailing-stop width for
+# every profitable position. Raising K loosens every winner's exit; lowering it
+# tightens all of them. If the intent ever becomes "protect the window but let
+# big runners breathe", that needs an explicit cap (e.g. floor never tighter than
+# some multiple of ATR behind water), because the arithmetic above will never let
+# the trail win it back.
+ENABLE_WATER_FLOOR = True
+WATER_FLOOR_K      = 0.5   # ATRs of give-back allowed behind the best excursion
+                           #
+                           # BAD — DO NOT do this:
+                           #   WATER_FLOOR_K = 0.0   # floor lands ON the water,
+                           #       i.e. on the market at a new extreme -> instant
+                           #       exit. Same failure as a profit rung with
+                           #       lock >= trigger.
+                           #   WATER_FLOOR_K = 3.0   # wider than atr_mult, so the
+                           #       floor never clears entry and the whole feature
+                           #       is inert — it can only ever tie the lock.
+                           # Validated at import below.
+if ENABLE_WATER_FLOOR and not 0.0 < WATER_FLOOR_K < STOP_LOSS_ATR_MULT:
+    raise ValueError(
+        "WATER_FLOOR_K must be in (0, STOP_LOSS_ATR_MULT=%s); got %r. At 0 the "
+        "floor lands on the market at every new extreme; at or above the trail "
+        "multiple it can never clear entry and the feature is inert."
+        % (STOP_LOSS_ATR_MULT, WATER_FLOOR_K))
+
 # ── Profit floor ladder (percentage stop floors that step up with the gain) ───
 # A ladder of static, ENTRY-anchored floors. Each rung reads: once the position
 # is up `trigger` from entry, its stop may never again fall below `lock` of

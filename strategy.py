@@ -476,6 +476,8 @@ _breakeven_lock_exits = 0  # confirmed stop-outs where that entry floor held the
                            # (NOT the same as _breakeven_locks: arm vs fire)
 _profit_floors_long  = 0   # stops raised to a LONG-ladder rung (profit locked, not just principal)
 _profit_floors_short = 0   # same on the SHORT ladder — counted separately, see _bump_profit_floor
+_water_floors_long   = 0   # stops raised to a LONG water floor (water - k*ATR, strictly past entry)
+_water_floors_short  = 0   # same on shorts — split from the start, see _bump_water_floor
 _floors_raised = 0         # broker GTC floors moved up to match a rung
 _floor_raise_failures = 0  # GTC raises that cancelled but failed to re-place (position unfloored!)
 _history_gaps_held = 0     # polls that evaluated NO stop because history was unavailable
@@ -516,6 +518,27 @@ def _bump_profit_floor(direction: str) -> int:
         return _profit_floors_short
     _profit_floors_long += 1
     return _profit_floors_long
+
+
+def _bump_water_floor(direction: str) -> int:
+    """Count one water-floor arming against its direction, and return that
+    count for the log line. Same contract as _bump_profit_floor — read that
+    docstring for why the mapping lives in exactly one place.
+
+    Split long/short FROM THE START rather than retrofitted, because the two
+    sides are not symmetric in practice even though the formula is: shorts give
+    back faster (equities drift up), and the evidence base is lopsided — three
+    equities cases are longs (PLTR, QQQ) or a short (AMD) and both futures locks
+    are longs. A single total could not tell us which side the floor is earning
+    its keep on, and splitting a live counter after the fact loses the history
+    (the trap already paid for once at docs/backlog.md line 482).
+    """
+    global _water_floors_long, _water_floors_short
+    if direction == "short":
+        _water_floors_short += 1
+        return _water_floors_short
+    _water_floors_long += 1
+    return _water_floors_long
 
 
 def _load_json(path: str) -> dict:
@@ -840,17 +863,122 @@ def _stop_order_for(symbol: str, account_id: str, side: str, qty: int,
                                  stop_price=stop_price)
 
 
-def _floor_price(entry: float, atr: float, mult: float, direction: str) -> float:
-    """The static GTC backstop level: the INITIAL ATR stop distance, widened by
+def _floor_price(entry: float, atr: float, mult: float, direction: str,
+                 anchor: Optional[float] = None,
+                 buffer: Optional[float] = None) -> float:
+    """A floor level in price space: `anchor` set back by `mult` x ATR x `buffer`,
+    on the protective side for `direction`.
+
+    Default call — `_floor_price(entry, atr, atr_mult, direction)` — is the static
+    GTC backstop: the INITIAL ATR stop distance, widened by
     BROKER_STOP_FLOOR_BUFFER so the bot's stop always trips first.
 
-    Deliberately derived from entry and the entry ATR — the same anchors the stop
-    record uses — and NEVER from the current stop_price, which trails. A floor
-    recomputed off a trailed stop would creep toward the market and eventually
-    overtake the bot, which is the exact failure this design exists to avoid.
+    ANCHOR is what makes this reusable. Anchored at `entry` (the default) the
+    result is STATIC, which is the property the GTC backstop needs: derived from
+    entry and the entry ATR — the same anchors the stop record uses — and NEVER
+    from the current stop_price, which trails. A floor recomputed off a trailed
+    stop would creep toward the market and eventually overtake the bot, which is
+    the exact failure this design exists to avoid.
+
+    Anchored at the WATER mark it is instead a TRAILING floor, which is the water
+    floor (see _water_floor). That is safe for the same reason the trail itself
+    is: high/low water are monotonic, so a water-anchored floor also only ever
+    moves protectively. It is NOT safe to anchor this at stop_price — that is the
+    creep case above, and there is no caller that should ever want it.
+
+    BUFFER defaults to BROKER_STOP_FLOOR_BUFFER because the GTC backstop is the
+    common case; the water floor passes 1.0 (no widening — it is a bot-managed
+    stop level, not an order resting behind one). Generalised rather than copied
+    per [[centralize dispatched logic]]: this direction-aware `anchor ± atr·d`
+    arithmetic is the one shape every floor in this file is built from, and the
+    sign convention is exactly what a second hand-written copy gets wrong.
     """
-    buf = atr * mult * config.BROKER_STOP_FLOOR_BUFFER
-    return entry + buf if direction == "short" else entry - buf
+    base = entry if anchor is None else anchor
+    buf = atr * mult * (config.BROKER_STOP_FLOOR_BUFFER if buffer is None
+                        else buffer)
+    return base + buf if direction == "short" else base - buf
+
+
+def _water_floor(rec: dict, price: float) -> Optional[float]:
+    """The water floor level, or None when it is not armed.
+
+        long  floor = high_water - WATER_FLOOR_K * atr_at_entry
+        short floor = low_water  + WATER_FLOOR_K * atr_at_entry
+
+    Signature mirrors _profit_floor(rec, price) so the two floors compose the
+    same way at the call site, and `price` is load-bearing for the same reason:
+    the caller composes floors BEFORE it ratchets the stored water, so reading
+    rec["high_water"] alone would compute the floor off last cycle's mark and
+    lag a poll behind the trail sitting next to it. Folding `price` in here keeps
+    both mechanisms on the same tick.
+
+    RETURNS None RATHER THAN entry WHEN THE RUN IS SHORT — the guard, and the
+    whole reason this returns Optional instead of implementing the documented
+    `max(entry, water - k*atr)` literally. Writing that max() out would return
+    `entry` whenever the run is under k*ATR, which is MOST of the time and is the
+    RTYU26 case by design (0.55 ATR run). The caller would then persist
+    `water_floor_price == entry`, and because _stop_source tests the water floor
+    BEFORE the `stop == entry` breakeven-lock branch, every lock-held stop would
+    silently relabel as "water floor" and lock attribution would go to zero —
+    the same class of mislabel as the STOP TRAIL bug fixed in 8ccedb1, on a
+    fourth source.
+
+    The `max(entry, ...)` semantics are NOT lost: the caller already contributes
+    `entry` to floor_srcs from the breakeven lock and takes the most protective
+    source, so returning None here composes to exactly the documented formula
+    while leaving `entry` owned by the mechanism that actually put it there.
+
+    BAD — DO NOT do this:
+        floor = max(entry, water - k * atr)      # long
+        rec["water_floor_price"] = floor         # == entry on a short run,
+                                                 # steals the lock's label
+    """
+    if not config.ENABLE_WATER_FLOOR:
+        return None
+    entry = rec.get("entry_price")
+    if not entry or entry <= 0:
+        return None                       # no basis -> nothing to floor against
+    atr = rec.get("atr_at_entry")
+    if not atr or atr <= 0:
+        return None                       # no ATR -> no width to give back
+    direction = rec.get("direction", "long")
+    water = (min(rec["low_water"], price) if direction == "short"
+             else max(rec["high_water"], price))
+    floor = _floor_price(entry, atr, config.WATER_FLOOR_K, direction,
+                         anchor=water, buffer=1.0)
+    # GUARD 1 — STRICTLY beyond entry, else not armed. `>=` / `<=` (not `>` /
+    # `<`) so a floor landing exactly ON entry is also rejected: at equality the
+    # level is indistinguishable from the breakeven lock and the lock is the
+    # mechanism that owns it.
+    if (floor >= entry) if direction == "short" else (floor <= entry):
+        return None
+    # GUARD 2 — NEVER ARM THROUGH THE MARKET. Without this the floor is a stop
+    # placed on the wrong side of the current price, i.e. an instant exit at
+    # market. This is not hypothetical: on 2026-08-31, applying the unguarded
+    # formula to the two live futures legs put the floor ABOVE the last price on
+    # BOTH (ESU26 floor 7746.20 vs price 7701.50; NQU26 29555.16 vs 29511.75),
+    # because each had run past 1.3 ATR and then retraced. Shipping without this
+    # guard would have market-exited both positions on the first poll.
+    #
+    # It bites specifically on RETROACTIVE application — a position that made its
+    # excursion BEFORE the feature existed, so the stop never ratcheted up on the
+    # way. In steady state the floor is armed at a new extreme, where
+    # water == price and the floor sits k*ATR behind it, so the guard is a no-op.
+    # Exactly the role the breakeven lock's `price > entry` clamp plays, and the
+    # reason that lock is safe to apply to pre-rule positions.
+    #
+    # THE CLAMP IS FOR ARMING ONLY — IT MUST NEVER REACH ATTRIBUTION. On the
+    # cycle price breaches the floor, this returns None (price is through the
+    # level), so a caller that asked "is the water floor active?" by calling this
+    # function would answer "no" on precisely the cycle the floor fired. That is
+    # the QQQ 2026-08-18 bug verbatim: the breakeven lock's arming clamp was
+    # reused for its label and made the label unreachable. The caller therefore
+    # attributes off the PERSISTED `water_floor_price` (level identity against
+    # stop_price), never off this return value, and the stop's own monotonic
+    # ratchet is what holds the level after this stops returning it.
+    if (floor <= price) if direction == "short" else (floor >= price):
+        return None
+    return round(floor, 4)
 
 
 def _place_broker_floor(symbol: str, qty: int, rec: dict,
@@ -1371,9 +1499,49 @@ def _profit_floor(rec: dict, price: float) -> Optional[tuple[float, float, float
     return None
 
 
+def _broker_floor_target(rec: dict, entry: Optional[float], direction: str,
+                         rung: Optional[tuple[float, float, float]],
+                         water_floor: Optional[float]
+                         ) -> Optional[tuple[float, float, str]]:
+    """The bot-side floor the resting GTC should track, as
+    `(price, lock_fraction, source_label)` — or None when nothing is armed.
+
+    Picks the MOST PROTECTIVE of the ladder rung and the water floor, mirroring
+    the `floor_srcs` composition that decides the bot's own stop, so the GTC
+    tracks the same source the stop does instead of a second opinion.
+
+    `lock_fraction` is the fraction of ENTRY the floor locks, which is the unit
+    _maybe_raise_broker_floor already uses for idempotence (`broker_floor_lock`).
+    The ladder states it directly; the water floor's is derived, and derived is
+    fine because it is monotonic for the same reason the level is — water only
+    ratchets, so the implied lock only ever rises and the "improvement only"
+    guard keeps working unchanged.
+
+    Not folded into _maybe_raise_broker_floor: choosing a floor is pure, while
+    raising one cancels and replaces a live order. Keeping them apart is what
+    lets the choice be unit-tested without a broker stub.
+    """
+    cands: list[tuple[float, float, str]] = []
+    if rung is not None:
+        cands.append((rung[0], rung[2], "profit floor"))
+    if water_floor is not None and entry:
+        lock = ((entry - water_floor) / entry if direction == "short"
+                else (water_floor - entry) / entry)
+        cands.append((water_floor, lock, "water floor"))
+    if not cands:
+        return None
+    return (min(cands, key=lambda c: c[0]) if direction == "short"
+            else max(cands, key=lambda c: c[0]))
+
+
 def _maybe_raise_broker_floor(symbol: str, qty: int, rec: dict, account_id: str,
-                              rung: Optional[tuple[float, float, float]]) -> None:
-    """Move the resting GTC floor up to match a newly armed ladder rung.
+                              floor: Optional[tuple[float, float, str]]) -> None:
+    """Move the resting GTC floor up to match a newly armed bot-side floor.
+
+    Takes the `(price, lock_fraction, source_label)` tuple from
+    _broker_floor_target — the winner of ladder-rung vs water-floor — rather than
+    a ladder rung directly, so that adding a floor source does not add a second
+    raiser against the same resting order.
 
     Mutates `rec` (broker_order_id / broker_floor_price / broker_floor_lock) so the
     caller persists it in the same write as the rest of the stop record.
@@ -1398,13 +1566,16 @@ def _maybe_raise_broker_floor(symbol: str, qty: int, rec: dict, account_id: str,
     if not (config.ENABLE_BROKER_STOP_FLOOR
             and config.ENABLE_PROFIT_FLOOR_BROKER_RAISE):
         return
-    if rung is None or not account_id or not qty or qty < 1:
+    if floor is None or not account_id or not qty or qty < 1:
         return
-    floor_price, _trigger, lock = rung
-    # Idempotence across polls: a rung stays armed every cycle once cleared, so
+    floor_price, lock, source = floor
+    # Idempotence across polls: a floor stays armed every cycle once cleared, so
     # without this the raise would re-fire on every single poll. Keyed on the
-    # lock actually resting at the broker, not on the rung, so a failed raise
-    # retries next cycle instead of being latched out.
+    # lock actually resting at the broker, not on the floor, so a failed raise
+    # retries next cycle instead of being latched out. Works unchanged for the
+    # water floor because its implied lock is monotonic — but note the water
+    # floor's lock RISES continuously as water improves, where a ladder rung's
+    # steps, so this path legitimately raises far more often on a runner.
     if lock <= rec.get("broker_floor_lock", 0.0):
         return
     old_id = rec.get("broker_order_id")
@@ -1452,10 +1623,10 @@ def _maybe_raise_broker_floor(symbol: str, qty: int, rec: dict, account_id: str,
     rec["broker_floor_price"] = round(target, 2)
     rec["broker_floor_lock"] = lock
     _floors_raised += 1
-    logger.info("BROKER FLOOR RAISE %s %s x%d: %.2f → %.2f GTC (rung locks "
-                "%.0f%% at %.2f, floor set %.2f behind it) order=%s — raises #%d",
+    logger.info("BROKER FLOOR RAISE %s %s x%d: %.2f → %.2f GTC (%s locks "
+                "%.1f%% at %.2f, floor set %.2f behind it) order=%s — raises #%d",
                 symbol, side, qty, cur if cur is not None else float("nan"),
-                target, lock * 100, floor_price, gap,
+                target, source, lock * 100, floor_price, gap,
                 rec["broker_order_id"], _floors_raised)
 
 
@@ -1605,14 +1776,33 @@ def _check_and_trail_stop(symbol: str, held: int, sig: dict,
     # same logic dispatched to two sites.
     rung = _profit_floor(rec, price)
 
+    # Water floor: the FOURTH source, and the one this composition was written
+    # out longhand to accommodate. Trails the best excursion at k x ATR instead
+    # of sitting at entry, which is what closes the [1*ATR, mult*ATR) window
+    # where the breakeven lock is the most protective source and therefore caps
+    # a large open gain at a scratch. Computed here beside the ladder, not inside
+    # the direction branches, for the same reason the ladder is.
+    water_floor = _water_floor(rec, price)
+
     # Collapse every floor SOURCE into one level so each branch stays a single
     # min/max. Breakeven (and crisis) contribute `entry`; the ladder contributes
-    # its rung. Most protective wins: highest for a long, lowest for a short.
-    # An armed rung always beats breakeven (lock > 0 ⇒ strictly past entry), so
-    # this reduces to the rung whenever one is armed — the min/max is written out
-    # anyway so that adding a fourth source later cannot silently pick wrong.
+    # its rung; the water floor contributes water -/+ k*ATR. Most protective
+    # wins: highest for a long, lowest for a short.
+    #
+    # This is where `max(entry, water - k*atr)` is actually realised. _water_floor
+    # deliberately returns None instead of clamping to entry itself, so that
+    # `entry` stays owned by the breakeven lock that put it there — see that
+    # function for why writing the max() out there would silently steal the
+    # lock's label. The composition below is what makes the two equivalent.
+    #
+    # An armed rung always beats breakeven (lock > 0 ⇒ strictly past entry), and
+    # so does an armed water floor (guarded strictly past entry), but the min/max
+    # stays written out: rung vs water genuinely can win in either order — a
+    # ladder rung is entry-anchored and static, the water floor trails, so early
+    # in a run the rung leads and later the water floor overtakes it.
     floor_srcs = [f for f in (entry if apply_floor else None,
-                              rung[0] if rung else None) if f is not None]
+                              rung[0] if rung else None,
+                              water_floor) if f is not None]
     floor_level = None
     if floor_srcs:
         floor_level = min(floor_srcs) if direction == "short" else max(floor_srcs)
@@ -1654,6 +1844,19 @@ def _check_and_trail_stop(symbol: str, held: int, sig: dict,
     rec["profit_floor_active"] = (
         rec.get("profit_floor_price") is not None
         and rec["stop_price"] == rec["profit_floor_price"])
+
+    # Same shape for the water floor, and recomputed every cycle for the same
+    # reason — never latched. `water_floor_price` is only ever WRITTEN when the
+    # stop actually lands on it, so a level the stop has since moved past stays
+    # recorded (it is monotonic, mirroring the stop's own ratchet) while
+    # `water_floor_active` correctly goes False. _water_floor's entry guard is
+    # what guarantees this key can never equal `entry`, which is what keeps the
+    # breakeven lock's `stop == entry` tell intact in _stop_source.
+    if water_floor is not None and rec["stop_price"] == water_floor:
+        rec["water_floor_price"] = water_floor
+    rec["water_floor_active"] = (
+        rec.get("water_floor_price") is not None
+        and rec["stop_price"] == rec["water_floor_price"])
 
     # ONE attribution for this cycle, computed here and reused by the stop-move
     # log below AND by the breach branch further down. Hoisted rather than
@@ -1749,12 +1952,44 @@ def _check_and_trail_stop(symbol: str, held: int, sig: dict,
                     rung[2] * 100, entry, rung[1] * 100, raw_trail,
                     direction, floors_n)
 
-    # Match the resting GTC to the rung. OFF by default
-    # (ENABLE_PROFIT_FLOOR_BROKER_RAISE) — see that flag for why. Skipped on a
-    # breach: the exit path below cancels the floor itself, and raising a floor
-    # we are about to tear down is pure risk.
+    # Water-floor event: same transition shape and same idempotence as the two
+    # above — once stop_price sits on the water floor, old_stop equals it next
+    # cycle. Unlike the ladder the level MOVES every time water improves, so this
+    # legitimately fires repeatedly on a running position; that is the mechanism
+    # working, not a re-fire bug, and it is why the counter reads as "times the
+    # floor moved the stop" rather than "positions floored".
+    #
+    # Logged even when the trail is what the stop-move line credits, because the
+    # two answer different questions — see the trail_set_level note above. The
+    # `run` figure is what makes a line diagnosable: it says how far the position
+    # actually went in ATRs, so a floor that armed at 0.55 ATR (the RTY negative
+    # case) is instantly distinguishable from one that armed at 2 ATR.
+    if water_floor is not None and old_stop != water_floor \
+            and rec["stop_price"] == water_floor:
+        run_atr = (abs(water - entry) / rec["atr_at_entry"]) if entry else 0.0
+        water_n = _bump_water_floor(direction)
+        logger.info("WATER FLOOR %s %s: stop %.2f → %.2f — %.2f ATR behind "
+                    "water %.2f on a %.2f ATR run from entry %.2f "
+                    "(trail would be %.2f) — %s water floors #%d",
+                    symbol, direction, old_stop, rec["stop_price"],
+                    config.WATER_FLOOR_K, water, run_atr, entry, raw_trail,
+                    direction, water_n)
+
+    # Match the resting GTC to whichever bot-side floor is most protective. OFF
+    # by default (ENABLE_PROFIT_FLOOR_BROKER_RAISE) — see that flag for why.
+    # Skipped on a breach: the exit path below cancels the floor itself, and
+    # raising a floor we are about to tear down is pure risk.
+    #
+    # The ladder rung and the water floor share ONE broker path rather than each
+    # raising the GTC: two independent raisers on one resting order would each
+    # cancel-then-place against the other's order id, and the loser becomes an
+    # orphan GTC that opens an unintended position — the exact failure
+    # _cancel_broker_floor exists to prevent. _broker_floor_target picks the
+    # winner first, so there is still exactly one raiser.
     if not breached:
-        _maybe_raise_broker_floor(symbol, abs(held), rec, account_id, rung)
+        _maybe_raise_broker_floor(
+            symbol, abs(held), rec, account_id,
+            _broker_floor_target(rec, entry, direction, rung, water_floor))
 
     if breached:
         # Attribution, captured at the breach: was this stop-out CAUSED by the
@@ -1791,6 +2026,12 @@ def _check_and_trail_stop(symbol: str, held: int, sig: dict,
         # back — and it appears NOWHERE else in the ledger, so it has to be
         # captured here or the report can never be built. Unrecoverable for
         # pre-fix trips, which is why the analyzer excludes rather than zeroes.
+        # Water floor gets the same held-vs-caused pair as the other two, and for
+        # the same reason: "the floor was sitting there" and "the floor closed
+        # this trade" are different claims and only the second belongs in a
+        # verdict. `water_floor_active` is already level identity recomputed this
+        # cycle, so held ⇒ the floor is genuinely what price ran into.
+        water_held = bool(rec.get("water_floor_active"))
         stop_attr = {
             "profit_floor_active": floor_active,
             "profit_floor_price":  rec.get("profit_floor_price"),
@@ -1800,6 +2041,9 @@ def _check_and_trail_stop(symbol: str, held: int, sig: dict,
             "lock_caused_exit":    bool(lock_held and not trail_would_fire),
             "stop_at_exit":        rec["stop_price"],
             "water_at_exit":       water,
+            "water_floor_active":  water_held,
+            "water_floor_price":   rec.get("water_floor_price"),
+            "water_caused_exit":   bool(water_held and not trail_would_fire),
         }
         logger.warning("STOP-LOSS EXIT %s %s x%d @ %.2f (stop=%.2f entry=%.2f "
                        "water=%.2f, held by %s, trail=%.2f) — exit #%d",
