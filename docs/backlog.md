@@ -864,6 +864,12 @@ someone "simplifying" the regex back to a slice.
 
 ## Futures profit floor: % rungs unreachable
 
+**Status: PARTLY DONE (2026-08-31).** The water-based floor specced in "Build
+sequence" below SHIPPED as `72c1aa2` and supersedes the *need* for dollar rungs —
+Options A and B are therefore **obsolete, not done**. The % rungs themselves are
+still structurally unreachable on futures, which is what keeps this item open.
+Follow-up: "Monitor K=0.5 effect on TSLA" at the end of this section.
+
 **Observed (2026-08-24):** The profit-floor ladder thresholds are percentages of
 ENTRY PRICE, and `PROFIT_FLOOR_STEPS_LONG`'s first rung is +15%. NQU26's entire
 peak run was **+2.66% of price = +$15,695** on ~$44k of margin. No rung can ever
@@ -1021,3 +1027,77 @@ live legs, and both ES and NQ carry **estimated** adopted entries (true fills
 on `entry`, a wrong entry puts the floor at the wrong price and those dollar
 figures inherit the error. They size the mechanism; they are not a forecast, and
 they are not a k-fit.
+
+---
+
+## Monitor K=0.5 effect on TSLA — first live test of the water floor
+
+**Status: OPEN, decision due end of week 2026-09-04.** Water floor shipped
+2026-08-31 (`72c1aa2`). Build sequence above is DONE; this is the parameter
+review it created.
+
+**The decision rule, set before seeing any outcome:**
+
+* If TSLA is **shaken out on normal volatility** in the first week — stopped at
+  the floor while the trend is still intact (EMA9 > EMA21 at the exit, and price
+  recovers above the exit within a few sessions) — **raise K to 0.75**.
+* If the floor **captures a significant gain** it would otherwise have given back
+  — exits near the high, or holds while price chops and then resumes — **keep
+  K=0.5**.
+* Judge on the *reason* for the exit, not the P&L sign. A small profit banked by
+  an exit that killed a live trend is the failure case, not a success.
+
+**Why TSLA is the test.** It is the only position the floor moved at deploy:
+stop **334.773 → 361.7946** (+27.02/share, $3,593.87 of stop movement across 133
+shares), from 25.15 points BELOW entry 359.92 (protecting nothing) to 1.87 points
+above it. Room to price 368.19 is **6.40 points = 0.47 ATR**, down from ~9%. A
+normal day's range can take it out. GOOGL is unaffected (its +2% rung at 342.3024
+is already tighter than the water floor at 342.8738 — the composition picking the
+most protective source, working as designed), and ESU26/NQU26 are guard-blocked.
+
+**K=0.5 IS NOT A MINOR KNOB — it is the trailing-stop width for every profitable
+position.** Floor and trail share the same water anchor and config validates
+`0 < K < STOP_LOSS_ATR_MULT`, so an armed floor never loses to the trail. Once a
+position is more than K·ATR past entry its effective trail is K·ATR wide, at every
+excursion. A position up 10 ATR exits on a 0.5 ATR retrace. It also supersedes the
+breakeven lock (floor arms at 0.5 ATR, lock at 1.0, floor strictly more protective
+once armed), so **expect `locks #N` → 0 on new positions**; a non-zero lock count
+now means the floor was guard-blocked.
+
+The trade-off, stated plainly:
+
+| | |
+|---|---|
+| ✅ | Captures gains faster — closes the give-back window the lock could not |
+| ❌ | More exits on normal volatility |
+| ❌ | May shake out strong trends |
+
+And the thing to keep in view: **the same K=0.5 that looked good sizing ES/NQ
+($2,272/$6,628 on legs that had run 1.1-1.5 ATR) now applies to EVERY profitable
+position at EVERY excursion.** Those two legs were selected by having run far;
+they are not a sample of the population K governs.
+
+**The K ladder** (measured, `entry=100, atr=10`; floor clears entry at `run > K`):
+
+| K | character | floor at 1.5 ATR run | notes |
+|---|---|---|---|
+| 0.25 | very tight | 112.50 | exits on noise |
+| **0.5** | **tight, captures fast** | **110.00** | **current** |
+| 0.75 | looser, more room | 107.50 | the fallback if TSLA shakes out |
+| 1.0 | most conservative useful | 105.00 | see correction below |
+
+**Correction to a plausible-sounding claim: K=1.0 is NOT "redundant with the
+lock".** It *ties* the lock at exactly a 1.0 ATR run (both land on entry) and
+strictly dominates it beyond — at a 1.5 ATR run the floor is 105.00 against the
+lock's 100.00. What K=1.0 actually does is align the floor's arming threshold with
+`BREAKEVEN_LOCK_ATR`, so the floor never arms earlier than the lock would have.
+That makes it the most conservative setting that still improves on the lock, not a
+no-op. K ≥ `STOP_LOSS_ATR_MULT` is the setting that makes the feature inert, and
+the config validator rejects it.
+
+Cross-refs: `config.py` WATER_FLOOR_K (the same trade-off is documented at the
+knob), `test_water_floor.py::test_armed_water_floor_ALWAYS_dominates_the_atr_trail`
+(pins the dominance), "Breakeven lock exit mislabeled as atr trail" (line 563)
+point 6 — still OPEN, so a floor armed on a position closed by the friday rule or
+an EMA exit stays invisible to the weekly report; engagement understated,
+causation correct.
