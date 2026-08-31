@@ -465,7 +465,12 @@ _low_vol_stops = 0         # stops armed WIDER  than normal (ATR/price <= 2%)
 _cross_gap_blocks = 0      # would-be signals suppressed by EMA_CROSS_MIN_GAP_PCT
 _cross_sustain_blocks = 0  # gap-valid entry crosses deferred by CROSS_SUSTAIN_MINUTES
 _regime_short_blocks = 0   # would-be short entries suppressed by SHORT_MIN_REGIME
-_stops_trailed = 0         # trailing stops that actually moved (new extreme)
+_stops_trailed = 0         # stop moves the ATR TRAIL itself caused. NOT every
+                           # stop move: a move a floor pushed beyond the trail
+                           # belongs to that floor and is excluded (fixed
+                           # 2026-08-31 — it used to count all of them, so
+                           # `trails #N` overstated trail work by exactly the
+                           # number of binding floor moves).
 _breakeven_locks = 0       # stops floored at entry after +1 ATR of profit (principal locked)
 _breakeven_lock_exits = 0  # confirmed stop-outs where that entry floor held the stop
                            # (NOT the same as _breakeven_locks: arm vs fire)
@@ -1498,6 +1503,22 @@ def _stop_source(rec: dict, entry: Optional[float], crisis_floor: bool,
     """
     if rec.get("profit_floor_active"):
         return "profit floor"
+    # Water floor — INERT until the water-based floor ships: nothing writes
+    # `water_floor_price` today, so this is a `.get` returning None every cycle.
+    # The slot is here NOW rather than added at build time because a water-held
+    # stop would otherwise fall through to "atr trail" and reproduce the exact
+    # mislabel this helper exists to prevent — the same way a floor-held stop
+    # used to be logged as a trail move (GOOGL 2026-08-31). Cheaper to reserve
+    # the branch than to rediscover the bug on a third stop source.
+    #
+    # Ordered AFTER the ladder deliberately: when a rung and the water floor
+    # land on the same level, first match wins and the rung is the more specific
+    # claim (it is anchored to a named trigger/lock pair, the water floor is
+    # not). They can only ever collide on the NAME, never on the level, since
+    # the caller has already reduced every source to one most-protective number.
+    water_floor = rec.get("water_floor_price")
+    if water_floor is not None and abs(rec["stop_price"] - water_floor) < 0.01:
+        return "water floor"
     # Tolerance, not equality: stop_price is round(_, 4) of a float floor, and a
     # cent is far below the tick of anything traded here.
     at_entry = bool(entry) and abs(rec["stop_price"] - entry) < 0.01
@@ -1634,20 +1655,62 @@ def _check_and_trail_stop(symbol: str, held: int, sig: dict,
         rec.get("profit_floor_price") is not None
         and rec["stop_price"] == rec["profit_floor_price"])
 
-    # Trail log — fires only when the stop actually MOVED, i.e. on a new extreme.
-    # The unconditional _save_stops below runs every poll for every held name
-    # (~55k polls/8 sessions in the logs), so an unguarded line here would bury
-    # the log rather than illuminate it. The water label names the direction the
-    # trail is tracking: high_water ratchets up under a long, low_water ratchets
-    # down over a short. `mult` is the EFFECTIVE multiple, so a defensive-regime
-    # tighten shows up here as a changed width rather than an unexplained jump.
+    # ONE attribution for this cycle, computed here and reused by the stop-move
+    # log below AND by the breach branch further down. Hoisted rather than
+    # computed twice: two call sites deriving the same attribution independently
+    # is precisely how the log line and the ledger drifted apart before
+    # _stop_source existed. Safe to hoist past everything between here and the
+    # breach — the two event logs only READ stop_price, and
+    # _maybe_raise_broker_floor mutates broker_* keys only.
+    src = _stop_source(rec, entry, crisis_floor, breakeven_reached)
+
+    # What the stop would be on the ATR trail ALONE, respecting the same ratchet
+    # the real stop obeys. This is the counterfactual the trail counter needs:
+    # `src` names who HOLDS the level, which is not the same question as who
+    # MOVED it, and the two genuinely disagree in both directions.
+    trail_only_stop = round(min(old_stop, raw_trail), 4) if direction == "short" \
+        else round(max(old_stop, raw_trail), 4)
+    # The trail earns the count only when its own level survived as the real
+    # stop. A floor that pushed the stop BEYOND the trail owns the move.
+    trail_set_level = rec["stop_price"] == trail_only_stop
+
+    # Stop-move log — fires only when the stop actually MOVED, i.e. on a new
+    # extreme or a newly binding floor. The unconditional _save_stops below runs
+    # every poll for every held name (~55k polls/8 sessions in the logs), so an
+    # unguarded line here would bury the log rather than illuminate it. The water
+    # label names the direction the trail is tracking: high_water ratchets up
+    # under a long, low_water ratchets down over a short. `mult` is the EFFECTIVE
+    # multiple, so a defensive-regime tighten shows up here as a changed width
+    # rather than an unexplained jump.
+    #
+    # THE MISLABEL THIS FIXES (GOOGL short, 2026-08-31 14:10 UTC). The old line
+    # was unconditionally titled a trail move and printed the trail's PARAMETERS
+    # beside a price the trail did not set:
+    #     STOP TRAIL GOOGL short 367.17 → 342.30 (low_water=338.30, trail=2.50x11.39)
+    # 338.30 + 2.50*11.39 = 366.78, not 342.30 — the +2% rung set the level and
+    # the line credited the trail, then bumped `trails #1` for a move the trail
+    # did not make. Two changes close it:
+    #   1. raw_trail is PRINTED (→%.2f) instead of left to be recomputed from
+    #      (water, mult, atr). That arithmetic is exactly what failed to
+    #      reconcile, and a reader doing it by hand cannot tell a floor move from
+    #      a mis-computed trail.
+    #   2. `held by %s` names the real source, from the same _stop_source the
+    #      exit line and the ledger use — so a stop-move line and the later
+    #      STOP-LOSS EXIT line on the same position cannot contradict each other.
+    # One format string with a variable tail, not two logger calls: the branch is
+    # about wording, and duplicating the call is how the two halves drift.
     if rec["stop_price"] != old_stop:
-        _stops_trailed += 1
-        logger.info("STOP TRAIL %s %s %.2f → %.2f (%s=%.2f, trail=%.2fx%.2f) "
-                    "— trails #%d",
+        if trail_set_level:
+            _stops_trailed += 1
+            tail = "— trails #%d" % _stops_trailed
+        else:
+            tail = ("— NOT a trail move, set by %s (trail alone would be %.2f); "
+                    "trails still #%d" % (src, trail_only_stop, _stops_trailed))
+        logger.info("STOP TRAIL %s %s %.2f → %.2f (%s=%.2f, trail=%.2fx%.2f→%.2f,"
+                    " held by %s) %s",
                     symbol, direction, old_stop, rec["stop_price"],
                     "low_water" if direction == "short" else "high_water",
-                    water, mult, rec["atr_at_entry"], _stops_trailed)
+                    water, mult, rec["atr_at_entry"], raw_trail, src, tail)
 
     # Breakeven-lock event: log + count once, on the cycle the floor first snaps
     # the stop TO entry (the raw trail would have left it short of breakeven). The
@@ -1707,9 +1770,14 @@ def _check_and_trail_stop(symbol: str, held: int, sig: dict,
         trail_would_fire = (price >= raw_trail if direction == "short"
                             else price <= raw_trail)
 
-        # ONE attribution, consumed by both the log line and the ledger.
+        # ONE attribution, consumed by the stop-move log above, the exit log
+        # below and the ledger. `src` is computed once before the stop-move log
+        # (see the hoist note there) — do NOT recompute it here. stop_price has
+        # not changed since, so the value is still current, and a second
+        # _stop_source call is how the log line and the ledger drifted apart in
+        # the first place.
         #
-        # `breakeven_reached` (water-based) is passed rather than
+        # The hoisted call passes `breakeven_reached` (water-based) rather than
         # `breakeven_lock` (or `apply_floor`, which contains it). The latter
         # carries the arming clamp `price > entry` / `price < entry`, and a stop
         # resting AT entry can only be breached by price crossing back THROUGH
@@ -1718,7 +1786,6 @@ def _check_and_trail_stop(symbol: str, held: int, sig: dict,
         # reads "atr trail" (QQQ 2026-08-18, stop = entry = 717.26 with the trail
         # 21 points away). Water is monotonic, so _breakeven_reached survives the
         # retrace that the clamp cannot.
-        src = _stop_source(rec, entry, crisis_floor, breakeven_reached)
         lock_held = src == "breakeven lock"
         # `water_at_exit` is the number the lock's verdict rests on — peak given
         # back — and it appears NOWHERE else in the ledger, so it has to be
