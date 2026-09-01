@@ -868,7 +868,8 @@ someone "simplifying" the regex back to a slice.
 sequence" below SHIPPED as `72c1aa2` and supersedes the *need* for dollar rungs —
 Options A and B are therefore **obsolete, not done**. The % rungs themselves are
 still structurally unreachable on futures, which is what keeps this item open.
-Follow-up: "Monitor K=0.5 effect on TSLA" at the end of this section.
+Follow-up: "Monitor K=0.5 effect on TSLA" at the end of this section — RESOLVED
+2026-09-01, K raised to 0.75.
 
 **Observed (2026-08-24):** The profit-floor ladder thresholds are percentages of
 ENTRY PRICE, and `PROFIT_FLOOR_STEPS_LONG`'s first rung is +15%. NQU26's entire
@@ -997,7 +998,8 @@ numbers below verified against `strategy.py` on 2026-08-27.
    (Two call sites for the same logic is the pattern that has bitten this repo
    3× — put the anchor-generalised helper in place on day one.)
 
-3. **Config:** `ENABLE_WATER_FLOOR = True`, `WATER_FLOOR_K = 0.5`, alongside
+3. **Config:** `ENABLE_WATER_FLOOR = True`, `WATER_FLOOR_K = 0.75` (shipped at
+   0.5; raised 2026-09-01, see the resolved section below), alongside
    `ENABLE_BREAKEVEN_LOCK` / `BREAKEVEN_LOCK_ATR` (config.py:573-574).
 
 4. **Wire into `_check_and_trail_stop()` (strategy.py:1511) — equities AND
@@ -1032,11 +1034,108 @@ they are not a k-fit.
 
 ## Monitor K=0.5 effect on TSLA — first live test of the water floor
 
-**Status: OPEN, decision due end of week 2026-09-04.** Water floor shipped
-2026-08-31 (`72c1aa2`). Build sequence above is DONE; this is the parameter
-review it created.
+**Status: RESOLVED 2026-09-01. K=0.50 was wrong. Raised to K=0.75.** Water floor
+shipped 2026-08-31 (`72c1aa2`); the answer arrived on day one, three days before
+the 09-04 deadline. Build sequence above is DONE.
 
-**The decision rule, set before seeing any outcome:**
+### Resolution — the shaken-out branch was met exactly
+
+**TSLA long x133 @ entry 359.92, `atr_at_entry` 13.51:**
+
+| fact | value |
+|---|---|
+| Run at arming | **0.64 ATR** — barely past the 0.50 threshold |
+| Floor armed | 13:30:08, stop 334.77 → 361.79 (0.50 ATR behind water 368.55) |
+| Exited | 13:31:15 — **67 seconds later**, one poll cycle |
+| Exit print / fill | 359.10 / **359.17** (slippage −0.0750) |
+| Realized | **−$99.75** |
+| Peak unrealized | **+$1,147.79** (water 368.55, 8.63/share) |
+| Trail at exit | **334.77** — 26.42 away, never in play |
+| Gap through stop | **2.62** — stop 361.79, filled 359.17 |
+
+The decision rule below asked for the exit *reason*, not the P&L sign. The reason
+is: a floor armed 0.14 ATR above the market on a run that had barely established
+itself, and the next minute took it out. The trail was irrelevant — this exit
+exists *only* because the floor armed. A +$1.1k open position was converted into a
+realized loss. That is the failure case as written.
+
+**K=0.75 verdict on this case: would NOT have armed.** Arming needs `run > K`, and
+the run was 0.64 ATR. TSLA stays on the trail and stays open. ✅
+
+### The opposite case, same day — NQU26 says K=0.50 was RIGHT there
+
+**NQU26 long x1 @ entry 29118.75:**
+
+| fact | value |
+|---|---|
+| Run at arming | **1.37 ATR** — well established |
+| Floor armed | 06:06:37, stop 29118.75 → 29555.16 |
+| Exited | 06:13:46, fill **29544.75** (slippage +5.00) |
+| Realized | **+$8,520** (426.00 pts × $20/pt) |
+| Trail | **28,307.22** — could never have fired |
+
+The floor was the **only** path to that realization. Keeping K=0.50 for its own
+sake was never the question; the question was whether 0.50 arms too early.
+
+**At K=0.75 NQU26 still arms** (1.37 > 0.75) and still banks the run. The knob
+separates the two cases cleanly — which is the whole argument for moving it.
+
+### The verdict
+
+The split is **run length at arming**, not the instrument and not the direction:
+
+| | |
+|---|---|
+| K=0.50 | Arms on runs that have barely established → shaken out by normal volatility |
+| K=0.75 | Arms only on more established runs → fewer noise exits, still captures what the trail structurally cannot |
+
+Cost, stated plainly: this raises the give-back allowance on **every** winner by
+0.25·ATR. K is the trailing-stop width for every profitable position (see the
+REPLACES-THE-TRAIL arithmetic below), so this is not a free fix — it is buying
+arming discipline with give-back. n=2. Re-examine on the next 2–3 armings.
+
+Note K=0.75 < `BREAKEVEN_LOCK_ATR` = 1.0 still holds, so the floor continues to
+arm before the lock and continues to supersede it.
+
+### ESU26 note — CORRECTION to the obvious reading
+
+ESU26 exited the same day at entry as `lock exits #1`, the **first
+breakeven-lock-caused exit ever**: 107.25 points of peak given back to a scratch.
+The tempting explanation is "the water floor never armed because the run never
+reached 0.50 ATR." **That is wrong, and the log disproves it:**
+
+* `STOP BOOTSTRAP ESU26` (2026-08-24) records `atr=70.60 mult=3.0x`. The trail
+  7569.69 confirms it: 7781.50 − 3.0 × 70.60 = 7569.69. ✓
+* Run from entry 7674.25 to water 7781.50 = 107.25 pts = **1.52 ATR** — past the
+  0.50 floor threshold *and* past the 1.0 lock threshold. The lock arming at all
+  is itself proof the run exceeded 0.50 ATR.
+
+The floor was blocked by **Guard 2 (never arm through the market)**, not by the
+threshold. Its level would have been 7781.50 − 0.50 × 70.60 = **7746.20**, already
+above the market when the floor shipped retroactively on 08-31, and the water never
+advanced again to rescue it. This is exactly the banner's "the lock now only binds
+on positions where the floor is blocked."
+
+**K=0.75 does not fix ESU26**: the floor would sit at 7728.55, still above the
+market, still guard-blocked. A general side effect worth tracking, though — raising
+K lands the floor *lower*, so Guard 2 blocks it less often on retroactive applies.
+
+Two further caveats on this leg:
+
+* ESU26 carries an **ESTIMATED adopted entry** — bootstrap anchored on live price
+  7674.25 and explicitly refused the margin `cost_basis`. The log states outright
+  that "profit floor, breakeven lock and exit P&L are all off the true fill for
+  this record." The −$412.50 implied by fill 7666.00 is therefore soft. Per-leg
+  ledger corrections are signed and per-leg; do not aggregate this naively.
+* This is the **fourth consecutive scratch-on-a-winner** with the same signature
+  (AMD 07-29, PLTR 08-04, QQQ 08-13, now ESU26). **That structural problem is
+  still open** — the water floor was supposed to close it and could not here,
+  because a guard-blocked floor falls back to exactly the lock behavior the floor
+  was built to replace. Raising K does not address it.
+
+---
+
+**The original decision rule, set before seeing any outcome (kept for the record):**
 
 * If TSLA is **shaken out on normal volatility** in the first week — stopped at
   the floor while the trend is still intact (EMA9 > EMA21 at the exit, and price
@@ -1082,8 +1181,8 @@ they are not a sample of the population K governs.
 | K | character | floor at 1.5 ATR run | notes |
 |---|---|---|---|
 | 0.25 | very tight | 112.50 | exits on noise |
-| **0.5** | **tight, captures fast** | **110.00** | **current** |
-| 0.75 | looser, more room | 107.50 | the fallback if TSLA shakes out |
+| 0.5 | tight, captures fast | 110.00 | 2026-08-31 → 2026-09-01; shook out TSLA |
+| **0.75** | **looser, more room** | **107.50** | **current** — the fallback, taken 2026-09-01 |
 | 1.0 | most conservative useful | 105.00 | see correction below |
 
 **Correction to a plausible-sounding claim: K=1.0 is NOT "redundant with the

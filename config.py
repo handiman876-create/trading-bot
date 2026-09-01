@@ -598,6 +598,21 @@ BREAKEVEN_LOCK_ATR    = 1.0    # favorable excursion (in entry-ATRs) required to
 # because it clears entry on the observed cases while leaving RTYU26 (0.55 ATR
 # run) below entry, i.e. inert on a position that never really ran.
 #
+# K=0.5 -> 0.75 ON 2026-09-01. Two live cases, opposite verdicts, and the split
+# is the RUN LENGTH at arming, not the instrument:
+#   TSLA long, 0.64 ATR run  -> armed 13:30:08, exited 13:31:15 (67s later) at
+#       -$99.75 realised against a +$1,147.79 peak; the trail sat 26.42 away and
+#       was never in play. Price gapped 2.62 THROUGH the 361.79 stop. A floor
+#       that arms 0.14 ATR above the market on a barely-established run is a
+#       coin-flip on the next tick, not protection.
+#   NQU26 long, 1.37 ATR run -> armed 06:06:37, exited 06:13:46 at +$8,520 on a
+#       trail of 28,307 that could never have fired. The floor was the ONLY path
+#       to that realisation. K=0.5 was RIGHT here.
+# At K=0.75 TSLA (0.64 ATR) never arms and stays on the trail; NQU26 (1.37 ATR)
+# still arms and still banks the run. The knob separates the two cases cleanly.
+# This raises the give-back allowance on every winner by 0.25*ATR — see the
+# REPLACES-THE-TRAIL section below; that is the price being paid deliberately.
+#
 # DO NOT TUNE K ON THE $2,272 / $6,628 ES/NQ FIGURES in docs/backlog.md. Those
 # are open unrealised on three live legs in ONE direction and ONE regime, and
 # both legs carry ESTIMATED adopted entries — an entry-anchored number inherits
@@ -630,7 +645,8 @@ BREAKEVEN_LOCK_ATR    = 1.0    # favorable excursion (in entry-ATRs) required to
 # some multiple of ATR behind water), because the arithmetic above will never let
 # the trail win it back.
 ENABLE_WATER_FLOOR = True
-WATER_FLOOR_K      = 0.5   # ATRs of give-back allowed behind the best excursion
+WATER_FLOOR_K      = 0.75  # ATRs of give-back allowed behind the best excursion
+                           # (0.5 until 2026-09-01 — see the TSLA/NQU26 split above)
                            #
                            # BAD — DO NOT do this:
                            #   WATER_FLOOR_K = 0.0   # floor lands ON the water,
