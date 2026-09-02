@@ -640,13 +640,80 @@ def test_analyzer_ingests_the_new_keys_at_both_sites():
     """The section can compute perfectly and still report nothing forever if the
     keys never survive ingest. Both trip-building sites must carry them, or
     every real trip reads breakeven_lock_held=None and the report says 'no
-    attributed stop exits' on a bot that is firing locks."""
-    import inspect
-    src = inspect.getsource(pa)
-    for key in ("breakeven_lock_held", "lock_caused_exit", "water_at_exit",
-                "stop_at_exit"):
-        assert src.count(f'raw.get("{key}")') == 1, f"{key} missing at raw ingest"
-        assert src.count(f'ev.get("{key}")') == 1, f"{key} missing at ev ingest"
+    attributed stop exits' on a bot that is firing locks.
+
+    REWRITTEN 2026-09-02, and the reason matters more than the test. This used to
+    assert on SOURCE TEXT — `src.count('raw.get("breakeven_lock_held")') == 1` —
+    against a hand-listed set of four keys. It passed continuously while the
+    analyzer silently dropped the three water-floor keys added to
+    trade_logger._STOP_ATTR_KEYS on 2026-08-31, because nobody added them to this
+    literal either. A test that must be updated by the same person making the
+    mistake catches nothing.
+
+    So: drive the real functions, and iterate _STOP_ATTR_KEYS itself. A 5th stop
+    source is covered the moment it is added to the tuple, with no edit here.
+    """
+    from trade_logger import _STOP_ATTR_KEYS
+    # Distinct non-None sentinel per key: a bug that swaps or drops one shows up
+    # as a wrong value, not a coincidentally-equal pass.
+    attrs = {k: float(i + 1) for i, k in enumerate(_STOP_ATTR_KEYS)}
+
+    entry_raw = {"timestamp": "2026-07-10 09:30:00 EDT", "action": "BUY",
+                 "symbol": "ZZZ", "quantity": 10, "price": 100.0,
+                 "order_type": "market", "order_id": "e1", "notes": "EMA cross up"}
+    exit_raw = dict({"timestamp": "2026-07-11 09:30:00 EDT", "action": "SELL",
+                     "symbol": "ZZZ", "quantity": 10, "price": 110.0,
+                     "order_type": "market", "order_id": "x1",
+                     "notes": "trailing stop hit @ 109.00"}, **attrs)
+
+    # SITE 1 — _normalize(): every key survives the raw -> event hop.
+    ev = pa._normalize(exit_raw)
+    for k, want in attrs.items():
+        assert ev.get(k) == want, f"{k} lost at raw ingest (_normalize)"
+
+    # SITE 2 — _pair_round_trips(): every key survives the event -> trip hop.
+    closed, _orphans, _open = pa._pair_round_trips(
+        [pa._normalize(entry_raw), ev])
+    assert len(closed) == 1, closed
+    for k, want in attrs.items():
+        assert closed[0].get(k) == want, f"{k} lost at trip ingest (_pair_round_trips)"
+
+
+def test_merge_backfills_attribution_onto_events_stored_by_an_older_normalize():
+    """The ledger outlives log rotation, so events are normalized ONCE and kept.
+    That makes every stored event a derived value frozen against the derivation
+    of its day — when the water floor added three keys, re-running the analyzer
+    could NOT repair the already-stored events, because dedup skipped them as
+    already-seen. This is the reconcile that fixes that, and it must (a) fill
+    absent keys, (b) never overwrite a present one, including a present None."""
+    from trade_logger import _STOP_ATTR_KEYS
+    raw = {"timestamp": "2026-07-10 09:30:00 EDT", "action": "SELL",
+           "symbol": "ZZZ", "quantity": 10, "price": 110.0,
+           "order_type": "market", "order_id": "x1",
+           "notes": "trailing stop hit @ 109.00",
+           "water_caused_exit": True, "water_floor_price": 109.0,
+           "stop_at_exit": 109.0}
+
+    # An event as an OLDER _normalize() would have written it: the water keys do
+    # not exist at all, and stop_at_exit is present-but-None (known unattributed).
+    stale = {k: v for k, v in pa._normalize(raw).items()
+             if not k.startswith("water_")}
+    stale["stop_at_exit"] = None
+    ledger = {"version": 1, "events": {pa._event_key(raw): stale},
+              "closed_trips": []}
+
+    added, backfilled = pa._merge_events(ledger, [(raw, "trades.log")])
+    got = ledger["events"][pa._event_key(raw)]
+    assert (added, backfilled) == (0, 1), (added, backfilled)
+    assert got["water_caused_exit"] is True, "absent key not back-filled"
+    assert got["water_floor_price"] == 109.0, "absent key not back-filled"
+    assert got["stop_at_exit"] is None, \
+        "present-but-None OVERWRITTEN — 'known unattributed' must survive"
+    for k in _STOP_ATTR_KEYS:
+        assert k in got, f"{k} still absent after reconcile"
+
+    # Idempotent: a second pass finds nothing left to do.
+    assert pa._merge_events(ledger, [(raw, "trades.log")]) == (0, 0)
 
 
 def test_analyzer_section_is_wired_into_the_text_report():

@@ -436,6 +436,80 @@ def test_counter_split_is_direction_keyed():
     assert strategy._bump_water_floor("banana") == 3
 
 
+# ── Analyzer section (added 2026-09-02, with the first equity fires) ──────────
+#
+# The feature shipped 2026-08-31 with counters in the LOG but no section in the
+# performance report, so the ledger could carry water-floor-caused exits that no
+# report ever mentioned — and it did, for both 09-01 fires. A safety net with no
+# reporting surface cannot be argued about, only remembered.
+
+def _wtrip(**kw):
+    """A water-floor-caused stop trip. Defaults are GOOGL 2026-09-02, the first
+    water-floor-caused exit on equities that was a WINNER."""
+    t = {"exit_reason": "stop", "qty": 140, "entry_price": 345.76,
+         "exit_price": 339.35, "pnl": 897.40, "win": True,
+         "water_floor_active": True, "water_caused_exit": True,
+         "water_floor_price": 339.161, "atr_trail_at_exit": 361.5203,
+         "water_at_exit": 333.04}
+    t.update(kw)
+    return t
+
+
+def test_analyzer_absent_water_attribution_is_unknown_not_inactive():
+    """`absent != False`. Exits before 2026-08-31 had no floor to arm, so they
+    must not land in the denominator and make the feature look idle."""
+    import performance_analyzer as pa
+    st = pa._water_floor_stats([{"exit_reason": "stop", "pnl": 10.0}] * 4)
+    assert st["attributed"] == 0, st
+    assert st["unattributed"] == 4, st
+    assert "not evidence against the feature" in "\n".join(pa._water_floor_lines(st))
+
+
+def test_analyzer_capture_ratio_is_realized_over_peak():
+    """THE K KNOB. GOOGL banked 897.40 of a 1,780.80 peak excursion
+    (|333.04-345.76| * 140) = 50.4%. This number, not the P&L sign, is what says
+    whether K is set right."""
+    import performance_analyzer as pa
+    st = pa._water_floor_stats([_wtrip()])
+    assert st["peak_excursion"] == 1780.80, st
+    assert st["capture_ratio"] == round(897.40 / 1780.80, 4), st
+    assert "capture ratio" in "\n".join(pa._water_floor_lines(st))
+
+
+def test_analyzer_refuses_a_verdict_on_a_thin_sample():
+    """Two fires say nothing. A confident HELPING at n=2 is how a safety net
+    gets kept — or pulled — for the wrong reason."""
+    import performance_analyzer as pa
+    st = pa._water_floor_stats([_wtrip(), _wtrip(pnl=-99.75, win=False)])
+    assert st["verdict"] == "INSUFFICIENT DATA", st
+    assert f"need {pa.MIN_WATER_TRIPS_FOR_VERDICT}+" in "\n".join(
+        pa._water_floor_lines(st))
+
+
+def test_analyzer_armed_but_trail_would_have_fired_is_not_caused():
+    """Armed is not caused. A floor that was merely present when the trail fired
+    is not evidence for the feature and must stay out of `floor_caused`."""
+    import performance_analyzer as pa
+    st = pa._water_floor_stats([_wtrip(water_caused_exit=False)])
+    assert (st["floor_active"], st["floor_caused"]) == (1, 0), st
+    assert st["trail_would_fire"] == 1, st
+
+
+def test_analyzer_section_is_wired_into_both_reports():
+    """Guards the assembly calls, not just the renderer: a section that computes
+    correctly but is never appended is a passing test and a missing report — the
+    exact shape of the 08-31→09-02 gap this section closes."""
+    import inspect
+    import performance_analyzer as pa
+    assert pa._water_floor_lines(pa._water_floor_stats([_wtrip()] * 3))[0] == \
+        "=== WATER FLOOR ANALYSIS ==="
+    src = inspect.getsource(pa)
+    assert '_water_floor_lines(report.get("water_floor"))' in src, \
+        "section computed but not appended to the text report"
+    assert '"water_floor": _water_floor_stats(closed)' in src, \
+        "section not added to the JSON report dict"
+
+
 if __name__ == "__main__":
     _tmp = tempfile.mkdtemp(prefix="water-floor-")
     strategy._STOPS_PATH = os.path.join(_tmp, "stop_prices.json")

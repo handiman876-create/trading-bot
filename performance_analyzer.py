@@ -30,6 +30,7 @@ import sys
 from datetime import datetime, timedelta
 
 import config
+from trade_logger import _STOP_ATTR_KEYS
 
 logger = logging.getLogger("performance_analyzer")
 
@@ -331,29 +332,49 @@ def _normalize(raw: dict) -> dict | None:
         "direction":       direction,
         "feature":         feature,
         "estimated_entry": False,
-        # Stop attribution (exits written on/after 2026-08-13). ABSENT on older
-        # records, and absent must stay distinguishable from False — an exit that
-        # predates the ladder is not evidence the ladder was inactive, it is no
-        # evidence at all. Hence None, never a `or False` default.
-        "profit_floor_active": raw.get("profit_floor_active"),
-        "profit_floor_price":  raw.get("profit_floor_price"),
-        "atr_trail_at_exit":   raw.get("atr_trail_at_exit"),
-        "floor_caused_exit":   raw.get("floor_caused_exit"),
-        # Breakeven-lock attribution (exits on/after 2026-08-19). Same
-        # absent-is-unknown contract: before that date the label was
-        # unreachable, so a missing key is not "the lock was inactive".
-        "breakeven_lock_held": raw.get("breakeven_lock_held"),
-        "lock_caused_exit":    raw.get("lock_caused_exit"),
-        "stop_at_exit":        raw.get("stop_at_exit"),
-        "water_at_exit":       raw.get("water_at_exit"),
+        # Stop attribution — the key list is OWNED BY trade_logger._STOP_ATTR_KEYS,
+        # never re-typed here. It was duplicated by hand at this site and in
+        # _pair_trips() until 2026-09-02, and both copies silently went stale when
+        # the water floor shipped (2026-08-31): trades.log carried
+        # water_floor_active/_price/water_caused_exit, the ledger dropped all three,
+        # so the first water-floor-caused exits (NQU26 09-01, GOOGL 09-02) landed in
+        # closed_trips looking like plain trail stops. Adding a 5th stop source must
+        # not require remembering two more places.
+        #
+        # ABSENT stays distinguishable from False — an exit predating a feature is
+        # not evidence the feature was inactive, it is no evidence at all. Hence
+        # .get() -> None, never a `or False` default.
+        **{k: raw.get(k) for k in _STOP_ATTR_KEYS},
     }
 
 
-def _merge_events(ledger: dict, raw_records) -> int:
-    """Insert normalized trade events into ledger['events'] (dedup by key).
-    Returns the number of NEW events added."""
+def _merge_events(ledger: dict, raw_records) -> tuple[int, int]:
+    """Insert normalized trade events into ledger['events'] (dedup by key), and
+    back-fill attribution keys onto events stored by an older _normalize().
+    Returns (new_events_added, events_backfilled).
+
+    WHY THE BACK-FILL EXISTS. Events are normalized ONCE, at first sight, then
+    kept forever — the ledger outlives log rotation, that is its whole job. So a
+    stored event is a derived value frozen against the derivation that existed
+    the day it was written, and every new stop source makes every older event
+    incomplete. The water floor (2026-08-31) proved it: three keys were added to
+    trade_logger._STOP_ATTR_KEYS, _normalize() was not updated, and the first two
+    water-floor-caused exits were written to the ledger with no water attribution
+    at all while trades.log had it in full.
+
+    Re-running the analyzer could not repair that — dedup skipped the events as
+    already-seen. Hence a RECONCILE rather than a one-shot backfill script: it
+    runs every time, so the next stop source is repaired automatically for as
+    long as the raw record is still visible in the (rotating) logs.
+
+    ONLY fills keys ABSENT from the stored event; never overwrites one that is
+    present, including a present-but-None. That distinction is load-bearing —
+    None means "known to be unattributed" and must survive, while a missing key
+    means the derivation of the day never considered it. Idempotent by
+    construction: once filled, the key is present and skipped forever after.
+    """
     events = ledger.setdefault("events", {})
-    added = 0
+    added = backfilled = 0
     for raw, _src in raw_records:
         ev = _normalize(raw)
         if ev is None:
@@ -362,7 +383,13 @@ def _merge_events(ledger: dict, raw_records) -> int:
         if key not in events:
             events[key] = ev
             added += 1
-    return added
+            continue
+        stored = events[key]
+        missing = [k for k in _STOP_ATTR_KEYS if k not in stored]
+        if missing:
+            stored.update({k: raw.get(k) for k in missing})
+            backfilled += 1
+    return added, backfilled
 
 
 def _inject_bootstrap_entries(ledger: dict, stops: dict, open_keys: set) -> int:
@@ -551,14 +578,8 @@ def _pair_round_trips(events: list):
                 "exit_price_src":  exit_src,
                 "price_basis":     basis,
                 "exit_reason":     _exit_reason(ev.get("notes")),
-                "profit_floor_active": ev.get("profit_floor_active"),
-                "profit_floor_price":  ev.get("profit_floor_price"),
-                "atr_trail_at_exit":   ev.get("atr_trail_at_exit"),
-                "floor_caused_exit":   ev.get("floor_caused_exit"),
-                "breakeven_lock_held": ev.get("breakeven_lock_held"),
-                "lock_caused_exit":    ev.get("lock_caused_exit"),
-                "stop_at_exit":        ev.get("stop_at_exit"),
-                "water_at_exit":       ev.get("water_at_exit"),
+                # Same single source of truth as _normalize(); see the note there.
+                **{k: ev.get(k) for k in _STOP_ATTR_KEYS},
                 "pnl":             round(pnl, 2),
                 "pnl_pct":         _pnl_pct(direction, entry_price, exit_price),
                 "win":             pnl > 0,
@@ -908,6 +929,7 @@ def build_report(ledger: dict, stops: dict, data_quality: dict,
         "warnings":     _build_warnings(agg),
         "profit_floor": _profit_floor_stats(closed),
         "breakeven_lock": _breakeven_lock_stats(closed),
+        "water_floor": _water_floor_stats(closed),
         "data_quality": data_quality,
     }
 
@@ -1179,6 +1201,133 @@ def _breakeven_lock_lines(st: dict | None) -> list[str]:
     return L
 
 
+MIN_WATER_TRIPS_FOR_VERDICT = 3
+
+
+def _water_floor_stats(closed_trips: list) -> dict:
+    """Is the water floor (2026-08-31) earning its keep, and is K set right?
+
+    Same three-population shape and the same absent-is-unknown contract as
+    _profit_floor_stats: `water_floor_active is None` means the exit predates the
+    feature (or the analyzer's pre-2026-09-02 key-dropping bug), NOT that the
+    floor was inactive. Those are excluded from every denominator.
+
+    THE METRIC THAT TUNES K — capture ratio. An armed water floor can never lose
+    to the ATR trail (config validates 0 < K < STOP_LOSS_ATR_MULT, both anchored
+    to the same water mark), so "did it beat the trail" is arithmetic, not
+    evidence, and reporting it would be self-congratulatory. What is NOT settled
+    in advance is how much of the peak excursion K lets you keep:
+
+        peak    = |water_at_exit - entry_price| * qty     (best the trade ever was)
+        capture = realized / peak                         (what K actually banked)
+
+    That is the whole TSLA-vs-NQU26 argument in one number. A capture ratio near
+    1.0 across many exits means K is too tight (exiting at the peak = shaking out
+    live trends); a persistently low one means K is giving the run back. Neither
+    is knowable from a single trip, hence the verdict floor.
+
+    HONEST LIMIT, identical to the other two sections: nothing here knows what
+    price did after the exit. `room_given_up` bounds how much earlier the floor
+    fired than the trail would have; it is NOT a realized gain, and summing it
+    would overstate the feature badly.
+    """
+    stops = [t for t in closed_trips if t.get("exit_reason") == "stop"]
+    known = [t for t in stops if t.get("water_floor_active") is not None]
+    active = [t for t in known if t.get("water_floor_active")]
+    caused = [t for t in active if t.get("water_caused_exit")]
+    realized = round(sum(t.get("pnl") or 0 for t in caused), 2)
+    wins = sum(1 for t in caused if t.get("win"))
+
+    room = peak = 0.0
+    measured = 0
+    for t in caused:
+        fl, tr, qty = (t.get("water_floor_price"),
+                       t.get("atr_trail_at_exit"), t.get("qty") or 0)
+        if fl is not None and tr is not None:
+            room += abs(fl - tr) * qty
+        en, wa = t.get("entry_price"), t.get("water_at_exit")
+        if en is not None and wa is not None and qty:
+            peak += abs(wa - en) * qty
+            measured += 1
+    capture = round(realized / peak, 4) if peak > 0 else None
+
+    if len(caused) < MIN_WATER_TRIPS_FOR_VERDICT:
+        verdict = "INSUFFICIENT DATA"
+    elif realized > 0 and wins / len(caused) >= 0.5:
+        verdict = "HELPING"
+    elif realized < 0:
+        verdict = "HURTING"
+    else:
+        verdict = "NEUTRAL"
+    return {
+        "stop_exits":         len(stops),
+        "attributed":         len(known),
+        "unattributed":       len(stops) - len(known),
+        "floor_active":       len(active),
+        "floor_caused":       len(caused),
+        "trail_would_fire":   len(active) - len(caused),
+        "realized_on_caused": realized,
+        "winners_on_caused":  wins,
+        "room_given_up":      round(room, 2),
+        "peak_excursion":     round(peak, 2),
+        "peak_measured":      measured,
+        "capture_ratio":      capture,
+        "verdict":            verdict,
+    }
+
+
+def _water_floor_lines(st: dict | None) -> list[str]:
+    """Render _water_floor_stats. Split from the computation for the same reason
+    as the other two sections: the numbers belong in the JSON report too."""
+    L = ["=== WATER FLOOR ANALYSIS ==="]
+    st = st or {}
+    if not st.get("attributed"):
+        n = st.get("unattributed", 0)
+        L.append("  no attributed stop exits yet"
+                 + (f" ({n} stop exit(s) carry no water attribution, "
+                    "not counted)" if n else ""))
+        L.append("  the water floor shipped 2026-08-31; exits before that date "
+                 "had no floor to arm, so an absence here is not evidence "
+                 "against the feature")
+        return L
+
+    L.append(f"  attributed stop exits:     {st['attributed']}"
+             + (f"   ({st['unattributed']} older/unattributed, excluded)"
+                if st["unattributed"] else ""))
+    L.append(f"  trades with floor armed:   {st['floor_active']} of {st['attributed']}")
+    L.append(f"  floor caused exit:         {st['floor_caused']} of {st['floor_active']}")
+    L.append(f"  trail would have fired:    {st['trail_would_fire']} of {st['floor_active']}")
+    if st["floor_caused"]:
+        L.append(f"  realized on floor-caused:  "
+                 f"{_fmt_money(st['realized_on_caused'])} "
+                 f"({st['winners_on_caused']}/{st['floor_caused']} winners)")
+        L.append(f"  room given up vs trail:    "
+                 f"{_fmt_money(st['room_given_up'])} "
+                 f"(how far the trail still sat; NOT a realized gain)")
+        if st["capture_ratio"] is not None:
+            L.append(f"  peak excursion:            "
+                     f"{_fmt_money(st['peak_excursion'])} "
+                     f"({st['peak_measured']} of {st['floor_caused']} measurable)")
+            L.append(f"  capture ratio:             "
+                     f"{st['capture_ratio']:.1%} of peak banked "
+                     f"— THE K KNOB: near 100% means K is too tight "
+                     f"(exiting at the peak shakes out live trends)")
+    if st["verdict"] == "INSUFFICIENT DATA":
+        L.append(f"  verdict: INSUFFICIENT DATA — {st['floor_caused']} "
+                 f"floor-caused exit(s), need "
+                 f"{MIN_WATER_TRIPS_FOR_VERDICT}+ before this means anything")
+    else:
+        detail = {
+            "HELPING": ("floor-caused exits are net profitable — but check the "
+                        "capture ratio before crediting K itself"),
+            "HURTING": ("floor-caused exits are net negative; the floor is "
+                        "firing on trades the trail would have held"),
+            "NEUTRAL": "floor-caused exits net out flat",
+        }[st["verdict"]]
+        L.append(f"  verdict: {st['verdict']} — {detail}")
+    return L
+
+
 def _ab_screen_lines(tracking: dict | None = None) -> list[str]:
     """Render the A/B SCREEN TRACKER section from SCREEN_AB_TRACKING_FILE.
 
@@ -1387,10 +1536,17 @@ def render_txt(report: dict) -> str:
             L.append(f"      - {r['symbol']} {r['direction']} x{r['qty']} "
                      f"@ {r['entry_ts']} — {r['reason']}")
     L.append(f"  new events added to ledger this run: {dq.get('new_events_added', 0)}")
+    bf = dq.get("events_backfilled", 0)
+    if bf:
+        L.append(f"  events back-filled with attribution keys: {bf} "
+                 f"(stored by an older _normalize(); repaired from the raw log "
+                 f"while it is still on disk)")
     L.append("")
     L.extend(_profit_floor_lines(report.get("profit_floor")))
     L.append("")
     L.extend(_breakeven_lock_lines(report.get("breakeven_lock")))
+    L.append("")
+    L.extend(_water_floor_lines(report.get("water_floor")))
     L.append("")
     L.append("A/B SCREEN TRACKER")
     L.extend(_ab_screen_lines())
@@ -1421,7 +1577,7 @@ def _load_stops() -> dict:
 def run(dry_run: bool = False, reconcile: bool = True) -> dict:
     ledger = _load_ledger()
     raw_records, files_parsed, parse_errors = _read_jsonl(TRADES_GLOB)
-    new_events = _merge_events(ledger, raw_records)
+    new_events, backfilled = _merge_events(ledger, raw_records)
 
     # A --dry-run still fetches positions: the reconcile result is part of what
     # the operator is previewing. Nothing is persisted unless dry_run is False.
@@ -1431,6 +1587,7 @@ def run(dry_run: bool = False, reconcile: bool = True) -> dict:
         "files_parsed":     files_parsed,
         "parse_errors":     parse_errors,
         "new_events_added": new_events,
+        "events_backfilled": backfilled,
     }, positions=positions)
 
     if not dry_run:
@@ -1439,10 +1596,11 @@ def run(dry_run: bool = False, reconcile: bool = True) -> dict:
         logger.info("Wrote %s and %s", REPORT_JSON, REPORT_TXT)
     dq = report["data_quality"]
     reconciled = dq.get("reconciled_entries")
-    logger.info("Ledger: %d events (+%d new, +%d bootstrap), %d closed trips, "
-                "%d open, reconciled %s",
+    logger.info("Ledger: %d events (+%d new, +%d bootstrap, +%d attr back-filled), "
+                "%d closed trips, %d open, reconciled %s",
                 len(ledger["events"]), new_events,
-                dq["bootstrap_injected"], dq["closed_trips"], dq["open_entries"],
+                dq["bootstrap_injected"], backfilled,
+                dq["closed_trips"], dq["open_entries"],
                 "SKIPPED" if reconciled is None else len(reconciled))
     for w in report["warnings"]:
         logger.warning("PERF WARNING: %s", w)

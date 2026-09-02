@@ -1,17 +1,30 @@
 # Profit floor — observed behavior
 
-Running log of what the profit-floor ladder actually did in production, as
-distinct from what it was designed to do. The weekly report's
-`=== PROFIT FLOOR ANALYSIS ===` section carries the running counters; this file
-carries the per-trip stories the counters can't hold.
+Running log of what the floor mechanisms actually did in production, as distinct
+from what they were designed to do. The weekly report's
+`=== PROFIT FLOOR ANALYSIS ===` and `=== WATER FLOOR ANALYSIS ===` sections carry
+the running counters; this file carries the per-trip stories the counters can't
+hold.
 
-The report withholds a verdict below `MIN_FLOOR_TRIPS_FOR_VERDICT` = 3
-floor-caused exits. **We are at 1.** Nothing below is a validated result.
+**Two different features live here.** The **profit-floor ladder** (entry-anchored
+static rungs, 2026-08-13) and the **water floor** (water-anchored trailing floor
+at K·ATR, 2026-08-31). They are separate sources in `floor_srcs` with separate
+counters, separate ledger keys and separate report sections, and conflating their
+exit counts is the easiest mistake to make when reading this file. Each report
+section withholds a verdict below 3 caused exits of **its own** kind.
 
-Count armings and exits separately. The ladder has **armed twice** (AVGO
-2026-08-26, CRWV 2026-08-28) and **caused one exit** (AVGO). Only the second
-number moves the verdict, and only the second number is in the report — see
-"The arming that no counter sees" below for why that is a measurement gap.
+Scoreboard as of 2026-09-02 — armings and caused exits counted separately,
+because only the second number moves a verdict:
+
+| mechanism | armed | caused an exit | caused exits, net |
+|---|---|---|---|
+| profit-floor ladder | 3 (AVGO, CRWV, GOOGL) | **1** (AVGO) | +$437.57 |
+| water floor, equities | 2 (TSLA, GOOGL) | **2** (TSLA, GOOGL) | +$797.65 |
+| water floor, futures | 1 (NQU26; ESU26 was guard-blocked, never armed) | **1** (NQU26) | +$8,520 |
+
+Neither feature has reached `MIN_*_TRIPS_FOR_VERDICT` = 3 in the ledger the
+report reads, so **nothing below is a validated result.** The futures leg is not
+in that ledger at all (see the note in Trip 2).
 
 ---
 
@@ -215,3 +228,132 @@ Until then: **the short ladder worked, once.** AVGO remains the only trade the
 floor has ever closed green on its own. CRWV is not a second instance of that —
 it is a second instance of the ladder *arming*, which is a weaker claim and the
 one the counters were built to keep separate.
+
+---
+
+# Water floor — observed behavior
+
+Separate feature, separate counters, separate verdict gate. Shipped `72c1aa2`
+2026-08-31 at K=0.50, raised to **K=0.75** in `36e02a8` on 2026-09-01.
+
+**Everything recorded below is K=0.50 evidence.** Both 09-01 restarts were after
+the close, so the K raise first took effect at the 2026-09-02 open — and because
+raising K can never loosen a floor that is already armed (the monotonic ratchet
+at `strategy.py:1819` clamps it), GOOGL carried its K=0.50-era level to the exit.
+**K=0.75 has still never armed anything.**
+
+## Trip 2 — GOOGL short, 2026-08-13 → 2026-09-02
+
+| | |
+|---|---|
+| Entry | 2026-08-13 10:53:51 EDT, `SELL_SHORT` 140 @ **345.76** (fill), order 967054314 |
+| Entry ATR | 11.3921 = 3.30% of entry, trail multiple 2.50x |
+| Best price | 333.04 → **+3.68%**, peak excursion **$1,780.80** (12.72 × 140) |
+| Floor armed | 2026-09-01, four ratchet steps: 342.30 → 340.35 → 340.09 → 339.94 → **339.16** (`short water floors #1–4`) |
+| Run at final arm | **1.08 ATR** behind water 333.46, K=0.50 |
+| Exit | 2026-09-02 10:14:20 EDT, `BUY_TO_COVER` @ **339.35** (fill; signal 339.31, slippage +0.04), order 969759768 |
+| Realized | **+$897.40** (+1.854%) |
+| Captured | **50.4%** of peak excursion |
+| ATR trail at exit | **361.52** — 22.17 away, would NOT have fired |
+| Broker GTC | cancelled 969547362 (`cancels #1`) |
+
+Ledger record carries `water_caused_exit: true`, `water_floor_active: true`,
+`water_floor_price: 339.161`, `stop_at_exit: 339.161`, `water_at_exit: 333.04`,
+and `floor_caused_exit: false` — the ladder's +2% rung (342.3024) existed but was
+not the binding level. That handoff is `floor_srcs` working as designed: at
+deploy the rung was tighter than the water floor (342.3024 vs 342.8738) and won;
+as water improved the water floor overtook it and held the stop to the exit.
+
+### Same shape as AVGO: the floor was the only mechanism near price
+
+This is the second time a floor has closed a trade that nothing else would have
+closed. The trail sat 22.17 points away on a 2.5x multiple and never came near;
+the breakeven lock was superseded (the water floor arms at 0.75 ATR — 0.50 at the
+time — against the lock's 1.00, and is strictly more protective once armed).
+Remove the water floor and this position is **still open**, not closed at a loss.
+
+**That distinction is the one number to be careful with.** It is tempting to
+write "without the floor this would have been −$2,206" (the loss if price ran to
+the 361.52 trail). It would be wrong in the same way the doc already refuses for
+the ladder: `room given up vs trail` is **$3,130.30** here and that is not a
+realized gain, because the trail sat there for being loose, not for being right.
+Nothing in the ledger knows what price did after 10:14, so −$2,206 is a **bound
+on exposure, not an estimated outcome.** The honest claim is the narrow one: on
+the observed tape the floor was the only mechanism in play, and it banked
++$897.40.
+
+### Capture ratio — the number that actually tunes K
+
+Realized over peak excursion, and the direct descendant of the ladder's "36% of
+MFE" question. Now computed by the report:
+
+| trip | peak excursion | realized | captured |
+|---|---|---|---|
+| GOOGL 09-02 | $1,780.80 | +$897.40 | **50.4%** |
+| TSLA 09-01 | $1,147.79 | −$99.75 | **−8.7%** |
+| both | $2,928.59 | +$797.65 | **27.2%** |
+
+Read the same caveat as AVGO's 36%: water is **poll-sampled**, so it is a lower
+bound on the true excursion and every capture figure here is optimistic. One
+significant figure at most.
+
+The split is what motivated the K raise, and it is run length at arming, not
+direction or instrument: TSLA armed at **0.64 ATR** and was stopped 67 seconds
+later; GOOGL armed at **1.08 ATR** and held for a day. At K=0.75 TSLA never arms.
+
+### Corrections to the obvious readings of this trip
+
+Three claims that sound right and are not:
+
+1. **It is not the first water-floor-caused exit.** TSLA (equities, 09-01,
+   −$99.75) and NQU26 (futures, 09-01, +$8,520) both preceded it. GOOGL is the
+   **third** water-floor-caused exit overall and the **second** on equities. What
+   is genuinely first: it is the first water-floor-caused exit that was a
+   **winner on equities**, and the first where the floor was demonstrably the
+   only mechanism in play.
+2. **It is not the third floor-caused exit overall.** Within the equities ledger
+   it is the third of any kind (AVGO ladder, TSLA water, GOOGL water); counting
+   the futures leg it is the fourth.
+3. **The positive case is not "proven".** `_water_floor_stats` reports
+   `INSUFFICIENT DATA` at 2 equity fires, and those two are split +$897.40 /
+   −$99.75. Two fires, one of them a shakeout, is exactly the sample the verdict
+   gate exists to refuse.
+
+### The measurement gap this trip closed — and the one it exposed
+
+The water floor shipped 2026-08-31 with counters in the log but **no section in
+the performance report and no attribution surviving into the ledger.**
+`performance_analyzer.py` kept two hand-copied lists of the stop-attribution keys
+(one in `_normalize`, one in `_pair_round_trips`) and neither was updated when
+`trade_logger._STOP_ATTR_KEYS` gained `water_floor_active` / `water_floor_price`
+/ `water_caused_exit`. So `trades.log` recorded the attribution in full while
+`closed_trips` dropped all three, and **both 09-01 fires plus this one landed in
+the ledger looking like plain trail stops.**
+
+Fixed 2026-09-02, three parts:
+
+- both copies replaced by `**{k: raw.get(k) for k in _STOP_ATTR_KEYS}` — the key
+  list is owned by `trade_logger` and never re-typed;
+- a **reconcile** in `_merge_events`, not a one-shot backfill: stored events are
+  derived values frozen against the derivation of their day, and re-running could
+  not repair them because dedup skipped them as already-seen. It fills only keys
+  that are *absent*, never a present-but-`None` (which means "known
+  unattributed"), so it is idempotent. It repaired **12 events** on first run and
+  reports the count in the report and the run log.
+- a `=== WATER FLOOR ANALYSIS ===` section, so the feature is arguable from the
+  report instead of only from this file.
+
+The test that should have caught it asserted on **source text** —
+`src.count('raw.get("breakeven_lock_held")') == 1` over four hand-listed keys —
+so it passed throughout, because whoever forgot to add the water keys to the
+analyzer also forgot to add them to the test's literal. Rewritten to drive
+`_normalize` and `_pair_round_trips` and iterate `_STOP_ATTR_KEYS` itself; a
+fifth stop source is now covered by adding it to the tuple.
+
+**Still open:** the futures ledger. `TRADES_GLOB` reads `trades.log*` only, so
+NQU26's +$8,520 water-floor exit is in `futures_trades.log` and in **no ledger and
+no report** — the largest single piece of evidence this feature has produced is
+invisible to the thing that judges it. That is why the scoreboard above has a
+futures row the report cannot see, and it is the binding constraint on reaching a
+verdict: the water floor is at 2 of 3 caused exits on equities and would be at 3
+of 3 if futures were counted.

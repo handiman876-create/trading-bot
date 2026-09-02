@@ -304,9 +304,14 @@ def test_merge_dedups_by_order_id_and_filters_test():
           "quantity": 1, "price": 100.0, "order_type": "market", "order_id": "t1",
           "notes": ""}, "trades.log"),
     ]
-    added = pa._merge_events(ledger, raw)
+    added, backfilled = pa._merge_events(ledger, raw)
     assert added == 1, "dedup + TEST filter -> one event"
     assert len(ledger["events"]) == 1
+    # The deduped duplicate is a back-fill CANDIDATE, not a back-fill: _normalize()
+    # already wrote every _STOP_ATTR_KEYS key (as None), so nothing is missing and
+    # the counter must stay 0. A non-zero here would mean the back-fill is
+    # rewriting known-unattributed Nones on every run.
+    assert backfilled == 0, "nothing missing -> no back-fill"
 
 
 def test_event_key_composite_when_no_order_id():
