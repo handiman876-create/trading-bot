@@ -1291,6 +1291,40 @@ The floor itself behaved correctly — it armed at 29555.16, which is 8.66 point
 signal fired at 29549.75 and the fill came back 5.00 points worse at 29544.75,
 below entry. **Slippage, not the floor, is why this leg is red.**
 
+### The whole futures book at true fills — record this before the logs rotate
+
+All three adopted legs have now exited, so the adopted-entry corrections can be
+closed out. `futures_trades.log*` rotates at 7 days and these fills exist nowhere
+else once it does; the analyzer never read them, so nothing else has a copy.
+
+| leg | entry (true fill) | exit fill | pts | $/pt | **true realized** | was reported | correction |
+|---|---|---|---|---|---|---|---|
+| ESU26 | 7,635.75 | 7,666.00 | +30.25 | 50 | **+$1,512.50** | −$412.50 | +$1,925.00 |
+| NQU26 | 29,546.50 | 29,544.75 | −1.75 | 20 | **−$35.00** | +$8,520.00 | −$8,555.00 |
+| RTYU26 | 3,050.70 | 2,971.50 | −79.20 | 50 | **−$3,960.00** | −$1,605.00 | −$2,355.00 |
+| | | | | | **−$2,482.50** | +$6,502.50 | **−$8,985.00** |
+
+Exits: ESU26 2026-09-01 (breakeven lock), NQU26 2026-09-01 (water floor), RTYU26
+2026-08-30 (EMA signal). **The futures book was believed to be +$6,502.50 and is
+actually −$2,482.50.** Each correction lands exactly on the per-leg value
+predicted when the legs were adopted (ES +$1,925 / NQ −$8,555 / RTY −$2,355),
+which is what makes this a reconciliation rather than a re-estimate.
+
+**A fourth round trip exists and is not in this table.** RTYU26 2026-07-21,
+11:31→11:32 — entry fill 2,986.80, exit `fill_price: null`, because it predates
+the 2026-07-27 fill-recording fix. At the signal price it is ≈ −$80.00 and the
+true exit fill is unrecoverable. So "three legacy legs" is correct for the
+adopted-entry problem, but the futures book has had **four** closed round trips.
+
+**Adopted entries are resolved, not eliminated.** `_arm_stop_on_entry` persists
+the true fill for every new futures position, `data/stop_prices.futures.json` is
+`{}` (flat), and the cross-process pruning that used to delete futures records
+mid-position is fixed by `_PROC_SUFFIX`. But `_bootstrap_stop` still anchors on
+live price for any futures position adopted *without* a stop record — a wiped
+`data/`, or a position opened outside the bot. If `STOP BOOTSTRAP` appears again
+for a futures symbol, a new estimated entry has been created and this table needs
+a new row. Point (5) below stands for that reason.
+
 ### What including futures actually does to the verdict
 
 Measured by running `_water_floor_stats` over the real equity trips plus NQU26:
