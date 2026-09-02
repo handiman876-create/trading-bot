@@ -1105,19 +1105,31 @@ Two consequences, and they point in opposite directions:
 Do not re-derive a K from this sample. See "performance_analyzer.py reads
 `trades.log*` only" for why these legs were never checked against a ledger.
 
-### The verdict
+### The verdict — REFRAMED 2026-09-02 after the NQU26 correction
 
-The split is **run length at arming**, not the instrument and not the direction:
+The original framing was a *contrast*: 0.64 ATR shaken out vs 1.37 ATR banked, so
+K=0.75 sits between them and separates the cases. With the true NQU26 entry there
+is no contrast — there is one band and one outcome:
 
-| | |
-|---|---|
-| K=0.50 | Arms on runs that have barely established → shaken out by normal volatility |
-| K=0.75 | Arms only on more established runs → fewer noise exits, still captures what the trail structurally cannot |
+* **Every K=0.50 arming on record is in the 0.52–0.64 ATR band.** NQU26 0.52,
+  TSLA 0.64. Nothing has ever armed on a well-established run.
+* **Both were premature, and both ended at a scratch or a small loss.**
+  NQU26 −$35.00, TSLA −$99.75.
+* **So the DIRECTION of the K=0.75 raise is correct** — arming that early has
+  never once worked, and the fix for "arms too early" is a higher K.
+* **But K=0.75 has armed NOTHING on record.** Both 09-01 restarts were
+  post-close, and the ratchet means an already-armed floor keeps its K=0.50-era
+  level, so GOOGL 09-02 was K=0.50 evidence too.
+* **Therefore no validation can be claimed.** The right level is unmeasured. Note
+  that neither recorded arming would have happened at 0.75 (0.52 and 0.64 are
+  both below it), so this sample cannot even say whether 0.75 is high enough,
+  only that 0.50 was too low.
 
-Cost, stated plainly: this raises the give-back allowance on **every** winner by
-0.25·ATR. K is the trailing-stop width for every profitable position (see the
-REPLACES-THE-TRAIL arithmetic below), so this is not a free fix — it is buying
-arming discipline with give-back. n=2. Re-examine on the next 2–3 armings.
+Cost, unchanged and stated plainly: this raises the give-back allowance on
+**every** winner by 0.25·ATR. K is the trailing-stop width for every profitable
+position (see the REPLACES-THE-TRAIL arithmetic below), so this is not a free fix
+— it is buying arming discipline with give-back. **n=0 at the current K.**
+Re-examine after the first 2–3 armings that actually occur at 0.75.
 
 Note K=0.75 < `BREAKEVEN_LOCK_ATR` = 1.0 still holds, so the floor continues to
 arm before the lock and continues to supersede it.
@@ -1134,6 +1146,10 @@ reached 0.50 ATR." **That is wrong, and the log disproves it:**
 * Run from entry 7674.25 to water 7781.50 = 107.25 pts = **1.52 ATR** — past the
   0.50 floor threshold *and* past the 1.0 lock threshold. The lock arming at all
   is itself proof the run exceeded 0.50 ATR.
+* Same estimated-entry caveat as NQU26, but it does not change this conclusion:
+  7674.25 is the adopted estimate and the true fill is **7635.75**, which makes
+  the run **2.06 ATR**, further past both thresholds rather than nearer. (It does
+  change the P&L: **+$1,512.50** realized, not the −$412.50 the estimate implies.)
 
 The floor was blocked by **Guard 2 (never arm through the market)**, not by the
 threshold. Its level would have been 7781.50 − 0.50 × 70.60 = **7746.20**, already
@@ -1230,8 +1246,14 @@ causation correct.
 
 ## performance_analyzer.py reads `trades.log*` only — futures are in no ledger
 
-**Status: OPEN, specced 2026-09-02. NOT the low-risk additive change it looks
-like** — see "Why this is not additive" below before scoping it.
+**Status: OPEN, specced 2026-09-02.**
+
+**Do not scope this as "low risk — additive only, no existing data changes."**
+That was the first reading and it is wrong on all three clauses: the analyzer
+would compute futures P&L with no multiplier (wrong numbers, not absent ones), it
+would change existing equity aggregates by merging a second instrument into them,
+and it would retire live futures entries as stale. See "Why this is not additive"
+below before scoping it.
 
 `TRADES_GLOB = config.TRADE_LOG_FILE + "*"` resolves to `trades.log*`, so
 `futures_trades.log*` is never parsed. Every futures round-trip the bot has ever
@@ -1310,11 +1332,15 @@ Widening the glob alone would write **wrong numbers**, silently:
 
 ### Suggested shape
 
-A separate `futures_trade_ledger.json` and a separate report section, not a
-merged ledger — that answers "how is the futures book doing" and "does the water
-floor work on futures" without corrupting the equity aggregates in (2) and (3).
-Point (1) is required either way and should land first, since it is the one that
-produces confidently wrong dollars.
+A **separate** `futures_trade_ledger.json` and a **separate** report section, not
+a merged ledger — that answers "how is the futures book doing" and "does the
+water floor work on futures" without corrupting the equity aggregates in (2) and
+(3). Point (1) is required either way and should land first, since it is the one
+that produces confidently wrong dollars.
+
+**This is not a quick add-on. Scope it properly** — five distinct problems, only
+one of which is the glob itself. The one-line version of this item ("also read
+futures_trades.log*") is the version that ships wrong numbers.
 
 Cross-refs: `docs/profit-floor-analysis.md` "Water floor — observed behavior"
 (the scoreboard's futures row is the row the report cannot see);
