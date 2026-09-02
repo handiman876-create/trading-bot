@@ -130,6 +130,69 @@ they must agree to the cent.
 `entry_price` is the breakeven lock, which leaves that flag `false`. Do not read
 `false` as "unprotected".
 
+### Futures bootstrap watch
+
+```bash
+grep "STOP BOOTSTRAP" ~/trading-bot/logs/futures_bot.log | grep "$(date +%Y-%m-%d)"
+```
+
+**Empty output is the healthy result.**
+
+If this appears for a futures symbol, a new **estimated entry** was created
+outside the normal entry path. Treat it as an adopted-entry situation: the stop
+record anchors on the **live price at adoption, not the true fill**, because
+TradeStation reports `cost_basis`/TotalCost as MARGIN for futures and
+`_bootstrap_stop` refuses it. Every entry-anchored feature — profit floor,
+breakeven lock, water floor, run-length-at-arming, and the exit P&L — then reads
+from the wrong basis.
+
+The three legacy corrections (ES **+$1,925**, NQ **−$8,555**, RTY **−$2,355**)
+are **resolved** — all three legs exited 2026-08-30/09-01 and reconciled exactly;
+true book −$2,482.50, not the +$6,502.50 reported. See `docs/backlog.md`, "The
+whole futures book at true fills". **Any new STOP BOOTSTRAP starts fresh** — those
+corrections do not apply to it, and it needs its own row computed from
+`futures_trades.log*` before that log rotates.
+
+Two gotchas:
+
+- **`date +%Y-%m-%d` only lines up because this host and `futures_bot.log` are
+  both UTC.** If either changes, the second grep silently matches nothing and the
+  check passes for the wrong reason. Note the trade logs are **EDT**, so the same
+  substitution is wrong there.
+- **`futures_bot.log` holds one day.** This is the daily check; for "has it *ever*
+  fired", the live log alone will lie —
+
+  ```bash
+  zcat -f ~/trading-bot/logs/futures_bot.log* | grep "STOP BOOTSTRAP"
+  ```
+
+  `zcat -f` passes plain files through, so one glob covers the live log, `.1`, and
+  every `.gz`. Do **not** reach for `futures_bot.log*[!z]` to mean "the
+  uncompressed ones" — it requires a character after `.log` and therefore skips
+  the live log, which is the file most likely to hold today's hit.
+
+  As of 2026-09-02 this returns **nothing**, and that is not evidence the
+  bootstrap never ran: the 2026-08-24 ESU26/NQU26/RTYU26 bootstrap has **already
+  aged out of all 7 rotations.** The durable record is the table in
+  `docs/backlog.md`, not the logs.
+
+The durable state check, independent of log rotation — a bootstrapped record
+carries the flag for as long as the position is open:
+
+```bash
+python3 -c "
+import json
+d = json.load(open('/root/trading-bot/data/stop_prices.futures.json'))
+bad = {k: v for k, v in d.items() if v.get('bootstrapped')}
+print(f'{len(d)} futures stop record(s), {len(bad)} with an ESTIMATED entry')
+for k, v in bad.items():
+    print(' ', k, 'entry_price', v.get('entry_price'), '<- live price at adoption, NOT the fill')
+"
+```
+
+`{}` means flat, which is also why `cat` is the wrong tool here — same trap as the
+options file below.
+
 ### Options Positions Check
 
 ```bash
