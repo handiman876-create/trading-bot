@@ -605,11 +605,17 @@ BREAKEVEN_LOCK_ATR    = 1.0    # favorable excursion (in entry-ATRs) required to
 #       was never in play. Price gapped 2.62 THROUGH the 361.79 stop. A floor
 #       that arms 0.14 ATR above the market on a barely-established run is a
 #       coin-flip on the next tick, not protection.
-#   NQU26 long, 1.37 ATR run -> armed 06:06:37, exited 06:13:46 at +$8,520 on a
-#       trail of 28,307 that could never have fired. The floor was the ONLY path
-#       to that realisation. K=0.5 was RIGHT here.
-# At K=0.75 TSLA (0.64 ATR) never arms and stays on the trail; NQU26 (1.37 ATR)
-# still arms and still banks the run. The knob separates the two cases cleanly.
+#   NQU26 long -> armed 06:06:37, exited 06:13:46. CORRECTED 2026-09-02: the bot
+#       armed off `entry 29118.75`, which was the pre-arming STOP; the true fill
+#       (futures_trades.log, 2026-08-06) is 29546.50. So the run was 0.52 ATR,
+#       NOT 1.37, and the result was -$35.00 realised, NOT +$8,520 (that figure
+#       was exit-minus-old-stop, a counterfactual booked as P&L). This leg is a
+#       SECOND premature arming, not a counter-example.
+# At K=0.75 TSLA (0.64 ATR) never arms and stays on the trail. NQU26 (0.52 ATR)
+# would not have armed either -- the "it still banks the run" claim was false,
+# built on the wrong entry. Every K=0.50 arming on record was premature, which
+# supports raising K but does NOT establish 0.75 as the right level: K=0.75 has
+# never armed anything. See docs/backlog.md "Monitor K=0.5 effect on TSLA".
 # This raises the give-back allowance on every winner by 0.25*ATR — see the
 # REPLACES-THE-TRAIL section below; that is the price being paid deliberately.
 #

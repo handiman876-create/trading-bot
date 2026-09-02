@@ -1062,23 +1062,48 @@ realized loss. That is the failure case as written.
 **K=0.75 verdict on this case: would NOT have armed.** Arming needs `run > K`, and
 the run was 0.64 ATR. TSLA stays on the trail and stays open. ✅
 
-### The opposite case, same day — NQU26 says K=0.50 was RIGHT there
+### ~~The opposite case, same day — NQU26 says K=0.50 was RIGHT there~~
 
-**NQU26 long x1 @ entry 29118.75:**
+**RETRACTED 2026-09-02. There was no opposite case.** Both numbers in this
+section were derived from a wrong entry price, and with the true fill NQU26 is
+not a counter-example to TSLA — it is a second instance of the same failure.
 
-| fact | value |
-|---|---|
-| Run at arming | **1.37 ATR** — well established |
-| Floor armed | 06:06:37, stop 29118.75 → 29555.16 |
-| Exited | 06:13:46, fill **29544.75** (slippage +5.00) |
-| Realized | **+$8,520** (426.00 pts × $20/pt) |
-| Trail | **28,307.22** — could never have fired |
+**NQU26 long x1. The bot armed off `entry 29118.75`, which was the position's
+pre-arming STOP, not its entry.** The real fill is in `futures_trades.log`:
+`BUY` 2026-08-06 18:31:29 EDT @ **29546.50**. The bot's own log line records the
+error verbatim — `on a 1.37 ATR run from entry 29118.75`.
 
-The floor was the **only** path to that realization. Keeping K=0.50 for its own
-sake was never the question; the question was whether 0.50 arms too early.
+| fact | as recorded | corrected (true entry 29546.50) |
+|---|---|---|
+| Run at arming | 1.37 ATR | **0.52 ATR** — (29804.75 − 29546.50) / 499.18 |
+| Floor armed | 06:06:37, stop 29118.75 → 29555.16 | unchanged (arming was still correct: 29555.16 is 8.66 pts above the true entry) |
+| Exited | 06:13:46, fill 29544.75 (slippage +5.00) | unchanged |
+| Realized | +$8,520 (426.00 pts) | **−$35.00** (−1.75 pts × $20) |
+| Trail | 28,307.22 — could never have fired | unchanged |
 
-**At K=0.75 NQU26 still arms** (1.37 > 0.75) and still banks the run. The knob
-separates the two cases cleanly — which is the whole argument for moving it.
+The +$8,520 was `exit − 29118.75`, i.e. the exit measured against the old stop:
+a counterfactual, booked as realized P&L. Cross-checked by the per-leg
+adopted-entry corrections already on file — ES +$1,925 / NQ **−$8,555** /
+RTY −$2,355 — and $8,520 − $8,555 = −$35.
+
+**What this does to the K argument.** The resolution below is built on "0.64 ATR
+was too early, 1.37 ATR was correct, so K=0.75 separates them." On true entries
+**both legs armed in the same 0.5–0.65 ATR band and both ended at a scratch or a
+small loss** (TSLA −$99.75, NQU26 −$35.00). There is no well-established-run
+success in this sample.
+
+Two consequences, and they point in opposite directions:
+
+* **Raising K is better supported, not worse.** Every K=0.50 arming on record was
+  premature; none banked a run.
+* **The specific claim "at K=0.75 NQU26 still arms" is FALSE.** 0.52 < 0.75 — it
+  would not have armed. K=0.75 was chosen partly to preserve a case that never
+  existed, so nothing here argues 0.75 is the *right* stopping point rather than
+  simply *higher*. The first genuine test is still ahead: **K=0.75 has never
+  armed anything.**
+
+Do not re-derive a K from this sample. See "performance_analyzer.py reads
+`trades.log*` only" for why these legs were never checked against a ledger.
 
 ### The verdict
 
@@ -1200,3 +1225,98 @@ knob), `test_water_floor.py::test_armed_water_floor_ALWAYS_dominates_the_atr_tra
 point 6 — still OPEN, so a floor armed on a position closed by the friday rule or
 an EMA exit stays invisible to the weekly report; engagement understated,
 causation correct.
+
+---
+
+## performance_analyzer.py reads `trades.log*` only — futures are in no ledger
+
+**Status: OPEN, specced 2026-09-02. NOT the low-risk additive change it looks
+like** — see "Why this is not additive" below before scoping it.
+
+`TRADES_GLOB = config.TRADE_LOG_FILE + "*"` resolves to `trades.log*`, so
+`futures_trades.log*` is never parsed. Every futures round-trip the bot has ever
+closed is absent from `data/trade_ledger.json`, from
+`logs/performance_report.{json,txt}` and from every floor/lock section. The
+futures bot has been trading since 2026-07-21 and has closed four legs.
+
+The immediate cost is that the **water floor cannot reach a verdict**. It needs 3
+caused exits; equities supply 2 (TSLA 09-01, GOOGL 09-02) and NQU26 09-01 is the
+third, sitting in `futures_trades.log` where nothing reads it.
+
+### FIRST — a number that has been wrong in three places, now corrected
+
+This item was originally written as "water floor verdict needs NQU26 (+$8,520)".
+**NQU26 did not make +$8,520. It made −$35.00.** Recomputed from the fills:
+
+| | |
+|---|---|
+| Entry | 2026-08-06 18:31:29 EDT, `BUY` NQU26 x1, fill **29546.50** (signal 29567.00, slippage −20.50) |
+| Exit | 2026-09-01 02:13:47 EDT, `SELL` x1, fill **29544.75** (signal 29549.75, slippage +5.00) |
+| Points | **−1.75** |
+| Realized | −1.75 × $20 = **−$35.00** |
+
+The +$8,520 was `(29544.75 − 29118.75) × 20` = 426 points × $20 — the exit
+measured against the **old stop level**, not against the entry. That is a
+"room given up vs trail" style counterfactual, and this repo's own house rule is
+that such a figure is **not a realized gain**. It was recorded as one.
+
+Independent confirmation: the per-leg adopted-entry corrections already on file
+are ES +$1,925 / NQ **−$8,555** / RTY −$2,355, and $8,520 − $8,555 = −$35. The
+correction was sitting right next to the wrong number the whole time.
+
+The floor itself behaved correctly — it armed at 29555.16, which is 8.66 points
+**above** the 29546.50 entry, so it was holding a genuine (small) profit. The
+signal fired at 29549.75 and the fill came back 5.00 points worse at 29544.75,
+below entry. **Slippage, not the floor, is why this leg is red.**
+
+### What including futures actually does to the verdict
+
+Measured by running `_water_floor_stats` over the real equity trips plus NQU26:
+
+| population | caused | realized | winners | capture | verdict |
+|---|---|---|---|---|---|
+| equities only (today) | 2 | +$797.65 | 1/2 | 27.2% | INSUFFICIENT DATA |
+| **+ futures, true −$35.00** | **3** | **+$762.65** | **1/3** | 23.9% | **NEUTRAL** |
+| + futures, wrong +$8,520 | 3 | +$9,317.65 | 2/3 | 292% | *HELPING* |
+
+**Reaching n=3 does not validate the feature — it returns NEUTRAL.** The whole
+apparent positive case was one mislabeled counterfactual, and a capture ratio of
+292% (banking three times the best the trade ever was) is the tell that should
+have caught it. Do not scope this item as "unlock the verdict"; scope it as
+"stop flying blind on a third of the book".
+
+### Why this is not additive
+
+Widening the glob alone would write **wrong numbers**, silently:
+
+1. **No futures multiplier anywhere in the analyzer.** `_pnl()` has
+   `OPTION_MULTIPLIER = 100` and nothing else, so NQU26 would book
+   `(29544.75 − 29546.50) × 1` = **−$1.75 instead of −$35.00**, a 20× error. The
+   multipliers exist in `config.FUTURES_SPECS` (ES/RTY 50, NQ 20, YM 5) but the
+   analyzer never reads them. Three computations need it, not one — `_pnl`,
+   `room_given_up`, and `peak_excursion` (already visible above: NQU26's peak
+   comes out $258.25 instead of $5,165).
+2. **Feature attribution collides.** `long_fresh_cross` is emitted by both bots,
+   so futures legs would silently merge into equity feature stats and move the
+   `MIN_TRADES_FOR_STATS` gate on aggregates that are no longer one instrument.
+3. **The SPY benchmark stops meaning anything** compared against a notional
+   futures book.
+4. **Broker reconcile is account-scoped.** `_broker_positions()` reads the
+   equities account; futures live in a separate sim account, so every open
+   futures entry would look stale and be retired.
+5. **`ESU26` carries an estimated adopted entry** in the stop machinery (7674.25)
+   while the trade log has the real fill (7635.75) — +$1,512.50 realized, not the
+   −$412.50 the estimate implies. Ingest must prefer the logged fill.
+
+### Suggested shape
+
+A separate `futures_trade_ledger.json` and a separate report section, not a
+merged ledger — that answers "how is the futures book doing" and "does the water
+floor work on futures" without corrupting the equity aggregates in (2) and (3).
+Point (1) is required either way and should land first, since it is the one that
+produces confidently wrong dollars.
+
+Cross-refs: `docs/profit-floor-analysis.md` "Water floor — observed behavior"
+(the scoreboard's futures row is the row the report cannot see);
+"Monitor K=0.5 effect on TSLA" (line 1035) — its NQU26 column uses the same
++$8,520 figure and is corrected here.

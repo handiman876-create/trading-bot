@@ -20,7 +20,7 @@ because only the second number moves a verdict:
 |---|---|---|---|
 | profit-floor ladder | 3 (AVGO, CRWV, GOOGL) | **1** (AVGO) | +$437.57 |
 | water floor, equities | 2 (TSLA, GOOGL) | **2** (TSLA, GOOGL) | +$797.65 |
-| water floor, futures | 1 (NQU26; ESU26 was guard-blocked, never armed) | **1** (NQU26) | +$8,520 |
+| water floor, futures | 1 (NQU26; ESU26 was guard-blocked, never armed) | **1** (NQU26) | **−$35.00** |
 
 Neither feature has reached `MIN_*_TRIPS_FOR_VERDICT` = 3 in the ledger the
 report reads, so **nothing below is a validated result.** The futures leg is not
@@ -306,7 +306,7 @@ later; GOOGL armed at **1.08 ATR** and held for a day. At K=0.75 TSLA never arms
 Three claims that sound right and are not:
 
 1. **It is not the first water-floor-caused exit.** TSLA (equities, 09-01,
-   −$99.75) and NQU26 (futures, 09-01, +$8,520) both preceded it. GOOGL is the
+   −$99.75) and NQU26 (futures, 09-01, −$35.00) both preceded it. GOOGL is the
    **third** water-floor-caused exit overall and the **second** on equities. What
    is genuinely first: it is the first water-floor-caused exit that was a
    **winner on equities**, and the first where the floor was demonstrably the
@@ -351,9 +351,22 @@ analyzer also forgot to add them to the test's literal. Rewritten to drive
 fifth stop source is now covered by adding it to the tuple.
 
 **Still open:** the futures ledger. `TRADES_GLOB` reads `trades.log*` only, so
-NQU26's +$8,520 water-floor exit is in `futures_trades.log` and in **no ledger and
-no report** — the largest single piece of evidence this feature has produced is
-invisible to the thing that judges it. That is why the scoreboard above has a
-futures row the report cannot see, and it is the binding constraint on reaching a
-verdict: the water floor is at 2 of 3 caused exits on equities and would be at 3
-of 3 if futures were counted.
+NQU26's water-floor exit is in `futures_trades.log` and in **no ledger and no
+report**, which is why the scoreboard above has a futures row the report cannot
+see. Backlogged as "performance_analyzer.py reads `trades.log*` only".
+
+**And a warning about what that invisibility cost.** This section originally
+recorded NQU26 as **+$8,520** — the figure carried in the backlog, in
+`config.py`'s WATER_FLOOR_K commentary, and in the reasoning that set K=0.75.
+It is wrong. The true realized P&L is **−$35.00**: the entry used throughout was
+29118.75, which was the position's *pre-arming stop*, while the actual fill was
+29546.50. +$8,520 was `exit − old stop`, a counterfactual booked as P&L, and the
+same bad entry inflated the run at arming from **0.52 ATR to 1.37 ATR**.
+
+The consequence for this file's argument: including futures does **not** unlock a
+positive verdict. Measured, `_water_floor_stats` returns **NEUTRAL** at 3 caused
+exits (+$762.65 net, 1 winner of 3, 23.9% capture) — where the wrong figure would
+have returned *HELPING* on a 292% capture ratio, which is the tell that a trade
+cannot bank three times its own best excursion. A number no ledger ever checked
+survived into three documents and a config decision. That is the real cost of the
+glob, more than the missing count.
