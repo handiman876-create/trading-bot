@@ -317,3 +317,60 @@ checked between candidates, so the last one can cross it).
 
 Nightly run is 03:00 ET (`--fast-only`). The momentum screen shares ONE free
 Polygon key with it — keep their schedules non-overlapping.
+
+## Monthly: S&P 500 Constituent Refresh
+
+`data/sp500.json` is the momentum-screen **universe** — the 503 names
+`momentum_screen.py` ranks. It is a **vendored file**, not a live API lookup, so
+it only changes when something rewrites it.
+
+**This is now automated.** `sp500-refresh.timer` runs monthly on the 1st at
+05:30 ET, 30 minutes before `momentum-rotation.timer` (06:00 ET on the 1st and
+15th), so the 1st-of-month rotation always screens the current index. Both are
+pre-market, so the swap never lands mid-session. Source is
+`constituents.csv` on GitHub — **not Polygon**, so it spends none of the shared
+5-calls/min free-tier budget.
+
+To run it by hand (safe any time — it shares `momentum.lock` with the screen, so
+it cannot race a rotation):
+
+```bash
+python3 refresh_sp500.py --dry-run   # print the symbol diff, write nothing
+python3 refresh_sp500.py             # rewrite data/sp500.json
+```
+
+### Why this needed automating
+
+Before 2026-09-03 there was **no schedule at all**: the file had sat unchanged
+since **2026-07-14**, and every index change in those ~7 weeks was invisible to
+the momentum screen. Nothing warned about it — `MOMENTUM_MAX_AGE_DAYS` guards
+`momentum_watchlist.json` (the generated slot), **not** the universe file, which
+has no staleness check whatsoever. The refresh on 2026-09-03 found the drift was
+`+3 / -3`:
+
+| | Symbols | Screenable? |
+|---|---|---|
+| added | `FERG`, `RDDT`, `VMRK` | FERG (Industrials) + RDDT (Communication Services) yes; VMRK is a Real Estate REIT, so `EXCLUDED_SECTORS` blocks it |
+| removed | `AVB`, `EA`, `EQR` | AVB/EQR were Real Estate, already excluded — only `EA` was a real loss of a screenable name |
+
+So the practical effect of 7 weeks of staleness was **two** newly screenable
+names missed and one stale one carried. That's the expected magnitude — index
+changes are rare, which is why monthly (not twice-monthly) is sufficient and the
+15th rotation screening a ≤2-week-old universe is an acceptable window.
+
+### Checks
+
+```bash
+systemctl list-timers sp500-refresh.timer --all   # NEXT should be the 1st, 05:30 ET
+grep sp500-refresh logs/momentum.log | tail -4    # START/END + exit code
+python3 -c "
+import json; d = json.load(open('/root/trading-bot/data/sp500.json'))
+print('count :', d['count']); print('source:', d['source'])
+"
+```
+
+A failed fetch **exits non-zero and leaves the old file in place** — the stale
+file is the graceful degradation, but the unit must go FAILED so it is visible.
+A timer showing green with a rotting universe file is the failure mode this
+whole section exists to prevent. `count` is expected to be **503**, not 500: three
+companies carry dual share classes (`GOOGL`/`GOOG`, `FOXA`/`FOX`, `NWSA`/`NWS`).

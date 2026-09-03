@@ -17,6 +17,8 @@ install -m 0644 sentiment-analysis.service   /etc/systemd/system/sentiment-analy
 install -m 0644 sentiment-analysis.timer     /etc/systemd/system/sentiment-analysis.timer
 install -m 0644 screen-ab-tracker.service    /etc/systemd/system/screen-ab-tracker.service
 install -m 0644 screen-ab-tracker.timer      /etc/systemd/system/screen-ab-tracker.timer
+install -m 0644 sp500-refresh.service        /etc/systemd/system/sp500-refresh.service
+install -m 0644 sp500-refresh.timer          /etc/systemd/system/sp500-refresh.timer
 
 echo "Installing logrotate config..."
 install -m 0644 logrotate-trading-bot /etc/logrotate.d/trading-bot
@@ -45,3 +47,9 @@ echo "A/B screen tracker (observation only — never feeds the live bot) is inst
 echo "but NOT enabled. It runs 1st & 15th 07:00 ET, one hour after the live screen."
 echo "  systemctl enable --now screen-ab-tracker.timer            # schedule 1st & 15th 07:00 ET"
 echo "  systemctl start screen-ab-tracker.service                 # run once now (optional)"
+echo
+echo "S&P 500 constituent refresh rewrites the momentum-screen universe"
+echo "(data/sp500.json). It runs monthly, 1st at 05:30 ET — 30 min BEFORE"
+echo "momentum-rotation, so that rotation screens the current index."
+echo "  systemctl enable --now sp500-refresh.timer                # schedule monthly 1st 05:30 ET"
+echo "  systemctl start sp500-refresh.service                     # run once now (optional)"

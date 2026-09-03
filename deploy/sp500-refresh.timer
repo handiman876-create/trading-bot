@@ -1,0 +1,24 @@
+[Unit]
+Description=Refresh the S&P 500 constituent list monthly, on the 1st at 05:30 America/New_York
+
+[Timer]
+# Monthly, 1st at 05:30 Eastern. The time is NOT arbitrary: momentum-rotation
+# runs 06:00 Eastern on the 1st and 15th, and it reads the file this unit
+# writes. Refreshing 30 min ahead means the 1st-of-month rotation screens the
+# CURRENT index; ordering it the other way would have every rotation screen a
+# universe one cycle stale. Both are pre-market, so the swap never lands
+# mid-session. The America/New_York suffix tracks EST/EDT automatically.
+#
+# Monthly (not twice-monthly) is deliberate: S&P constituent changes are rare —
+# the 2026-07-14 -> 2026-09-03 diff over ~7 weeks was +3/-3. The 15th rotation
+# screening a universe up to two weeks old is an acceptable staleness window;
+# a 7-week one was not.
+OnCalendar=*-*-01 05:30:00 America/New_York
+# If the machine was off at the scheduled time, run once at next boot rather
+# than skipping the month entirely and letting the file rot until the next.
+Persistent=true
+# Small jitter so it isn't hitting GitHub at exactly :30.
+RandomizedDelaySec=120
+
+[Install]
+WantedBy=timers.target

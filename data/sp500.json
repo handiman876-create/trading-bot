@@ -44,7 +44,6 @@
     "ARE",
     "ARES",
     "ATO",
-    "AVB",
     "AVGO",
     "AVY",
     "AWK",
@@ -151,7 +150,6 @@
     "DVA",
     "DVN",
     "DXCM",
-    "EA",
     "EBAY",
     "ECHO",
     "ECL",
@@ -165,7 +163,6 @@
     "EMR",
     "EOG",
     "EQIX",
-    "EQR",
     "EQT",
     "ERIE",
     "ES",
@@ -187,6 +184,7 @@
     "FDX",
     "FDXF",
     "FE",
+    "FERG",
     "FFIV",
     "FICO",
     "FIS",
@@ -387,6 +385,7 @@
     "Q",
     "QCOM",
     "RCL",
+    "RDDT",
     "REG",
     "REGN",
     "RF",
@@ -470,6 +469,7 @@
     "VLO",
     "VLTO",
     "VMC",
+    "VMRK",
     "VRSK",
     "VRSN",
     "VRT",
@@ -662,8 +662,8 @@
       "sub_industry": "Asset Management & Custody Banks"
     },
     "APP": {
-      "sector": "Information Technology",
-      "sub_industry": "Application Software"
+      "sector": "Communication Services",
+      "sub_industry": "Advertising"
     },
     "APTV": {
       "sector": "Consumer Discretionary",
@@ -680,10 +680,6 @@
     "ATO": {
       "sector": "Utilities",
       "sub_industry": "Gas Utilities"
-    },
-    "AVB": {
-      "sector": "Real Estate",
-      "sub_industry": "Multi-Family Residential REITs"
     },
     "AVGO": {
       "sector": "Information Technology",
@@ -1022,8 +1018,8 @@
       "sub_industry": "Specialized Consumer Services"
     },
     "DD": {
-      "sector": "Materials",
-      "sub_industry": "Specialty Chemicals"
+      "sector": "Industrials",
+      "sub_industry": "Industrial Conglomerates"
     },
     "DDOG": {
       "sector": "Information Technology",
@@ -1109,10 +1105,6 @@
       "sector": "Health Care",
       "sub_industry": "Health Care Equipment"
     },
-    "EA": {
-      "sector": "Communication Services",
-      "sub_industry": "Interactive Home Entertainment"
-    },
     "EBAY": {
       "sector": "Consumer Discretionary",
       "sub_industry": "Broadline Retail"
@@ -1164,10 +1156,6 @@
     "EQIX": {
       "sector": "Real Estate",
       "sub_industry": "Data Center REITs"
-    },
-    "EQR": {
-      "sector": "Real Estate",
-      "sub_industry": "Multi-Family Residential REITs"
     },
     "EQT": {
       "sector": "Energy",
@@ -1252,6 +1240,10 @@
     "FE": {
       "sector": "Utilities",
       "sub_industry": "Electric Utilities"
+    },
+    "FERG": {
+      "sector": "Industrials",
+      "sub_industry": "Building Products"
     },
     "FFIV": {
       "sector": "Information Technology",
@@ -2053,6 +2045,10 @@
       "sector": "Consumer Discretionary",
       "sub_industry": "Hotels, Resorts & Cruise Lines"
     },
+    "RDDT": {
+      "sector": "Communication Services",
+      "sub_industry": "Interactive Media & Services"
+    },
     "REG": {
       "sector": "Real Estate",
       "sub_industry": "Retail REITs"
@@ -2385,6 +2381,10 @@
       "sector": "Materials",
       "sub_industry": "Construction Materials"
     },
+    "VMRK": {
+      "sector": "Real Estate",
+      "sub_industry": "Multi-Family Residential REITs"
+    },
     "VRSK": {
       "sector": "Industrials",
       "sub_industry": "Research & Consulting Services"
@@ -2521,6 +2521,6 @@
   "count": 503,
   "source": "github.com/datasets/s-and-p-500-companies (constituents.csv)",
   "sectors_source": "github.com/datasets/s-and-p-500-companies (constituents.csv)",
-  "as_of": "2026-07-14",
+  "as_of": "2026-09-03",
   "note": "S&P 500 membership + GICS sector/sub-industry snapshot; refresh quarterly with refresh_sp500.py. Universe + sector filter source for momentum_screen.py."
 }
