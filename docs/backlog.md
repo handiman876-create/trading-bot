@@ -1380,3 +1380,25 @@ Cross-refs: `docs/profit-floor-analysis.md` "Water floor — observed behavior"
 (the scoreboard's futures row is the row the report cannot see);
 "Monitor K=0.5 effect on TSLA" (line 1035) — its NQU26 column uses the same
 +$8,520 figure and is corrected here.
+
+---
+
+## Futures stale-bullish: cross-sustain untested
+
+**Observed 2026-09-03:** ES has been EMA9 > EMA21
+continuously since 2026-08-26 (8,043+ samples,
+zero bearish crossings). The futures entry path
+requires a FRESH cross — a position adopted before
+the water floor shipped (ESU26) exited, and ES
+cannot re-enter until EMA9 first crosses bearish
+then bullish again.
+
+**Consequence:** The 30-min futures cross-sustain
+parameter is untested in production.
+
+**No action needed** unless ES remains flat for
+weeks — the signal is working as designed. Worth
+monitoring: if ES dips and crosses bearish, watch
+for SUSTAIN PENDING in futures_bot.log.
+
+**Priority:** LOW (monitoring only)
