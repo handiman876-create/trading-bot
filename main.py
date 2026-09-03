@@ -36,6 +36,7 @@ import fcntl
 import logging
 import signal
 import threading
+import time
 
 import trade_logger  # noqa: F401 – configures logging as side-effect
 import config
@@ -52,12 +53,23 @@ logger = logging.getLogger("bot")
 
 _shutdown = threading.Event()
 
-# Cycles abandoned because the positions fetch failed (see _run_cycle). Counted
+# Cycles abandoned because the positions fetch failed (see _evaluate_cycle). Counted
 # so the banner can report whether the guard is still firing; _consecutive is
 # tracked separately because a sustained outage is a different problem from an
 # isolated blip and should be louder.
 _positions_fetch_failures = 0
 _positions_fetch_consecutive = 0
+
+# Per-cycle work counters. Reset by _run_cycle, incremented BEFORE each evaluate
+# call, and read by its single timing log line. Incrementing first is what makes
+# a partial cycle legible: if a broker-side throttle stalls the run, the count
+# says how many symbols got through rather than reporting zero.
+#
+# These measure ATTEMPTED evaluations, not successful ones — each loop catches
+# its own exceptions and continues, so a symbol that errored still counted as
+# work (it consumed the API call and the wall-clock).
+_cycle_symbols = 0
+_cycle_options = 0
 
 # Consecutive skips before the log escalates WARNING -> ERROR. At a 60s poll,
 # 3 skips is ~3 minutes with no stop enforcement (stops are bot-managed, so an
@@ -103,6 +115,31 @@ def _handle_signal(signum, frame):
 
 
 def _run_cycle(account_id: str) -> None:
+    """Time one evaluation pass and log what it cost, then hand off to
+    _evaluate_cycle for the actual work.
+
+    ONE log site, in a `finally`, deliberately: _evaluate_cycle has three exits
+    (skipped cycle on a failed positions fetch, the futures early return, and
+    the equities fall-through) and the caller catches its exceptions. Logging at
+    each exit would be four sites drifting apart; this way every cycle emits
+    exactly one timing line, including the ones that fail.
+
+    The counter is module-level rather than a return value so a cycle that
+    raises PART WAY THROUGH the symbol loop still reports how far it got — the
+    exact signal a broker-side throttle would produce.
+    """
+    global _cycle_symbols, _cycle_options
+    _cycle_symbols = 0
+    _cycle_options = 0
+    started = time.perf_counter()
+    try:
+        _evaluate_cycle(account_id)
+    finally:
+        logger.info("cycle work=%.3fs symbols=%d options=%d",
+                    time.perf_counter() - started, _cycle_symbols, _cycle_options)
+
+
+def _evaluate_cycle(account_id: str) -> None:
     """One evaluation pass over the active watchlist.
 
     Abandons the cycle outright when the positions fetch fails. Everything below
@@ -113,6 +150,7 @@ def _run_cycle(account_id: str) -> None:
     can fire on held=0 anyway (that is already true today). What it prevents is
     the entry paths reading held=0 as "flat" and re-entering held positions."""
     global _positions_fetch_failures, _positions_fetch_consecutive
+    global _cycle_symbols, _cycle_options
 
     positions = tc.get_positions(account_id)
     if positions is None:                     # None = fetch failed; [] = truly flat
@@ -174,6 +212,7 @@ def _run_cycle(account_id: str) -> None:
 
     if MODE == "futures":
         for root in config.FUTURES_WATCHLIST:
+            _cycle_symbols += 1
             try:
                 strategy.evaluate_future(root, account_id, positions, regime)
             except Exception as exc:
@@ -190,6 +229,7 @@ def _run_cycle(account_id: str) -> None:
     # via the normal SELL path) and _check_and_trail_stop (breakeven-floored stops),
     # so there is no separate bulk step here — the regime flows in via evaluate_stock.
     for symbol in watchlist.effective_stock_watchlist(positions):
+        _cycle_symbols += 1
         try:
             strategy.evaluate_stock(symbol, account_id, positions, equity,
                                     is_momentum=(symbol in momentum_set),
@@ -200,6 +240,7 @@ def _run_cycle(account_id: str) -> None:
 
     expiration = mh.next_monthly_expiration()
     for (symbol, opt_type) in config.OPTIONS_WATCHLIST:
+        _cycle_options += 1
         try:
             strategy.evaluate_option(symbol, expiration, opt_type,
                                      account_id, positions)
