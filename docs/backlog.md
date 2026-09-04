@@ -51,6 +51,50 @@ the log either way.
 whole failure class is "the bot believes it closed a position it did not", and
 in a live account that is real money left exposed with no one watching.
 
+## ENABLE_SHORTING = False — REQUIRED BEFORE GOING LIVE
+
+The death cross signal has produced **zero profitable exits on its own terms:
+0-for-6, -$10,598** (AMD ×2, DHR ×2, AVGO, AAPL — every short that exited on
+the EMA-bullish cover signal).
+
+All **four** short winners came from bolt-on exits, not the signal — META
++$1,505.60 (ATR trail), GOOGL +$897.40 (water floor), AVGO +$437.57 (profit
+floor), CRWV +$1,023.04 (Friday close). That is risk machinery cutting losses
+short, which is damage control working as designed, not an edge.
+
+Corroborating: -1.21% mean drift from entry to same-day close across all 14
+closed shorts, underwater at the close on 79% of them, vs +0.16% / 52% for
+longs over the same window.
+
+**See the `## SHORT_MAX_ATR_PCT` section below (line 143 as of this commit) for
+the full analysis and ledger evidence,** including the caveat that drift-to-close
+is corroboration rather than independent proof (median hold 143.7h; only 5 of 45
+trips are intraday). Search the heading, not the line number — adding this gate
+moved that section from 101 to 143.
+
+**Why this is a live gate and not just a backlog preference:** the mechanisms
+currently rescuing shorts are all paper-only. Bot-managed stops give no gap
+protection — a broker-native stop is the deferred prerequisite for going live —
+and an uncapped overnight short gap is the one loss this book cannot bound. The
+`## Earnings blackout for short entries` section below has the worked CRWD
+example.
+
+**Action:** set `ENABLE_SHORTING = False` at `config.py:397` before deploying
+live. **Estimated time: 1 line, 5 minutes** — and verified cheap, not assumed:
+
+- No test depends on the ambient value. `test_ema_gap`, `test_cross_sustain`,
+  `test_momentum_entry` and `test_exit_state` each assign
+  `strategy.config.ENABLE_SHORTING = True` in their own fixture and restore it,
+  so flipping the default cannot break them (contrast the four tests that DID
+  break when `SHORT_MIN_REGIME` was retuned — the pinning lesson was applied).
+- `test_momentum_entry.py:237` pins that **`ENABLE_SHORTING` is an ENTRY gate,
+  never a management gate.** An open short keeps its stop, floor and cover
+  logic after the flip, so this is safe to set with a position on the book — it
+  stops new shorts, it does not abandon existing ones.
+
+Revisit only if death-cross-short clears `ci_lower > 1.0` in the discovery
+pipeline. Confirmed 2026-09-04 by `entry_time_analysis.py` (`3c3f8f9`).
+
 ## A/B tracker: option IV needs an entitled Polygon key
 
 **Observed (2026-07-19):** `screen_ab_tracker.py` records `avg_iv` per screen via
