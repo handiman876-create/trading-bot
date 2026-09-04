@@ -1131,6 +1131,50 @@ position (see the REPLACES-THE-TRAIL arithmetic below), so this is not a free fi
 — it is buying arming discipline with give-back. **n=0 at the current K.**
 Re-examine after the first 2–3 armings that actually occur at 0.75.
 
+### Monitoring window EXTENDED to 2026-09-11 (checked 2026-09-04)
+
+**Decision: defer the verdict. Still n=0 armings at K=0.75, so there is nothing
+to decide on.** The 09-04 check date arrived with no new evidence, and the reason
+is a lack of eligible positions, not a lack of time.
+
+**Correction to the note above:** "K=0.75 has never run live" is now out of date.
+It *has* run live — three full sessions, each confirmed by a `Market is OPEN` line
+(09-02, 09-03, 09-04; 09-03 is in `bot.log.1`, 09-02 in the `.gz` archives). What
+remains true is the part that matters: **zero armings at 0.75.** Every
+`WATER FLOOR` arming on record is still the five 09-01 K=0.50 lines — GOOGL short
+`#1`–`#4` and TSLA long `#1` — and both the 09-03 and 09-04 startup banners report
+`WATER FLOOR (long: 0, short: 0 this process)`.
+
+The week's only candidate was META, the sole open position, read from
+`data/stop_prices.json` on 09-04:
+
+| fact | value |
+|---|---|
+| entry / `atr_at_entry` | 613.71 / 20.6878 |
+| `high_water` | **619.255** |
+| Peak run | **0.268 ATR** — 36% of the way to the threshold |
+| Water needed to arm | **629.23** (`entry + 0.75·ATR`) |
+| `water_floor_active` | **false** |
+
+This is not a near miss that a slightly lower K would have caught. The structural
+reason is in the META entry note: the fill was a gap-up cross 5.4% above EMA9, so
+the high water mark was set on the entry bar itself and the position never built a
+run to give back. A position that never travels 0.75 ATR cannot test a 0.75 ATR
+arm threshold at any K in the plausible range — even K=0.25 would not have armed
+on 0.268.
+
+**Do not read n=0 as evidence for or against 0.75.** Three quiet sessions with one
+gap-entry position say nothing about whether the level is right; they only say the
+sample has not started. Lowering K to manufacture an arming would be tuning on the
+absence of data.
+
+**New check date: 2026-09-11 (next Friday).** Same exit condition as before — the
+first 2–3 armings that actually occur at 0.75. If that date also arrives at n=0,
+the thing to question is not K but the arming *opportunity* rate: three sessions
+with a single open position, entered on a gap, is a watchlist/entry-timing
+observation, and the honest conclusion would be that this feature cannot be
+validated from live flow at the current trade frequency.
+
 Note K=0.75 < `BREAKEVEN_LOCK_ATR` = 1.0 still holds, so the floor continues to
 arm before the lock and continues to supersede it.
 
