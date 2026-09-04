@@ -339,6 +339,29 @@ def _render_rungs(steps) -> str:
     return ", ".join("%.0f%%→%.0f%%" % (t * 100, lk * 100) for t, lk in steps)
 
 
+def _shorting_banner(scope: str) -> str:
+    """The `Shorting :` banner value for one mode. `scope` names what would be
+    shortable if it were on (e.g. "effective watchlist", "ES/NQ/RTY").
+
+    A helper, not two inline branches, because `config.ENABLE_SHORTING` is
+    MODE-BLIND: strategy.py's short entry branch reads it with no
+    `is_futures_symbol` split and `_evaluate_cycle` feeds FUTURES_WATCHLIST
+    through that same branch, so the flag governs both bots and both banners
+    must say the same thing about it. Until 2026-09-04 only the equities banner
+    printed this line at all, which meant the futures bot was silently
+    long-only after `7fc9a31` with nothing on startup to say so.
+
+    The DISABLED text is deliberately one string shared by both callers: it is
+    the load-bearing sentence (open shorts still get managed), and the same
+    class of drift already bit the ENABLED parenthetical once — see the comment
+    at the equities call site.
+    """
+    if not config.ENABLE_SHORTING:
+        return ("DISABLED — long-only; no NEW short entries. ENTRY-only gate: "
+                "open shorts still trail, stop and cover normally.")
+    return "ENABLED (%s, death-cross entries)" % scope
+
+
 def main() -> None:
     _acquire_singleton_lock()          # hard-stop a second instance before any API calls
     signal.signal(signal.SIGINT,  _handle_signal)
@@ -359,6 +382,12 @@ def main() -> None:
                      for root in config.FUTURES_WATCHLIST}
         logger.info("Futures     : %s", config.FUTURES_WATCHLIST)
         logger.info("Front months: %s", contracts)
+        # Same flag, same sentence as the equities banner — see _shorting_banner.
+        # The futures book has never opened a short, so this line is expected to
+        # read DISABLED with no behaviour change behind it; it is here so that
+        # fact is visible rather than inferred from an absent line.
+        logger.info("Shorting    : %s",
+                    _shorting_banner(", ".join(config.FUTURES_WATCHLIST)))
     else:
         logger.info("Core stocks : %s (%d)", config.CORE_WATCHLIST, len(config.CORE_WATCHLIST))
         logger.info("Momentum    : %s (dynamic, %s)",
@@ -387,12 +416,7 @@ def main() -> None:
         # read "DISABLED (effective watchlist, death-cross entries)" on 2026-08-03,
         # which describes what shorting would do if it were on — and the banner is
         # what gets read as the source of truth for what the bot is doing.
-        if config.ENABLE_SHORTING:
-            logger.info("Shorting    : ENABLED (effective watchlist, death-cross entries)")
-        else:
-            logger.info("Shorting    : DISABLED — long-only; no NEW short entries. "
-                        "ENTRY-only gate: open shorts still trail, stop and cover "
-                        "normally.")
+        logger.info("Shorting    : %s", _shorting_banner("effective watchlist"))
         if config.ENABLE_SHORTING and config.ENABLE_REGIME_SHORT_FILTER:
             # DERIVED, not described. This line used to hardcode "(cautious/
             # defensive only) ... risk_on and unknown blocked ... shorts fire ONLY
