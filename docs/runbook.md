@@ -312,11 +312,50 @@ if spent == 0:
 `ci_lower > 1.0`, not on PF or score, so zero hits is the normal state until the
 generator improves. Do not treat it as breakage; `spent == 0` is the real alarm.
 
-Spend landing at or just over the `$0.50` nightly ceiling is normal (the cap is
-checked between candidates, so the last one can cross it).
+Spend landing at or just over the `$0.60` nightly ceiling is normal (the cap is
+checked between candidates, so the last one can cross it). The ceiling is read
+off the run header — `autodiscover START (n=20, cost-ceiling=$0.60, fast-only)`
+— not from this doc, which has been stale before.
 
 Nightly run is 03:00 ET (`--fast-only`). The momentum screen shares ONE free
 Polygon key with it — keep their schedules non-overlapping.
+
+#### Seasonality failure check
+
+Run after 07:30 UTC **any day** — `OnCalendar=*-*-* 03:00:00 America/New_York`
+is every day, not weekdays; the timer demonstrably fired Sat 08-29 and Sun 08-30.
+
+```bash
+awk '/autodiscover START/{buf=""} {buf=buf $0 ORS} END{printf "%s", buf}' \
+  ~/strategy-discovery/logs/autodiscover.log |
+  grep -nE "seasonality|at most 400|disallows timeframes|^DONE"
+```
+
+A clean run has **no** `at most 400` and **no** `disallows timeframes` lines, and
+always ends with the `DONE` line.
+
+**Do NOT add `| grep <date>` to this.** Only three lines in the whole log carry a
+date (`START`, the summary-saved line, `END`). The `CAND N` lines and their
+`attempt N:` errors are undated, so a dated grep returns **zero lines** and reads
+as a clean pass while the failures sit right there in the file. That is why the
+`awk` block is here: it isolates the LAST run without needing a date at all. Same
+silent-empty-grep family as the `-E` alternation trap above.
+
+Interpreting the `DONE` line:
+
+- `usable=20` is the target. Anything less means candidates failed *generation* —
+  look for `GEN-FAIL all 3 attempts failed` above it.
+- `hits=0` is still expected and healthy; `usable` counts generation, `hits`
+  counts `ci_lower > 1.0` promotions. They are different gates.
+- `reason=batch_exhausted` is the normal ending. `reason=cost_ceiling` means the
+  run stopped early on spend, which looks like a generation failure but is not —
+  check `spent=` against the header's ceiling.
+
+Background: two of 20 slots were lost to this on 2026-09-04 (`CAND 9`, `CAND 19`,
+`usable=18`). Both burned all three attempts — three failures on the 400-char
+thesis ceiling (`spec.py`, `max_length=400`) and three on `timeframes ['5m']`
+rejected by the translator. Prompt constraints added in `strategy-discovery`
+`ed38090`.
 
 ## Monthly: S&P 500 Constituent Refresh
 
