@@ -1020,6 +1020,44 @@ PERF_LOG_FILE  = f"logs/{_LOG_PREFIX}performance.log"
 # durable sink, not an alert channel.
 CRITICAL_ALERT_FILE = f"{_LOG_PREFIX}critical_alerts.log"
 
+# ── Discord push channel for CRITICAL events ──────────────────────────────────
+# The sink above is durable but silent — it only "catches" a failure when a human
+# opens the file, which is the whole gap docs/backlog.md's alerting gate
+# describes. This pushes new CRITICAL lines to a Discord webhook each cycle.
+#
+# NOT SET IN THIS FILE ON PURPOSE. A Discord webhook URL is a bearer credential:
+# anyone holding it can post to the channel. config.py is tracked and this repo
+# is public on GitHub, so putting the URL here would publish it on the next push
+# (and Discord auto-revokes URLs it finds leaked). Put it in .env, which is
+# gitignored, exactly like TS_CLIENT_SECRET:
+#     DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/...
+# Empty string = disabled, and disabled is the default so a fresh clone is inert.
+DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "")
+DISCORD_ALERT_TIMEOUT = 5        # seconds; a hung webhook must not stall a cycle
+DISCORD_ALERT_MAX_CHUNKS = 3     # per file per cycle, so a log flood cannot spam
+
+# BOTH sinks, listed explicitly rather than derived by string-munging
+# CRITICAL_ALERT_FILE. That constant already carries _LOG_PREFIX, so on the
+# futures bot it reads "futures_critical_alerts.log" — and
+# `.replace("critical_alerts.log", "futures_critical_alerts.log")` on that value
+# yields "futures_futures_critical_alerts.log", a file that never exists. The
+# push would then have looked healthy (equities covers both sinks) while the
+# futures bot pushed nothing and every futures alert double-posted.
+#
+# Both bots watch BOTH files by design: each bot only polls while ITS market is
+# open, and the two sessions differ (equities 9:30-16:00 ET, CME 18:00-17:00), so
+# cross-watching is what covers a futures alert raised while the equities bot is
+# the one awake. Duplicate pushes are prevented by the SHARED watermark below,
+# not by splitting ownership.
+CRITICAL_ALERT_SINKS = ("critical_alerts.log", "futures_critical_alerts.log")
+
+# Deliberately has NO _LOG_PREFIX: the two bots must share one watermark, or each
+# would push the other's alerts again from its own offset. Persisted rather than
+# in-memory so a restart does not lose the offset — an in-memory watermark
+# initialised to the current size silently swallows every alert written while the
+# bot was down, which is precisely when you most want to hear about one.
+DISCORD_WATERMARK_FILE = "data/alert_watermarks.json"
+
 # ── Trade-note markers ────────────────────────────────────────────────────────
 # The analyzer classifies exits by pattern-matching the free-text `notes` field
 # of a trade record. That couples a writer (whoever places the order) to a reader

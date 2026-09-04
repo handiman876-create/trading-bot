@@ -47,6 +47,7 @@ import strategy
 import sentiment_analyzer
 import watchlist
 import momentum_screen
+import discord_alerts
 from trade_logger import log_performance
 
 logger = logging.getLogger("bot")
@@ -565,10 +566,18 @@ def main() -> None:
                 "confirm (exit withheld — position may be open AND unprotected). "
                 "Both retry next cycle; a REPEATING one never self-clears. Goes "
                 "to bot.log AND %s at the repo root (never rotated — bot.log "
-                "holds ONE day and weekends produce no rotated file at all). No "
-                "push channel, so nothing pages you: check %s on Mondays. "
+                "holds ONE day and weekends produce no rotated file at all). %s "
                 "Counters: EXIT ORDER REJECTED, BROKER FLOOR stuck",
-                config.CRITICAL_ALERT_FILE, config.CRITICAL_ALERT_FILE)
+                config.CRITICAL_ALERT_FILE,
+                # DERIVED, not described. This clause read "No push channel, so
+                # nothing pages you: check <file> on Mondays" and would have
+                # become false the moment DISCORD_WEBHOOK_URL was set — the same
+                # drift that made the short-regime line contradict itself.
+                ("Discord push channel is ACTIVE, so these also page you."
+                 if config.DISCORD_WEBHOOK_URL else
+                 "No push channel, so nothing pages you: check %s on Mondays."
+                 % config.CRITICAL_ALERT_FILE))
+    logger.info("Alert push  : %s", discord_alerts.banner())
     if config.ENABLE_VIX_FILTER:
         logger.info("VIX filter  : ENABLED — %s, %ds cache; risk_on/cautious/"
                     "defensive/crisis @ <%g/%g/%g/>=%g (crisis>=%g EXTREME); "
@@ -635,6 +644,12 @@ def main() -> None:
     else:
         logger.warning("Could not retrieve account balance at startup.")
 
+    # Flush anything raised while this process was down. The watermark is
+    # persisted and shared, so this is a catch-up, not a re-send: a startup with
+    # nothing new pushes nothing. Without it, a CRITICAL logged in the final
+    # cycle before a crash or a restart would wait for the next session open.
+    discord_alerts.check_critical_alerts()
+
     while not _shutdown.is_set():
         if not _clock.is_market_open():
             _wait_for_market_open()
@@ -651,6 +666,11 @@ def main() -> None:
             except Exception as exc:
                 logger.exception("Unexpected error in run cycle: %s", exc)
 
+            # AFTER the cycle and OUTSIDE its try, so a cycle that died holding a
+            # position still gets its CRITICAL pushed — that failure mode is
+            # exactly when the alert matters most.
+            discord_alerts.check_critical_alerts()
+
             # Wait for POLL_INTERVAL, waking early on shutdown
             remaining = config.POLL_INTERVAL
             while remaining > 0 and not _shutdown.is_set():
@@ -662,6 +682,10 @@ def main() -> None:
                     break
 
         if not _shutdown.is_set():
+            # Last chance before a long sleep: the inner loop can exit on the
+            # close between a CRITICAL being logged and the next push check, and
+            # the futures bot then sleeps until Sunday 18:00 ET.
+            discord_alerts.check_critical_alerts()
             logger.info("Market CLOSED for the day. Bot going to sleep.")
 
     logger.info("Bot shut down cleanly.")

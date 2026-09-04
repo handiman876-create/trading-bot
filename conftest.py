@@ -54,6 +54,14 @@ config.PERF_LOG_FILE  = os.path.join(_LOG_TMPDIR, "performance.log")
 # human reads to decide whether the bot is in trouble, so a fabricated fixture
 # CRITICAL landing there is worse than one landing in bot.log.
 config.CRITICAL_ALERT_FILE = os.path.join(_LOG_TMPDIR, "critical_alerts.log")
+# The Discord watermark follows the sinks into the tmpdir. It is deliberately
+# UNPREFIXED in production (both bots share one offset), so without this a test
+# run would read and rewrite the live bots' watermark — and a test that advanced
+# it past a real un-pushed CRITICAL would silently consume that alert.
+config.DISCORD_WATERMARK_FILE = os.path.join(_LOG_TMPDIR, "alert_watermarks.json")
+# Belt and braces: no test may ever reach the network here. Every test that
+# exercises pushing sets this itself and restores it.
+config.DISCORD_WEBHOOK_URL = ""
 
 
 def _redirect_existing_log_handlers() -> int:
