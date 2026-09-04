@@ -151,6 +151,46 @@ adding a third ATR%-of-price constant beside the two that exist.
 **Prerequisite:** let `SHORT_MIN_REGIME` run 2-4 weeks first and gather actual
 cautious-regime short data. Revisit only with pipeline evidence.
 
+### CONFIRMED 2026-09-04 by `entry_time_analysis.py` — recommend disabling before live
+
+The "fails unconditionally" branch above is now the measured one. Over all 14
+closed shorts in the ledger (2026-07-17..08-28), entry price vs the same-day
+close: **-1.21% mean drift against the position, underwater at the close on
+79% of entries (11 of 14).** Longs over the same window are a coin flip
+(+0.16% mean, 52% in favour), so this is the short side specifically, not a
+market-direction artefact and not an entry-timing one — the drift is flat
+across the 09:xx / 10:xx / 11:xx+ entry buckets.
+
+**All four short winners came from bolt-on exits, none from the signal:**
+
+| exit | symbol | P&L | mechanism |
+|---|---|---|---|
+| `stop` | META 07-28 | +$1,505.60 | ATR trail |
+| `stop` | GOOGL 08-13 | +$897.40 | water floor (`water_caused_exit`) |
+| `stop` | AVGO 08-19 | +$437.57 | profit floor (`floor_caused_exit`) |
+| `friday_short_close` | CRWV 08-28 | +$1,023.04 | calendar rule |
+
+The complement is the sharper number: **every short that exited on the signal
+itself (EMA bullish cover) lost money — 6 for 6**, -$10,598 total (AMD x2,
+DHR x2, AVGO, AAPL). The death cross has produced zero profitable round-trips
+on its own terms; the four wins are the risk machinery cutting losses short,
+which is not an edge, it is damage control working as designed.
+
+**Recommend `ENABLE_SHORTING = False` before going live.** Rationale: the
+entry signal has no demonstrated edge in either direction of test, and the
+mechanisms currently rescuing it are the same ones that are paper-only —
+bot-managed stops give no gap protection, and an uncapped short gap is the one
+loss this book cannot bound (see the earnings-blackout entry below for the
+CRWD worked example). Shorting can be revisited if and when the archetype
+clears `ci_lower > 1.0` in the discovery pipeline.
+
+**Caveat on the instrument:** drift-to-close is a weak proxy here. Median hold
+is 143.7 hours (~6 days) and only 5 of 45 trips are intraday, so same-day
+close does not determine the outcome — DDOG drifted +5.61% and still lost
+$2,946; CRWV drifted -1.91% and made $11,941. The 79%/-1.21% figure is
+directionally strong and consistent with the 0-for-6 signal-exit record, but
+it is corroboration, not an independent proof.
+
 ## SPY trend confirmation: demote the effective regime when SPY disagrees
 
 **Observed (2026-07-30):** the whole session ran `cautious` on a SENTIMENT
