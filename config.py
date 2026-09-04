@@ -394,7 +394,26 @@ ATR_MULT_BY_REGIME_AND_BAND = {
 # ENTRY-only, like every other gate here: read at strategy.py's short ENTRY
 # branch and nowhere else, so open shorts always trail, stop, breakeven-lock and
 # cover regardless of this switch.
-ENABLE_SHORTING = True   # master switch; False = long-only (prior behaviour)
+# DISABLED 2026-09-04 — pre-live gate closed. The death cross has produced zero
+# profitable exits on its own terms: 0-for-6 / -$10,598 on shorts that exited on
+# the EMA-bullish cover signal (AMD x2, DHR x2, AVGO, AAPL). All FOUR short
+# winners came from bolt-on exits — META +$1,505.60 (ATR trail), GOOGL +$897.40
+# (water floor), AVGO +$437.57 (profit floor), CRWV +$1,023.04 (Friday close) —
+# i.e. risk machinery cutting losses, not an edge. Corroborated by
+# entry_time_analysis.py: -1.21% mean drift entry->same-day close over all 14
+# closed shorts, underwater at the close on 79%, vs +0.16% / 52% for longs.
+# See docs/backlog.md `## ENABLE_SHORTING = False — REQUIRED BEFORE GOING LIVE`.
+#
+# SCOPE — this switch is MODE-BLIND and that is deliberate but worth knowing.
+# strategy.py's short entry branch reads it with no `is_futures_symbol` split,
+# and main.py's `_run_cycle` feeds FUTURES_WATCHLIST through that same branch, so
+# False makes the FUTURES bot long-only too. That is currently a no-op in fact —
+# the futures book has never opened a short (every futures entry on record is a
+# BUY; every SELL is a long exit) — but it IS a forward policy change on ES/NQ/RTY
+# that the equity evidence above does not speak to. If futures shorting is ever
+# wanted back independently, split this per-mode rather than flipping it globally;
+# same shape as the CROSS_SUSTAIN_MINUTES futures caveat.
+ENABLE_SHORTING = False  # master switch; False = long-only (prior behaviour)
 
 # Master switch for the regime short filter below. False restores pre-filter
 # behaviour exactly (shorts gated only by ENABLE_SHORTING and block_new_entries),
