@@ -3,7 +3,42 @@
 Deferred work and known limitations that are observed but not actively
 prioritized. Each entry: what was seen, where, and the proposed direction.
 
-## CRITICAL log lines reach no one — REQUIRED BEFORE GOING LIVE
+## CRITICAL log lines reach no one — GATE CLOSED 2026-09-05
+
+**Status: RESOLVED 2026-09-05 (`9779b95`). This pre-live gate is CLOSED.**
+`discord_alerts.py` pushes new CRITICAL content to a Discord webhook, polling
+both sinks (`critical_alerts.log`, `futures_critical_alerts.log`) every cycle
+off a shared watermark file. Design notes:
+
+- **Watermark advances only on a confirmed 2xx**, so a failed push retries next
+  cycle instead of being dropped (the opposite of the usual advance-then-send
+  shape). Corrupt or shrunken state resets to 0 rather than wedging the channel.
+- **Both bots watch both sinks** — their sessions differ, so cross-watching is
+  the coverage — which is why the offset is a shared locked file, not
+  per-process state.
+- **Never breaks a trading cycle**: every failure path is caught inside
+  `check_critical_alerts()`.
+- Observability per the counters rule: `pushes #N` / `failures #N` /
+  `truncations #N`, per-process, plus an `Alert push :` startup banner that says
+  DISABLED and names this gate when `DISCORD_WEBHOOK_URL` is empty.
+
+Live confirmation: enabled 2026-09-05, first real delivery landed (`pushes #1`,
+watermark 45), and the seed test line was cleared with `> critical_alerts.log`
+— a truncation the module handles by design and
+`test_truncation_resets_watermark` pins.
+
+Config lives in `.env` as `DISCORD_WEBHOOK_URL` (documented in `.env.example`),
+never in `config.py` — this repo is public. When checking whether it is set,
+grep for the **key** `^DISCORD_WEBHOOK_URL=`, not just for a URL somewhere in
+the file.
+
+Remaining weakness, deliberately accepted: delivery depends on the bot process
+running its cycle. A crashed bot pushes nothing, and that case is systemd's
+(`Restart=`), not this module's.
+
+The original analysis follows, for history.
+
+---
 
 As of 2026-08-11 the bot logs `CRITICAL` on the two states where it wanted out
 of a position and could not get out:
