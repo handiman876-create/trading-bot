@@ -23,6 +23,10 @@ data/sentiment_report.json
 data/screen_ab_tracking.json
 data/fundamentals_cache.json
 data/options_positions.json
+# Bare filename is correct here, unlike stop_prices above: DISCORD_WATERMARK_FILE
+# is a literal with no _PROC_SUFFIX, because both bots share one watermark under
+# flock (that sharing is what prevents double-posts).
+data/alert_watermarks.json
 screen_ab.lock
 .venv/
 bot.log.*
