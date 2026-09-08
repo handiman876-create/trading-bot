@@ -113,6 +113,14 @@ def isolate_bot_state(tmp_path, monkeypatch):
     monkeypatch.setattr(strategy, "_MOM_ENTRIES_PATH", str(tmp_path / "momentum_entries.json"), raising=False)
     monkeypatch.setattr(strategy, "_OPT_POSITIONS_PATH", str(tmp_path / "options_positions.json"), raising=False)
 
+    # note_regime() deduplicates its sentiment-divergence line against this, so it
+    # is cross-test state: a test asserting "SENTIMENT OVERRIDE in cap.text" fails
+    # if some earlier test in the same process already logged the identical
+    # (branch, sent_regime, vix_regime, fear) tuple. Cleared per-test so each one
+    # sees a first cycle. The dedupe itself is tested explicitly, by calling
+    # note_regime twice inside one test.
+    monkeypatch.setattr(strategy, "_last_sentiment_note", None, raising=False)
+
     # The broker stop floor is OFF for every test unless the test opts in. It
     # reaches the network through tc.place_equity_order with keyword arguments
     # (order_type/duration/stop_price), and the stubs across the older test

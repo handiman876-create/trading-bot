@@ -1406,17 +1406,24 @@ def _arm_stop_on_entry(symbol: str, entry_price: float, atr: Optional[float],
     stops = _load_stops()
     stops[symbol] = rec
     _save_stops(stops)
+    # mult is %.4g, NOT %.1f. At %.1f a 1.25x width printed as "1.2x" (Python
+    # rounds half to even), so recomputing the stop from the log gave 92.78 while
+    # the armed stop was 92.46 — the log contradicted stop_prices.json on the one
+    # number the line exists to report. %.4g keeps 1.25 as "1.25" and 2.5 as "2.5"
+    # without padding the whole-number widths to "3.0". All three branches carry
+    # the same spec on purpose: two of them are the paths taken when the fill
+    # lookup missed, i.e. exactly when the log is the only surviving record.
     if fill_price is not None:
-        logger.info("STOP ARMED %s %s entry=%.2f atr=%.2f mult=%.1fx stop=%.2f "
+        logger.info("STOP ARMED %s %s entry=%.2f atr=%.2f mult=%.4gx stop=%.2f "
                     "(regime=%s) fill=%.2f signal=%.2f slippage=%+.2f",
                     symbol, direction, entry_price, atr, mult, stop, regime,
                     fill_price, signal_price, slippage)
     elif signal_price is not None:
-        logger.warning("STOP ARMED %s %s entry=%.2f atr=%.2f mult=%.1fx stop=%.2f "
+        logger.warning("STOP ARMED %s %s entry=%.2f atr=%.2f mult=%.4gx stop=%.2f "
                        "(regime=%s) fill=UNAVAILABLE — armed at SIGNAL price",
                        symbol, direction, entry_price, atr, mult, stop, regime)
     else:
-        logger.info("STOP ARMED %s %s entry=%.2f atr=%.2f mult=%.1fx stop=%.2f (regime=%s)",
+        logger.info("STOP ARMED %s %s entry=%.2f atr=%.2f mult=%.4gx stop=%.2f (regime=%s)",
                     symbol, direction, entry_price, atr, mult, stop, regime)
 
 
@@ -2420,6 +2427,19 @@ _regime_counts = {r: 0 for r in _REGIMES}
 _vix_cache = {"ts": None, "vix": None, "regime": "risk_on"}
 _last_logged_regime = None            # drives REGIME TRANSITION logging
 
+# The last sentiment-divergence line note_regime() actually emitted, as the tuple
+# of everything that line reports: (branch, sent_regime, vix_regime, fear). The
+# divergence block re-logs only when this changes.
+#
+# Keyed on the tuple and NOT on _last_logged_regime, which looks like the obvious
+# reuse and is wrong: the EFFECTIVE regime can sit on "cautious" while the reason
+# for it changes underneath (VIX rising into cautious on its own retires the
+# override without moving the effective regime), and the fear score can move
+# 4→6 inside one regime band. Both are changes to what the line asserts, so both
+# have to re-log. `None` means "nothing emitted yet", which is why a first cycle
+# always logs.
+_last_sentiment_note = None
+
 
 def _get_market_regime(vix: Optional[float]) -> str:
     """Pure VIX → regime. Constants mark the CEILING of their namesake regime, so
@@ -2567,7 +2587,7 @@ def note_regime(vix: Optional[float], regime: str, vix_regime: Optional[str] = N
     log a SENTIMENT OVERRIDE when Claude's read is strictly more fearful than the VIX
     read. Counts the effective regime, logs the level, flags transitions, and emits
     the human-readable mode line for the entry-gating regimes."""
-    global _last_logged_regime, _sentiment_threshold_blocks
+    global _last_logged_regime, _sentiment_threshold_blocks, _last_sentiment_note
     _regime_counts[regime if regime in _regime_counts else "unknown"] += 1
     vtxt = f"{vix:.1f}" if isinstance(vix, (int, float)) else "n/a"
     extreme = " EXTREME" if _is_extreme(vix) else ""
@@ -2588,26 +2608,59 @@ def note_regime(vix: Optional[float], regime: str, vix_regime: Optional[str] = N
         # combine used — a fear score under the floor is suppressed by the floor,
         # not by the master switch, and saying "OVERRIDE" there would report an
         # action that did not happen.
-        if sentiment_participates(fear):
-            logger.warning("SENTIMENT OVERRIDE: %s mode from Claude analysis "
-                           "(fear=%s, VIX-regime=%s, risks: %s)", sent_regime, fear,
-                           vix_regime, ", ".join(risks or []) or "n/a")
-        elif getattr(config, "ENABLE_SENTIMENT_OVERRIDE", True):
+        #
+        # LOGGED ON CHANGE, NOT EVERY CYCLE. This block runs once per 60s poll for
+        # as long as the divergence holds, so a Monday that reads cautious from
+        # 08:00 produced ~390 identical lines — and the OVERRIDE branch emitted
+        # them at WARNING, which is the level that is supposed to mean "look at
+        # this". Restating a steady state hundreds of times is what made the real
+        # WARNINGs (an unarmed stop, a failed fetch) hard to find. The state still
+        # counts every cycle below; it is only the LINE that is deduplicated.
+        #
+        # BAD — DO NOT do this:
+        #     logger.warning("SENTIMENT OVERRIDE: ...")   # every cycle, forever
+        _branch = ("override" if sentiment_participates(fear)
+                   else "threshold" if getattr(config, "ENABLE_SENTIMENT_OVERRIDE", True)
+                   else "advisory")
+        _note = (_branch, sent_regime, vix_regime, fear)
+        _changed = _note != _last_sentiment_note
+        _last_sentiment_note = _note
+        if _branch == "override":
+            if _changed:
+                logger.info("SENTIMENT OVERRIDE: %s mode from Claude analysis "
+                            "(fear=%s, VIX-regime=%s, risks: %s)", sent_regime, fear,
+                            vix_regime, ", ".join(risks or []) or "n/a")
+        elif _branch == "threshold":
+            # The counter is unconditional — it measures how long the floor held,
+            # so it must not inherit the log line's deduplication.
             _sentiment_threshold_blocks += 1
-            logger.info("SENTIMENT BELOW THRESHOLD (no override): Claude reads %s "
-                        "vs VIX-regime %s, but fear=%s < %s — regime stays %s "
-                        "(threshold blocks #%d). risks: %s",
-                        sent_regime, vix_regime, fear,
-                        getattr(config, "SENTIMENT_OVERRIDE_MIN_FEAR", 0), regime,
-                        _sentiment_threshold_blocks,
-                        ", ".join(risks or []) or "n/a")
-        else:
+            if _changed:
+                logger.info("SENTIMENT BELOW THRESHOLD (no override): Claude reads %s "
+                            "vs VIX-regime %s, but fear=%s < %s — regime stays %s "
+                            "(threshold blocks #%d). risks: %s",
+                            sent_regime, vix_regime, fear,
+                            getattr(config, "SENTIMENT_OVERRIDE_MIN_FEAR", 0), regime,
+                            _sentiment_threshold_blocks,
+                            ", ".join(risks or []) or "n/a")
+        elif _changed:
             logger.info("SENTIMENT ADVISORY (no override): Claude reads %s vs "
                         "VIX-regime %s (fear=%s) — regime stays %s. risks: %s",
                         sent_regime, vix_regime, fear, regime,
                         ", ".join(risks or []) or "n/a")
+    else:
+        # Divergence gone (or sentiment off) — clear the dedupe key so the NEXT
+        # divergence logs instead of being swallowed as "same as last time".
+        _last_sentiment_note = None
     if regime == "cautious":
-        logger.info("CAUTIOUS MODE - skipping momentum alignment (VIX=%s)", vtxt)
+        # Gated on the flag because the sentence is only true when the flag is on.
+        # USE_MOMENTUM_ALIGNMENT has been False since 2026-07-24 (40a34a3), so
+        # cautious mode has not been "skipping" anything — there was nothing to
+        # skip, and the line advertised protection the bot was not providing.
+        # Cautious still does real work (it sets the entry ATR mult to 1.25x), and
+        # the regime itself is already on the "VIX=%s regime=%s" line above, so
+        # dropping this loses no state.
+        if config.USE_MOMENTUM_ALIGNMENT:
+            logger.info("CAUTIOUS MODE - skipping momentum alignment (VIX=%s)", vtxt)
     elif regime == "defensive":
         logger.info("DEFENSIVE MODE - no new entries (VIX=%s)", vtxt)
     elif regime == "crisis":

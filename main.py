@@ -265,6 +265,49 @@ def _wait_for_market_open() -> None:
                 break
 
 
+# Watchlist names missing from SECTOR_TO_SYMBOLS on the last coverage check, and
+# how many times the check has fired. The gap LIST is what you act on; the counter
+# exists because this is a safety net and a net with no counter cannot be shown to
+# still be earning its keep — a permanently-zero counter here is the goal state,
+# and the only way to tell "clean" from "never ran" is to see it.
+_sector_map_gaps = []
+_sector_map_gap_checks = 0
+
+
+def _check_sector_map_coverage(watchlist) -> list:
+    """WARN on any watchlist symbol absent from sentiment_analyzer.SECTOR_TO_SYMBOLS.
+
+    A symbol that is in no sector cannot be gated: sectors_blocked() only ever
+    returns names it finds in the map, so an unmapped name silently ignores a
+    "high" risk reading for its sector. That is not hypothetical — it is the
+    2026-09-08 CRWV entry, taken on a tech=high day (see the map's own comment).
+
+    Returns the gap list so callers/tests can assert on it rather than scraping
+    the log. Called at startup once the effective watchlist is built, NOT per
+    cycle: the map is a module constant and the watchlist only changes on a
+    momentum rotation or a restart, so a per-cycle check would just be the same
+    warning 390 times a session — the exact noise this commit removes elsewhere.
+    """
+    global _sector_map_gaps, _sector_map_gap_checks
+    _sector_map_gap_checks += 1
+    mapped = set()
+    for symbols in sentiment_analyzer.SECTOR_TO_SYMBOLS.values():
+        mapped.update(symbols)
+    # OPTION-prefixed names are OCC contract symbols, not underlyings; the sector
+    # gate is an equities-entry gate and never sees them.
+    gaps = [s for s in watchlist
+            if s not in mapped and not s.startswith("OPTION")]
+    _sector_map_gaps = gaps
+    if gaps:
+        logger.warning("SECTOR MAP GAP: %d of %d watchlist symbols unmapped: %s "
+                       "— sector gate is blind to these names (checks #%d)",
+                       len(gaps), len(watchlist), gaps, _sector_map_gap_checks)
+    else:
+        logger.info("Sector map  : COMPLETE — all %d watchlist symbols mapped "
+                    "(checks #%d)", len(watchlist), _sector_map_gap_checks)
+    return gaps
+
+
 def _log_sentiment_banner(rep: dict) -> None:
     """Startup banner for the sentiment overlay. A function rather than inline
     banner code so the fallback branch is testable without booting the bot (main()
@@ -399,6 +442,11 @@ def main() -> None:
         active = watchlist.effective_stock_watchlist([])
         logger.info("Active list : %s (%d; core ∪ momentum, held names fold in live)",
                     active, len(active))
+        # Reconcile the hand-maintained sector map against the list we actually
+        # trade, BEFORE the first cycle can act on a sentiment reading. Held names
+        # fold in live and are not known here, so a held-only name still reaches
+        # the gate unchecked — core ∪ momentum is where the drift comes from.
+        _check_sector_map_coverage(active)
         logger.info("Options     : %s", config.OPTIONS_WATCHLIST)
         logger.info("Next option exp.: %s", mh.next_monthly_expiration())
         logger.info("Stop loss   : %s (regime ATR mult — risk_on %.1fx/cautious %.1fx/"

@@ -44,13 +44,35 @@ logger = logging.getLogger("sentiment")
 # Consumed by strategy.py via sectors_blocked(). Energy/airlines are already removed
 # from the tradable universe by the momentum sector filter, so their lists are empty
 # (kept as keys for schema completeness and so a "high" reading is a harmless no-op).
+#
+# THIS MAP MUST COVER THE EFFECTIVE WATCHLIST OR THE GATE IS SILENTLY BLIND.
+# On 2026-09-08 sentiment rated tech "high" and the bot still opened CRWV, because
+# CRWV had never been added here — sectors_blocked() did exactly what it says and
+# returned a set that did not contain it. Half the 20 monitored names were unmapped
+# that day (SPY, AMZN, TSLA, AVGO, CRWV, PLTR, NEM, COIN, ABNB, FDS), and nothing
+# reported it: a name absent from this map is not blocked and not counted, so the
+# hole looks identical to "no tech name crossed today". main.py now runs
+# _check_sector_map_coverage() at startup and WARNS on any unmapped watchlist name
+# — this map is hand-maintained against a momentum slot that rotates twice-monthly,
+# so it WILL drift again and the warning is how you find out.
+#
+# Grouping is by RISK BEHAVIOUR, not by GICS. GICS (data/sp500.json) puts TSLA and
+# AMZN in Consumer Discretionary, META in Communication Services and COIN in
+# Financials; all four trade as high-beta tech here, so they are gated with tech.
+# Deriving this map from GICS instead would also cover nothing for CRWV/SPY/QQQ —
+# a recent IPO and two ETFs, none of which have an sp500.json entry.
+#
+# CRL is NOT tech. It is GICS Health Care / Life Sciences Tools & Services and was
+# mis-filed under tech until 2026-09-08, so every "tech high" reading blocked a
+# lab-services name while leaving the actual AI complex open.
 SECTOR_TO_SYMBOLS = {
-    "tech":        ["NVDA", "AMD", "CRWD", "ARM", "AAPL", "MSFT", "GOOGL",
-                    "META", "QQQ", "DDOG", "CRL"],
-    "financials":  ["JPM", "BLK", "MS"],
-    "healthcare":  ["CAH", "HCA", "TMO", "DHR"],
-    "industrials": ["LII", "CAT", "DHR"],
-    "consumer":    ["KO", "COST", "TGT"],
+    "tech":        ["NVDA", "AMD", "AVGO", "ARM", "CRWV", "PLTR", "AMZN",
+                    "TSLA", "MSFT", "AAPL", "GOOGL", "META", "SPY", "QQQ",
+                    "COIN"],
+    "financials":  ["JPM", "FDS"],
+    "healthcare":  ["CRL"],
+    "industrials": [],
+    "consumer":    ["ABNB"],
     "energy":      [],   # already excluded by the momentum sector filter
     "airlines":    [],   # already excluded (Passenger Airlines sub-industry)
 }

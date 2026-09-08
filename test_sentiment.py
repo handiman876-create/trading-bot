@@ -153,9 +153,12 @@ def test_sectors_blocked_maps_high_to_symbols():
                   sectors={"tech": "high", "financials": "medium", "energy": "high",
                            "healthcare": "low", "consumer": "low", "industrials": "low"})
     blocked = sa.sectors_blocked(rep)
-    assert "NVDA" in blocked and "AMD" in blocked and "CRWD" in blocked  # tech high
+    assert "NVDA" in blocked and "AMD" in blocked     # tech high
+    # The 2026-09-08 hole: these are the AI/mega-cap names the tech gate was blind
+    # to while it was still blocking CRWD/DDOG, which the bot had stopped trading.
+    assert {"CRWV", "AVGO", "PLTR", "AMZN", "TSLA", "SPY", "QQQ"} <= blocked
     assert "JPM" not in blocked                       # financials only medium
-    assert not (blocked & {"KO", "COST", "TGT"})      # consumer low
+    assert "ABNB" not in blocked                      # consumer low
     # energy "high" is a harmless no-op (already universe-excluded → empty list)
     assert all(sym for sym in blocked)
 
@@ -163,6 +166,103 @@ def test_sectors_blocked_maps_high_to_symbols():
 def test_sectors_blocked_empty_when_no_high():
     rep = _report(datetime(2026, 7, 17, tzinfo=UTC))  # all low
     assert sa.sectors_blocked(rep) == set()
+
+
+# ── 6b. SECTOR MAP COVERAGE (2026-09-08 regression) ──────────────────────────
+# Sentiment rated tech "high" on 2026-09-08 and the bot opened CRWV anyway,
+# because CRWV was not in SECTOR_TO_SYMBOLS. sectors_blocked() was correct; the
+# map had drifted off the watchlist. Ten of the twenty monitored names were
+# unmapped and nothing said so — an unmapped name is not blocked and not counted,
+# so the hole is indistinguishable from "no tech name crossed today".
+def _mapped_symbols():
+    out = set()
+    for symbols in sa.SECTOR_TO_SYMBOLS.values():
+        out.update(symbols)
+    return out
+
+
+def test_core_watchlist_fully_mapped():
+    """Every CORE watchlist name must have a sector, or the gate cannot see it.
+
+    CORE only — the momentum slot is regenerated twice-monthly and WILL rotate in
+    names this hand-maintained map has never heard of. That drift is caught at
+    runtime by main._check_sector_map_coverage(); it cannot be asserted here
+    without this test failing every time the screen runs.
+    """
+    gaps = sorted(set(config.CORE_WATCHLIST) - _mapped_symbols())
+    assert not gaps, f"core watchlist names with no sector: {gaps}"
+
+
+def test_the_2026_09_08_gap_names_are_mapped():
+    """The specific hole, named. CRWV is the one that cost a blocked entry."""
+    for sym in ("CRWV", "AVGO", "PLTR", "AMZN", "TSLA", "SPY", "QQQ"):
+        assert sym in _mapped_symbols(), f"{sym} unmapped — 2026-09-08 regression"
+    assert "CRWV" in sa.SECTOR_TO_SYMBOLS["tech"]
+
+
+def test_stale_names_removed_from_map():
+    """Names the bot no longer trades must not linger in the map. They are not
+    harmful on their own, but they are why the map LOOKED maintained while the
+    live watchlist had drifted out from under it."""
+    stale = {"CRWD", "DDOG", "BLK", "MS", "CAH", "HCA", "TMO", "DHR",
+             "LII", "CAT", "KO", "COST", "TGT"}
+    assert not (stale & _mapped_symbols()), \
+        f"stale names still mapped: {sorted(stale & _mapped_symbols())}"
+
+
+def test_crl_is_healthcare_not_tech():
+    """CRL is GICS Health Care / Life Sciences Tools & Services (data/sp500.json),
+    and was filed under tech until 2026-09-08 — so a "tech high" reading blocked a
+    lab-services name while leaving the AI complex it was aimed at wide open."""
+    assert "CRL" not in sa.SECTOR_TO_SYMBOLS["tech"]
+    assert "CRL" in sa.SECTOR_TO_SYMBOLS["healthcare"]
+    rep = _report(datetime(2026, 7, 17, tzinfo=UTC),
+                  sectors={"tech": "high", "financials": "low", "energy": "low",
+                           "healthcare": "low", "consumer": "low",
+                           "industrials": "low"})
+    assert "CRL" not in sa.sectors_blocked(rep), "tech high must not block CRL"
+    rep2 = _report(datetime(2026, 7, 17, tzinfo=UTC),
+                   sectors={"tech": "low", "financials": "low", "energy": "low",
+                            "healthcare": "high", "consumer": "low",
+                            "industrials": "low"})
+    assert "CRL" in sa.sectors_blocked(rep2), "healthcare high must block CRL"
+
+
+def test_reconcile_warns_on_unmapped_watchlist_symbol():
+    import main
+    before = main._sector_map_gap_checks
+    with _LogCap() as cap:
+        logging.getLogger("bot").addHandler(cap._h)
+        logging.getLogger("bot").setLevel(logging.DEBUG)
+        gaps = main._check_sector_map_coverage(["NVDA", "ZZZZ", "CRWV", "YYYY"])
+        logging.getLogger("bot").removeHandler(cap._h)
+    assert gaps == ["ZZZZ", "YYYY"], gaps
+    assert "SECTOR MAP GAP" in cap.text
+    assert "2 of 4" in cap.text
+    assert "sector gate is blind" in cap.text
+    # Observability: the check has to be able to prove it ran.
+    assert main._sector_map_gap_checks == before + 1
+    assert main._sector_map_gaps == ["ZZZZ", "YYYY"]
+
+
+def test_reconcile_clean_when_all_mapped():
+    """No gap → no warning, but still an affirmative line: 'clean' and 'never
+    ran' must not look the same in the log."""
+    import main
+    with _LogCap() as cap:
+        logging.getLogger("bot").addHandler(cap._h)
+        logging.getLogger("bot").setLevel(logging.DEBUG)
+        gaps = main._check_sector_map_coverage(["NVDA", "CRWV", "JPM", "CRL"])
+        logging.getLogger("bot").removeHandler(cap._h)
+    assert gaps == []
+    assert "SECTOR MAP GAP" not in cap.text
+    assert "Sector map  : COMPLETE" in cap.text
+    assert main._sector_map_gaps == []
+
+
+def test_reconcile_ignores_option_symbols():
+    import main
+    assert main._check_sector_map_coverage(["NVDA", "OPTION_SPY_call"]) == []
 
 
 # ── 7. VIX vs sentiment: take the MORE fearful ────────────────────────────────
@@ -255,6 +355,98 @@ def test_note_regime_still_logs_override_when_on():
     finally:
         config.ENABLE_SENTIMENT_OVERRIDE = saved
         config.SENTIMENT_OVERRIDE_MIN_FEAR = saved_floor
+
+
+def test_sentiment_override_logs_once_not_every_cycle():
+    """The 2026-09-08 noise: cautious held from 08:00 and the OVERRIDE line was
+    re-emitted every 60s poll, at WARNING. Steady state logs once."""
+    saved = _with_override(True)
+    saved_floor = getattr(config, "SENTIMENT_OVERRIDE_MIN_FEAR", 0)
+    config.SENTIMENT_OVERRIDE_MIN_FEAR = 6
+    strategy._last_sentiment_note = None
+    try:
+        with _LogCap() as cap:
+            logging.getLogger("strategy").addHandler(cap._h)
+            logging.getLogger("strategy").setLevel(logging.DEBUG)
+            for _ in range(5):        # five identical cycles
+                strategy.note_regime(15.3, "cautious", vix_regime="risk_on",
+                                     sent_regime="cautious", fear=6, risks=["r"])
+            logging.getLogger("strategy").removeHandler(cap._h)
+        hits = [m for m in cap.records if "SENTIMENT OVERRIDE" in m]
+        assert len(hits) == 1, f"{len(hits)} override lines for one steady state"
+    finally:
+        config.ENABLE_SENTIMENT_OVERRIDE = saved
+        config.SENTIMENT_OVERRIDE_MIN_FEAR = saved_floor
+
+
+def test_sentiment_override_relogs_when_the_reading_changes():
+    """Deduplication must not swallow a real change. The fear score moving inside
+    one regime band, and the divergence ending and returning, both re-log —
+    neither is visible in the EFFECTIVE regime, which is why the dedupe key is
+    the reported tuple and not _last_logged_regime."""
+    saved = _with_override(True)
+    saved_floor = getattr(config, "SENTIMENT_OVERRIDE_MIN_FEAR", 0)
+    config.SENTIMENT_OVERRIDE_MIN_FEAR = 6
+    strategy._last_sentiment_note = None
+    try:
+        with _LogCap() as cap:
+            logging.getLogger("strategy").addHandler(cap._h)
+            logging.getLogger("strategy").setLevel(logging.DEBUG)
+            strategy.note_regime(15.3, "cautious", vix_regime="risk_on",
+                                 sent_regime="cautious", fear=6, risks=["r"])
+            # fear 6 -> 7 is still "cautious" vs risk_on, but it is a different
+            # reading and the line reports the score.
+            strategy.note_regime(15.3, "cautious", vix_regime="risk_on",
+                                 sent_regime="cautious", fear=7, risks=["r"])
+            # Divergence ends (VIX catches up), then returns.
+            strategy.note_regime(21.0, "cautious", vix_regime="cautious",
+                                 sent_regime="cautious", fear=6, risks=["r"])
+            strategy.note_regime(15.3, "cautious", vix_regime="risk_on",
+                                 sent_regime="cautious", fear=6, risks=["r"])
+            logging.getLogger("strategy").removeHandler(cap._h)
+        hits = [m for m in cap.records if "SENTIMENT OVERRIDE" in m]
+        assert len(hits) == 3, f"expected 3 distinct readings, got {len(hits)}"
+    finally:
+        config.ENABLE_SENTIMENT_OVERRIDE = saved
+        config.SENTIMENT_OVERRIDE_MIN_FEAR = saved_floor
+
+
+def test_threshold_counter_still_counts_every_cycle_while_line_is_deduped():
+    """Only the LINE is deduplicated. The counter measures how long the floor
+    held, so it must not inherit the dedupe — a net with a counter that stops
+    counting cannot show it is still earning its keep."""
+    with _override(floor=6):
+        strategy._last_sentiment_note = None
+        before = strategy._sentiment_threshold_blocks
+        with _LogCap() as cap:
+            logging.getLogger("strategy").addHandler(cap._h)
+            logging.getLogger("strategy").setLevel(logging.DEBUG)
+            for _ in range(4):
+                strategy.note_regime(15.0, "risk_on", vix_regime="risk_on",
+                                     sent_regime="cautious", fear=4)
+            logging.getLogger("strategy").removeHandler(cap._h)
+        assert strategy._sentiment_threshold_blocks == before + 4
+        hits = [m for m in cap.records if "SENTIMENT BELOW THRESHOLD" in m]
+        assert len(hits) == 1, f"{len(hits)} threshold lines for one steady state"
+
+
+def test_cautious_mode_line_gated_on_momentum_alignment_flag():
+    """USE_MOMENTUM_ALIGNMENT has been False since 40a34a3, so "CAUTIOUS MODE -
+    skipping momentum alignment" announced protection that was not happening —
+    there was nothing to skip. The regime itself stays on the VIX= line."""
+    saved = config.USE_MOMENTUM_ALIGNMENT
+    try:
+        for flag, expected in ((False, False), (True, True)):
+            config.USE_MOMENTUM_ALIGNMENT = flag
+            with _LogCap() as cap:
+                logging.getLogger("strategy").addHandler(cap._h)
+                logging.getLogger("strategy").setLevel(logging.DEBUG)
+                strategy.note_regime(15.3, "cautious")
+                logging.getLogger("strategy").removeHandler(cap._h)
+            assert ("CAUTIOUS MODE" in cap.text) is expected, (flag, cap.text)
+            assert "regime=cautious" in cap.text, "regime must stay visible"
+    finally:
+        config.USE_MOMENTUM_ALIGNMENT = saved
 
 
 def test_note_regime_logs_below_threshold_not_override():

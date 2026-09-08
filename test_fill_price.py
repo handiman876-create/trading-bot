@@ -188,6 +188,88 @@ def test_arm_stop_fallback_uses_signal_when_no_fill():
     assert abs(rec["stop_price"] - (100.0 - 2.5 * 4.0)) < 1e-6, rec
 
 
+# ── STOP ARMED: the mult must print the width that was actually armed ─────────
+# CRWV armed at 1.25x on 2026-09-08 and the line said "mult=1.2x" — %.1f rounds
+# 1.25 half-to-even. Recomputing the stop from the log gave 92.78 against a real
+# stop of 92.46, i.e. the log contradicted stop_prices.json on the one number it
+# exists to report. Both fill branches are covered: the WARNING branch is the one
+# taken when the fill lookup missed, i.e. when the log is the only record left.
+
+class _Cap:
+    """Capture "strategy" logger messages regardless of level."""
+    def __enter__(self):
+        import logging
+        self.msgs = []
+        self._h = logging.Handler()
+        self._h.emit = lambda r: self.msgs.append(r.getMessage())
+        self._log = logging.getLogger("strategy")
+        self._log.addHandler(self._h)
+        # setLevel(), NOT `self._log.level = ...`. Assigning the attribute skips
+        # Logger.setLevel's manager._clear_cache(), so isEnabledFor() keeps
+        # returning a False cached while the level was WARNING — under pytest the
+        # effective level IS WARNING. That made these tests pass run alone and
+        # fail in the module, and only for the two logger.info() branches: the
+        # WARNING branch was enabled either way.
+        self._prev = self._log.level
+        self._log.setLevel(logging.DEBUG)
+        return self
+
+    def __exit__(self, *exc):
+        self._log.removeHandler(self._h)
+        self._log.setLevel(self._prev)
+
+    @property
+    def text(self):
+        return "\n".join(self.msgs)
+
+
+def _armed_line(mult, **kw):
+    """Arm a stop with a pinned mult and return the STOP ARMED log line. The mult
+    is stubbed rather than steered via `regime`, because the live width is
+    regime x volatility-band and this test is about the FORMAT, not the ladder."""
+    _testlib.safe_remove(strategy._STOPS_PATH)
+    orig = strategy._get_atr_mult
+    strategy._get_atr_mult = lambda *a, **k: mult
+    try:
+        with _Cap() as cap:
+            strategy._arm_stop_on_entry("CRWV", 100.58, 6.4971, direction="long",
+                                        regime="cautious", **kw)
+    finally:
+        strategy._get_atr_mult = orig
+    return next(m for m in cap.msgs if m.startswith("STOP ARMED"))
+
+
+def test_stop_armed_mult_prints_fractional_width():
+    """1.25 must print as 1.25, not 1.2 — the CRWV case."""
+    line = _armed_line(1.25, signal_price=100.56, fill_price=100.58, slippage=0.02)
+    assert "mult=1.25x" in line, line
+    assert "mult=1.2x" not in line, line
+    # And the stop in the line must be recomputable from the mult in the line.
+    assert "stop=92.46" in line, line
+
+
+def test_stop_armed_mult_does_not_pad_whole_widths():
+    """%.4g must not turn 2.5 into 2.5000 or 3.0 into 3.0000."""
+    assert "mult=2.5x" in _armed_line(2.5, signal_price=100.56,
+                                      fill_price=100.58, slippage=0.02)
+    assert "mult=3x" in _armed_line(3.0, signal_price=100.56,
+                                    fill_price=100.58, slippage=0.02)
+
+
+def test_stop_armed_mult_format_on_fill_unavailable_branch():
+    """The signal-price WARNING branch carries the same spec."""
+    line = _armed_line(1.25, signal_price=100.56, fill_price=None, slippage=None)
+    assert "fill=UNAVAILABLE" in line, line
+    assert "mult=1.25x" in line, line
+
+
+def test_stop_armed_mult_format_on_bare_branch():
+    """So does the branch with neither fill nor signal price."""
+    line = _armed_line(1.25)
+    assert "mult=1.25x" in line, line
+    assert "fill=" not in line, line
+
+
 # ── Enriched trade log + backward compat ──────────────────────────────────────
 
 def _last_trade_record():
