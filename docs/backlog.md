@@ -1153,9 +1153,13 @@ they are not a k-fit.
 
 ## Monitor K=0.5 effect on TSLA — first live test of the water floor
 
-**Status: RESOLVED 2026-09-01. K=0.50 was wrong. Raised to K=0.75.** Water floor
-shipped 2026-08-31 (`72c1aa2`); the answer arrived on day one, three days before
-the 09-04 deadline. Build sequence above is DONE.
+**Status: K=0.75 REMAINS SET, verdict SPLIT as of 2026-09-09 — monitoring EXTENDED
+to 2026-09-18, AMD is the tiebreaker.** Water floor shipped 2026-08-31
+(`72c1aa2`); the original TSLA question resolved on day one and K was raised to
+0.75 on 09-01 (`36e02a8`). Whether 0.75 is *right* is a separate question that
+went n=0 for five sessions and then produced evidence both ways on 2026-09-09 —
+see **VERDICT UPDATE 2026-09-09** below, which is the current state. Build
+sequence above is DONE; no config change pending.
 
 ### Resolution — the shaken-out branch was met exactly
 
@@ -1296,6 +1300,150 @@ validated from live flow at the current trade frequency.
 
 Note K=0.75 < `BREAKEVEN_LOCK_ATR` = 1.0 still holds, so the floor continues to
 arm before the lock and continues to supersede it.
+
+### VERDICT UPDATE 2026-09-09 — n=0 is over. Evidence arrived BOTH WAYS on one day.
+
+**Decision: SPLIT verdict. NO config change. `WATER_FLOOR_K` stays 0.75.
+Monitoring window extended to 2026-09-18.**
+
+The 09-04 note above predicted that if 09-11 arrived at n=0 the thing to question
+would be the arming *opportunity* rate. That prediction is now moot: 09-09
+produced the first K=0.75 arming in the feature's history AND resolved the CRWV
+counterfactual, and the two point in opposite directions.
+
+#### Evidence FOR K=0.75 — META, the first arming ever
+
+Seventeen `WATER FLOOR` ratchets, 13:30:06 → 15:20:34 UTC, walking the stop
+**629.44 → 641.7841** as the run went 1.51 → 2.11 ATR.
+
+| fact | value |
+|---|---|
+| entry / `atr_at_entry` / `atr_mult` | 613.71 / 20.6878 / 2.5x |
+| `high_water` | **657.30** (peak run 43.59 = **2.11 ATR**) |
+| `stop_price` == `water_floor_price` | **641.7841**, `water_floor_active: true` |
+| Locked in | 78 × 28.0741 = **+$2,189.78** |
+| Peak unrealized | +$3,400.02 → **capture-if-hit 64.4%** |
+| ATR trail counterfactual | 657.30 − 2.5×20.6878 = 605.58 = **−$634.14** |
+| Floor's advantage over the trail | **+$2,824** |
+
+64.4% is the best capture ratio on record (GOOGL 50.4%, TSLA −8.7%). First
+arming landed at 629.444 = water 644.96 − 0.75·ATR, within $0.21 of the 629.23
+threshold this section predicted on 09-04 — the arithmetic is confirmed live.
+
+**This also falsifies the 09-04 structural claim.** That note argued META's
+gap-up entry (fill 5.4% above EMA9, high water set on the entry bar) meant the
+position "never built a run to give back." True as of 09-04 at 0.268 ATR; wrong
+as a permanent property. Price continued past the gap. **A gap-up cross DELAYS
+floor arming; it does not make the floor unreachable.** Do not carry the
+"unreachable" framing to the next gap-up entry.
+
+#### Evidence AGAINST K=0.75 — CRWV, the first non-gap-up counterfactual, now resolved
+
+`16:29:38 UTC STOP-LOSS EXIT CRWV long x477 @ 96.00 (stop=96.10 entry=100.58
+water=104.22, held by atr trail, trail=96.10) — exit #1`. Fill **96.08**, not the
+96.00 print (slippage −0.08).
+
+| fact | value |
+|---|---|
+| entry / `atr_at_entry` / `atr_mult` | 100.58 / 6.4971 / 1.25 (cautious × high-vol band) |
+| `high_water` | 104.2206 — peak run 3.6406 = **0.560 ATR** |
+| Realized | 477 × −4.50 = **−$2,146.50** |
+| Peak unrealized | **+$1,736.57** → **$3,883 of give-back** |
+| K=0.75 arms at | 105.4528 — never reached, `water_floor_active: false` ✓ |
+| K=0.50 arms at | 103.8285 — cleared; floor would be **100.9721** |
+| K=0.50 outcome | ≈ **+$187** |
+| **Delta** | **+$2,333 favouring K=0.50** |
+
+**The pre-registered rule decides this one, and it decides for K=0.50.** The rule
+set in advance at the top of this section says: judge the *reason* for the exit,
+not the P&L sign — floor "captures a gain it would otherwise have given back" →
+**keep K=0.5**; floor "shaken out on normal volatility with the trend intact" →
+**raise K**. CRWV fell 8.22 points = **1.27 ATR** off water into a close below
+entry. That is a genuine reversal, not normal volatility around a live trend. So
+a K=0.50 floor would have banked a gain that was in fact given back in full:
+**the keep-K=0.50 condition is met, cleanly, on the first non-gap-up test.**
+
+This is the counterfactual flagged on 09-08 as unresolved ("judge the reason for
+the eventual exit, not the P&L sign"). It is now resolved, and it went against
+the raise.
+
+#### Net verdict: SPLIT — no change yet
+
+n=1 for, n=1 against. The dollar sum favours K=0.75 by ~$2.2k, but that is one
+large winner against one loser at n=1 each; deciding on the sum would be reading
+noise. The structural read is more useful:
+
+| position | peak run | K=0.75 | K=0.50 | better |
+|---|---|---|---|---|
+| CRWV long | **0.560 ATR** | never arms → −$2,146.50 | +$187 | **0.50** |
+| META long | **2.11 ATR** | +$2,189.78 locked | floor 646.96 — **tighter** | 0.75 (more room) |
+
+**K is a regime split, not a single optimum.** It only decides an outcome for
+peak runs inside the candidate band; above the band both values arm and the
+higher K is strictly roomier. **Correct the 09-08 claim** that "the run-length
+distribution is concentrated in the band where the threshold decides" — with
+META at 2.11 the observed distribution is **bimodal** (0.268 / 0.5065 / 0.560
+versus 2.11), not concentrated. That weakens the case for treating this as a
+single-threshold tuning problem at all.
+
+#### The asymmetry to weigh — it now bites a LIVE position
+
+* **Lowering K to 0.50 tightens META's live armed floor**, on the next poll:
+  641.7841 → 657.30 − 0.50×20.6878 = **646.9561**. That is **+$403.42 more
+  locked** (78 × 5.172) but **5.17 points = 0.25 ATR less room**. Not a
+  paper change — an intervention on an open winner.
+* **Raising K can never loosen an already-armed floor** — the monotonic ratchet
+  at `strategy.py:1819` (`min(stop_price, new_stop)` for longs) clamps it, so the
+  position keeps its tighter level until water improves by more than `ΔK·ATR`.
+
+So the two directions are not symmetric in risk: lowering acts immediately on
+live positions, raising acts only on future armings. This is a reason to require
+more evidence before lowering, independent of the evidence balance itself.
+
+#### Monitoring extended to 2026-09-18 — AMD is the tiebreaker
+
+**New check date: 2026-09-18.** AMD (opened 2026-09-09) is the next candidate and
+is unencumbered by the gap-up entry shape that made META uninformative for five
+sessions.
+
+| fact | value |
+|---|---|
+| entry / `atr_at_entry` / `atr_mult` | 524.37 / **23.0854** / 2.5x (regime=risk_on) |
+| `high_water` at open | 525.80 (run 0.062 ATR) |
+| **K=0.75 arms when water >** | **541.68** (`entry + 0.75×23.0854`) — needs **+3.02%** |
+| K=0.50 arms when water > | **535.91** |
+| decisive band | **[535.91, 541.68)** — a run in here separates the two K values |
+
+**CORRECTION — the threshold is $541.68, not the $539.88 quoted earlier in this
+session.** That figure was computed with META's `atr_at_entry` (20.6878) instead
+of AMD's (23.0854): 524.37 + 0.75×20.6878 = 539.88 is the wrong pairing. Same
+class of mistake as reading a rounded ATR out of a log line — recompute per
+position from `data/stop_prices.json`, never reuse another symbol's ATR.
+
+Exit conditions for 09-18, stated in advance as before:
+
+1. **AMD peak run lands in [0.50, 0.75) ATR and it exits on the trail** →
+   third data point against K=0.75, and with CRWV that is 2-of-3 in the decisive
+   band. Lower K to 0.50.
+2. **AMD arms at 0.75 and the floor causes the exit at a capture ratio > ~50%** →
+   second data point for K=0.75. Keep it.
+3. **AMD arms at 0.75 and is shaken out with the trend intact** (EMA9 > EMA21 at
+   exit, price recovers within a few sessions) → K=0.75 is itself too low; that
+   is a new finding, not a repeat of 09-01.
+4. **AMD never travels 0.50 ATR** → no information, same as META 09-04. Do not
+   count it either way.
+
+Because the distribution is bimodal, also record AMD's peak run *whatever*
+happens — the run-length distribution is now the primary object of interest, more
+than the win/loss on any single arming.
+
+**Still open, and 09-09 made it worse:** the give-back-on-a-winner problem
+(AMD 07-29, PLTR 08-04, QQQ 08-13, ESU26 08-24) now has a fifth case in CRWV,
+which peaked at +$1,736.57 and closed at −$2,146.50. The water floor was built to
+close that window and did not close it here, because the run never reached K. No
+value of K fixes a position that gives back its entire excursion from 0.56 ATR —
+that points at trail width and entry timing, not at K. Backlog point 6
+(non-stop exit paths carry no stop attribution) is unchanged.
 
 ### ESU26 note — CORRECTION to the obvious reading
 
