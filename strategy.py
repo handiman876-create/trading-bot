@@ -489,6 +489,14 @@ _option_target_exits    = 0  # contracts closed at OPTION_PROFIT_TARGET_PCT
 _option_stop_exits      = 0  # contracts closed at OPTION_STOP_LOSS_PCT
 _option_expiry_exits    = 0  # contracts closed with <= OPTION_MIN_DAYS_TO_EXPIRY left
 _occ_stop_prunes        = 0  # OCC-keyed stop records dropped (options are not stop-managed)
+_option_entry_unresolved = 0  # option entries whose broker fill could not be read, so
+                              # entry_price fell back to the ASK QUOTE. Non-zero means
+                              # live premium thresholds (+50%/-50%) are armed off a quote
+                              # for those contracts — the exact defect found 2026-09-10.
+                              # Counts the fallback at ENTRY plus any stored record
+                              # reconcile_option_entries could not repair afterwards.
+_option_entries_repaired = 0  # unresolved stored entry_prices later corrected from the
+                              # broker's order history by reconcile_option_entries
 
 
 def _bump_profit_floor(direction: str) -> int:
@@ -817,6 +825,10 @@ _floor_rearms = 0
 # therefore retried on the next restart, not on the next poll — the loud error in
 # _cancel_broker_floor is what surfaces it in the meantime.
 _floors_reconciled = False
+# Same startup-only latch for the option-entry reconcile: it costs one historical
+# orders fetch, and the records it repairs cannot change while the process runs
+# (an entry either resolved at open or it did not).
+_option_entries_reconciled = False
 
 
 # ── Instrument routing for the shared stop machinery ──────────────────────────
@@ -1358,6 +1370,101 @@ def reconcile_broker_floors(positions: list[dict], account_id: str) -> None:
                        "unfloored — will retry next cycle", unplaced)
         return
     _floors_reconciled = True
+
+
+def reconcile_option_entries(account_id: str) -> None:
+    """Repair stored option entry premiums that are quotes rather than fills.
+    Called once at startup.
+
+    WHY A RECONCILE AND NOT A BACKFILL. `entry_price` in the options store is a
+    DERIVED value whose derivation changed on 2026-09-10 (ask quote -> resolved
+    fill). Every stored value written before that is stale against the new logic,
+    and a one-shot cleanup would fix today's records while leaving the next
+    fallback-written record to drift silently. So this re-derives from the broker
+    every startup and is keyed off provenance, not off a date.
+
+    THE AUTHORITY IS THE BROKER, NOT THE QUOTE. The tempting test — "is
+    entry_price suspiciously close to the current ask?" — cannot work: a genuine
+    fill of 12.55 may match today's ask by coincidence (false positive), and a
+    quote-priced entry from last week usually will NOT match today's ask (false
+    negative, the case that matters). It compares two numbers that are not
+    measuring the same thing. `entry_fill_resolved` answers the question exactly,
+    which is why it is persisted.
+
+    Uses get_historical_orders, not get_order: `/orders/{id}` 404s once an order
+    ages out of the live blotter (confirmed 2026-09-10 on the AMD call's entry),
+    so the live endpoint cannot answer for a position opened on an earlier day —
+    which is precisely when a repair is needed.
+
+    Repairs are LOGGED LOUDLY and change live exit levels, because that is the
+    point: correcting 18.90 -> 12.55 moves the -50% stop from 9.45 to 6.28.
+    """
+    global _option_entries_reconciled, _option_entry_unresolved, \
+        _option_entries_repaired
+    if _option_entries_reconciled:
+        return
+    store = _load_option_positions()
+    if not store:
+        # Nothing held. Do NOT latch: the store is written by the entry path
+        # later in this same cycle, and spending the process's only pass on an
+        # empty file would leave a contract opened minutes from now unchecked
+        # until the next restart. Same reasoning as reconcile_broker_floors'
+        # empty-stop-file case.
+        return
+
+    suspect = {k: r for k, r in store.items()
+               if not r.get("entry_fill_resolved")
+               and float(r.get("entry_price") or 0) > 0}
+    # Adopted contracts (entry_price 0.0) are excluded above: "unknown premium"
+    # is a handled state, _option_exit_reason already refuses to arm thresholds
+    # on it, and there is no order id to repair from. Warning on them every
+    # startup would be noise that trains the reader to ignore this line.
+    if not suspect:
+        _option_entries_reconciled = True
+        return
+
+    history = tc.get_historical_orders(account_id, min(
+        str(r.get("entry_date") or date.today().isoformat()) for r in suspect.values()))
+    if history is None:
+        logger.warning("OPTION ENTRY reconcile skipped: order-history fetch failed "
+                       "— not repairing %d record(s) on an unknown broker state",
+                       len(suspect))
+        return                            # unlatched: retry next cycle
+    fills = {row["order_id"]: row["price"] for row in history
+             if row.get("order_id") and row.get("price")}
+
+    changed = False
+    for key, rec in suspect.items():
+        oid = rec.get("entry_order_id")
+        true_fill = fills.get(str(oid)) if oid else None
+        stored = float(rec.get("entry_price") or 0)
+        if true_fill is None:
+            _option_entry_unresolved += 1
+            logger.warning(
+                "OPTION ENTRY UNRESOLVED: %s (%s) stored entry %.2f is a QUOTE and "
+                "no broker fill could be matched (order_id=%s) — its %.0f%%/%.0f%% "
+                "premium thresholds are armed off that quote (unresolved entries #%d)",
+                key, rec.get("occ_symbol"), stored, oid,
+                config.OPTION_STOP_LOSS_PCT * 100,
+                config.OPTION_PROFIT_TARGET_PCT * 100, _option_entry_unresolved)
+            continue
+        rec["entry_price"] = true_fill
+        rec["entry_fill_resolved"] = True
+        store[key] = rec
+        changed = True
+        _option_entries_repaired += 1
+        logger.warning(
+            "OPTION ENTRY REPAIRED %s (%s): entry %.2f (quote) -> %.2f (broker fill) "
+            "— stop level %.2f -> %.2f, target %.2f -> %.2f (repairs #%d)",
+            key, rec.get("occ_symbol"), stored, true_fill,
+            stored * config.OPTION_STOP_LOSS_PCT,
+            true_fill * config.OPTION_STOP_LOSS_PCT,
+            stored * config.OPTION_PROFIT_TARGET_PCT,
+            true_fill * config.OPTION_PROFIT_TARGET_PCT,
+            _option_entries_repaired)
+    if changed:
+        _save_option_positions(store)
+    _option_entries_reconciled = True
 
 
 def _arm_stop_on_entry(symbol: str, entry_price: float, atr: Optional[float],
@@ -2965,9 +3072,28 @@ def _drop_option_position(key: str, occ_symbol: str, reason: str) -> None:
 
 
 def _option_record(occ_symbol: str, entry_price: float, expiration: str,
-                   opt_type: str, strike: float, underlying: float) -> dict:
+                   opt_type: str, strike: float, underlying: float,
+                   entry_fill_resolved: bool = False,
+                   entry_order_id=None) -> dict:
     """Build a store record. Two callers (fresh entry, legacy adoption), so the
-    schema is defined once — config.OPTIONS_POSITION_FILE documents it."""
+    schema is defined once — config.OPTIONS_POSITION_FILE documents it.
+
+    `entry_fill_resolved` is PROVENANCE on entry_price, and it exists because
+    entry_price is not a cosmetic field: _option_exit_reason computes BOTH the
+    +50% target and the -50% stop off it, so a wrong basis moves live exit
+    levels. It mirrors `bootstrapped` in stop_prices.json — same question ("is
+    this a real fill or an estimate?"), same reason for asking it.
+
+    False means the number is the ASK QUOTE at signal time, not an execution.
+    That was the ONLY thing ever stored here before 2026-09-10, which is how
+    AMD 260918C520 came to carry 18.90 against a true fill of 12.55 and stopped
+    out at 9.45 when its real -50% level was 6.28 — a ~3.2-point-early exit on a
+    position that was down 26%, not 50%.
+
+    `entry_order_id` is kept so reconcile_option_entries can go back to the
+    broker and repair an unresolved record later. A stored price cannot be
+    re-derived from anything else once the quote has moved.
+    """
     return {
         "occ_symbol":       occ_symbol,
         "entry_price":      entry_price,
@@ -2977,6 +3103,8 @@ def _option_record(occ_symbol: str, entry_price: float, expiration: str,
         "strike":           strike,
         "contracts":        config.OPTIONS_CONTRACTS,
         "underlying_entry": underlying,
+        "entry_fill_resolved": bool(entry_fill_resolved),
+        "entry_order_id":   entry_order_id,
     }
 
 
@@ -3169,8 +3297,15 @@ def evaluate_option(
             # entry_price is unknown at this point; the ledger remains the record
             # of what was actually paid.
             _option_adoptions += 1
+            # entry_fill_resolved=False is EXPLICIT, not a default: 0.0 means
+            # "unknown premium" and _option_exit_reason already guards on it, so
+            # this record must never look fill-backed to reconcile_option_entries
+            # either. There is no order id to repair from — the ledger remains the
+            # record of what was actually paid.
             _save_option_position(key, _option_record(occ_symbol, 0.0, exp_used,
-                                                      opt_type, strike, sig["close"]))
+                                                      opt_type, strike, sig["close"],
+                                                      entry_fill_resolved=False,
+                                                      entry_order_id=None))
             logger.info("OPTION POSITION ADOPTED %s (%s) — held at the broker but "
                         "absent from the store; exits now key off the stored symbol "
                         "(adoptions #%d)", key, occ_symbol, _option_adoptions)
@@ -3211,14 +3346,27 @@ def evaluate_option(
         else:
             entry_ok = (_bearish_cross_edge(sig, occ_symbol)
                         and sig["rsi"] > config.RSI_OVERSOLD)
-        if entry_ok and _open_option(account_id, occ_symbol, "buy_to_open",
-                                     entry_price, symbol, exp_used, strike,
-                                     opt_type, sig):
+        if not entry_ok:
+            return
+        opened = _open_option(account_id, occ_symbol, "buy_to_open",
+                              entry_price, symbol, exp_used, strike,
+                              opt_type, sig)
+        # `is not None`, NOT truthiness: _open_option hands back a dict on any
+        # placed order, and a resolved premium of 0.0 is data, not failure.
+        if opened is not None:
             _mark_bought(occ_symbol)
             # Persist immediately: from here every exit keys off THIS symbol, so
             # the underlying is free to move without orphaning the contract.
+            #
+            # entry_price stored is the RESOLVED FILL, not `entry_price` (the ask)
+            # — the whole point of the 2026-09-10 fix. _option_exit_reason arms
+            # both premium thresholds off this field, so storing the quote here
+            # was silently moving live exit levels by the size of entry slippage.
             _save_option_position(key, _option_record(
-                occ_symbol, entry_price, exp_used, opt_type, strike, sig["close"]))
+                occ_symbol, opened["entry_price"], exp_used, opt_type, strike,
+                sig["close"],
+                entry_fill_resolved=opened["fill_resolved"],
+                entry_order_id=opened["order_id"]))
 
     # Close existing position on the opposite STATE (not edge) — same fix as the
     # equities exits: a long call stranded by a missed bearish edge would ride to
@@ -3426,14 +3574,70 @@ def evaluate_future(root: str, account_id: str, positions: list[dict],
 
 
 def _open_option(account_id, occ_symbol, side, price, symbol, exp, strike, opt_type, sig):
+    """Open a contract. Returns None if the order did not place, else
+    `{"entry_price", "fill_resolved", "order_id"}` describing what was paid.
+
+    WHY THIS RETURNS THE PRICE IT PAID. Until 2026-09-10 this called log_trade
+    directly
+    with `price` — the ASK QUOTE — and resolved no fill at all, making the option
+    entry the LAST unresolved fill site in the bot. The 2026-07-27 correction
+    (`_resolve_fill`, 5f26dcd) fixed equity/futures entries and `_log_exit_trade`
+    later fixed all eight exit paths; this one site was missed because there is no
+    `_log_entry_trade` counterpart to be dragged through. Two things went wrong at
+    once and only one of them was visible:
+
+      * the ledger recorded a quote as a fill (`fill_price`/`slippage` null on
+        every option entry ever written — option entry slippage has never been
+        measured), and
+      * the caller persisted that same quote as the store's `entry_price`, which
+        arms BOTH premium thresholds — so the -50% stop and +50% target have
+        always been computed off the ask rather than off what was paid.
+
+    AMD 260918C520 is the worked case: ask 18.90 stored against a true broker
+    fill of 12.55, so the stop fired on a 9.25 bid at a "-50%" level of 9.45 when
+    the real one was 6.28. Returning the resolved price (rather than letting the
+    caller re-read the quote) is what keeps the ledger and the store agreeing on
+    one number; they disagreed for a month because each derived its own.
+
+    The caller gets `fill_resolved` and `order_id` back rather than re-deriving
+    them, so the ledger row and the store record are built from ONE resolution —
+    and so reconcile_option_entries has an order id to repair from later.
+
+    Returns None ONLY when the order failed. A resolved 0.0 is a real (if absurd)
+    answer, so callers must test `is not None`, not truthiness.
+    """
+    global _option_entry_unresolved
     qty = config.OPTIONS_CONTRACTS
     logger.info("SIGNAL %s %s x%d", side.upper(), occ_symbol, qty)
     result = tc.place_option_order(account_id, occ_symbol, side, qty)
-    if result:
-        order_id = result.get("order", {}).get("id")
-        log_trade(side.upper(), occ_symbol, qty, price, "market", order_id,
-                  f"{symbol} EMA cross, RSI={sig['rsi']:.1f}, strike={strike} {opt_type} exp={exp}")
-    return result
+    if not result:
+        return None
+
+    order_id = result.get("order", {}).get("id")
+    # `price` (the ask) is the signal price for slippage purposes: it is what we
+    # expected to pay when the decision was made. _resolve_fill returns
+    # (signal_price, None, None) on a lookup miss and warns, so `resolved` is
+    # always safe to use as the entry basis — degraded, not disabled.
+    resolved, fill_price, slippage = _resolve_fill(
+        occ_symbol, account_id, order_id, price, side.upper())
+
+    if fill_price is None:
+        # Falls back to the ask, which is the OLD behaviour — but now it is
+        # counted and named instead of being indistinguishable from a real fill.
+        # A rising counter here means live entry premiums are being recorded off
+        # quotes again, and every threshold armed in that window is suspect.
+        _option_entry_unresolved += 1
+        logger.warning("OPTION ENTRY UNRESOLVED: %s using ask %.2f as fallback "
+                       "— premium thresholds armed off a QUOTE, not a fill "
+                       "(unresolved entries #%d)",
+                       occ_symbol, resolved, _option_entry_unresolved)
+
+    log_trade(side.upper(), occ_symbol, qty, price, "market", order_id,
+              f"{symbol} EMA cross, RSI={sig['rsi']:.1f}, strike={strike} {opt_type} exp={exp}",
+              fill_price=fill_price, signal_price=price, slippage=slippage)
+    return {"entry_price":   resolved,
+            "fill_resolved": fill_price is not None,
+            "order_id":      order_id}
 
 
 def _close_option(account_id, occ_symbol, held, price, symbol, exp, strike,

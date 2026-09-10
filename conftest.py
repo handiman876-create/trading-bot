@@ -121,6 +121,31 @@ def isolate_bot_state(tmp_path, monkeypatch):
     # note_regime twice inside one test.
     monkeypatch.setattr(strategy, "_last_sentiment_note", None, raising=False)
 
+    # NO TEST MAY REACH THE BROKER'S HTTP BOUNDARY. Stubbed at tc._get, which is
+    # the single chokepoint every read endpoint funnels through, rather than at
+    # the named helpers — those are themselves under test (test_order_outcome and
+    # test_fill_price stub _get and call get_order_outcome for real), so pinning
+    # the helpers would replace the thing being tested.
+    #
+    # WHY THIS EXISTS: on 2026-09-10 the option-entry fill resolution added a
+    # tc.get_order call to the entry path, and the three option test modules had
+    # no reason to stub it — they stub place_option_order. The suite silently
+    # started issuing live GETs to sim-api (403s), each one preceded by a token
+    # refresh, against an endpoint that 401s after ~4 cold refreshes in a few
+    # minutes. Tests were still GREEN: get_order_outcome catches the failure and
+    # reports "unknown", which the entry path correctly treats as an unresolved
+    # fill. So the network access was invisible in the results and would have
+    # stayed invisible until the token endpoint started refusing the live bot.
+    #
+    # Raising (not returning empty) is deliberate: every caller of _get already
+    # handles an exception as "lookup failed", so a test that unexpectedly reaches
+    # here degrades exactly the way production does instead of being handed
+    # fabricated success. A test that WANTS broker data stubs _get itself.
+    import tradestation_client as tc
+    monkeypatch.setattr(tc, "_get", lambda *a, **k: (_ for _ in ()).throw(
+        RuntimeError("conftest: tc._get blocked — stub the broker in your test")),
+        raising=False)
+
     # The broker stop floor is OFF for every test unless the test opts in. It
     # reaches the network through tc.place_equity_order with keyword arguments
     # (order_type/duration/stop_price), and the stubs across the older test

@@ -239,6 +239,13 @@ def _evaluate_cycle(account_id: str) -> None:
         except Exception as exc:
             logger.error("Error evaluating stock %s: %s", symbol, exc)
 
+    # Repair any stored option entry premium that is an ask quote rather than a
+    # broker fill, BEFORE the options loop can arm a +50%/-50% threshold off it.
+    # Startup-only and self-latching, so it costs one order-history fetch per
+    # process. Sits below the futures early-return because options are an
+    # equities-mode feature and the futures account holds no contracts.
+    strategy.reconcile_option_entries(account_id)
+
     expiration = mh.next_monthly_expiration()
     for (symbol, opt_type) in config.OPTIONS_WATCHLIST:
         _cycle_options += 1
