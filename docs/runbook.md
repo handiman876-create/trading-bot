@@ -75,6 +75,71 @@ the bare `|` is the only broken form. This has produced false all-clears on stop
 exits, futures activity and sentiment checks, so it is promoted out of the
 CRITICAL note above to its own heading.
 
+### Exit / stop event check — and never filter on `strategy: `
+
+**Correct pattern:**
+
+```bash
+grep -E "EXIT|STOP ARMED|WATER FLOOR|PROFIT FLOOR|SIGNAL BUY|SELL_TO_CLOSE" \
+  ~/trading-bot/logs/bot.log \
+  | grep -v "\] bot: "          # ← drop the startup banner, see below
+```
+
+**Drop the `bot: ` lines, but never the `strategy: ` ones.** The startup banner
+*describes* these features in `[INFO] bot:` text ("Water floor : ENABLED ...",
+"Profit floor: ENABLED ...", "Option exits: ENABLED ..."), so on any day the bot
+restarted it matches the pattern without an event having occurred. On
+2026-09-10 that was **exactly half the hits — 6 banner, 6 real.** Same
+false-positive class as `grep "CRITICAL"` matching the banner (above): a loose
+pattern gives a false POSITIVE on a quiet bot, and because you learn to skim
+past it, a false negative on the day it matters.
+
+**Wrong pattern — DO NOT USE:**
+
+```bash
+... | grep -v "bot: " | grep -v "strategy: "    # ← removes every exit
+```
+
+**Exits are logged by the `strategy` logger** (and the settled fill line by
+`trade`). The `bot` logger only carries session lifecycle — market open/closed,
+`cycle work=`. So the two exclusions above, added to strip per-symbol quote
+spam, delete exactly the lines being looked for and return empty. That reads as
+"nothing happened today" rather than "I filtered out the answer."
+
+The reason the filter is tempting is that `strategy: ` prefixes **both** the
+routine per-symbol poll lines *and* the exit events — it is a logger name, not
+an event class, so it cannot separate noise from signal. Seen 2026-09-10: a
+five-stage pipeline reported no META and no AMD-call exit on a day both had
+exited.
+
+To cut the poll spam, exclude the *symbols* or filter on level instead:
+
+```bash
+# per-symbol poll lines are "strategy: SPY | price=..." — the symbol, not the logger
+grep -E "EXIT|WATER FLOOR|STOP TRAIL" bot.log | grep -vE "strategy: [A-Z]+ \|"
+
+# highest signal of all: every stop/option exit is WARNING, no banner noise
+grep "\[WARNING\]" bot.log
+```
+
+The `[WARNING]` filter is the one to reach for first. On 2026-09-10 it returned
+**3 lines** — both real exits plus one `SECTOR MAP GAP` warning — against 12 for
+the pattern above. Note it will NOT show the `trade:` fill line (that is `[INFO]`),
+so use it to find *that* an exit happened and `trades.log` to find at what price.
+
+**Better still, read `logs/trades.log`.** It is the authoritative exit record:
+one JSON object per fill carrying `fill_price`, `slippage`, `stop_at_exit`,
+`water_at_exit` and the `*_caused_exit` attribution flags. Answering "how did X
+exit" from `bot.log` greps is doing it the hard way, and the attribution flags
+are not in `bot.log` at all.
+
+**Timestamp trap:** `bot.log` is **UTC**, `trades.log` is **ET** (`EDT`/`EST`
+suffixed). The two disagree by 4–5 hours by design — do not align them by eye,
+and note a date filter on `bot.log` is usually redundant since it holds one day.
+
+Same silent-empty-grep family as the `-E` trap above and the dated-grep trap
+under *Seasonality failure check*.
+
 ### Rotation and the weekend gap
 
 Rotation is `logrotate.timer` → `OnCalendar=daily`, system TZ is `Etc/UTC`, so

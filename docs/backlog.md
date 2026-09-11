@@ -1713,3 +1713,62 @@ monitoring: if ES dips and crosses bearish, watch
 for SUSTAIN PENDING in futures_bot.log.
 
 **Priority:** LOW (monitoring only)
+
+## SIM option fills are unreliable — no SIM option P&L is usable
+
+**Priority:** LOW (informational — a measurement constraint, not a defect to fix)
+
+**Observed 2026-09-10.** AMD 260918C520, the bot's only complete option round
+trip. Both legs executed far off the quoted book, both times in our favour:
+
+| leg | real quote at the decision | SIM `ExecutionPrice` | edge to us |
+|---|---|---|---|
+| buy 09-09 14:17:47 UTC | ask **18.90** (bid 18.40) | **12.55** | **+$6.35/sh** |
+| sell 09-10 13:57:14 UTC | bid **9.25** (ask 9.65) | **16.80** | **+$7.55/sh** |
+
+Phantom edge **~$13.90/share = $1,390 per 1-contract round trip.**
+
+**The SIM's own order record contradicts itself.** Order `970772011` carries:
+
+```
+"PriceUsedForBuyingPower": "9.5"      <- valued at the market
+"FilledPrice":             "16.8"     <- executed here
+```
+
+One document, two prices, ~$7.30 apart. That is the cleanest tell available —
+check this field before arguing from the option chain. Cash corroborates both
+legs independently of the API (−$1,256.00 = 12.55×100 + $1; +$1,679.00 =
+16.80×100 − $1), so the SIM genuinely booked these prices; it is the execution
+engine that is unrealistic, not the reporting.
+
+**Why it matters more than a one-off would.** The artifacts land on BOTH legs and
+therefore largely cancel in the difference, which is exactly what makes them
+dangerous: a trade that cost **−$965** at market prices books as a **+$425
+winner**. The sign flips. A per-leg error that averaged out would be tolerable;
+this one inverts the conclusion.
+
+**POLICY: no option P&L from SIM3297101M is usable for strategy evaluation.**
+That covers win rate, capture ratio, and any ±50% threshold tuning. Equity and
+futures fills have never shown this behaviour — treat it as options-specific
+until a second instrument does.
+
+**This is NOT what `022635a` fixed.** That commit fixed the bot recording the ask
+quote as the entry premium, which had armed the ±50% thresholds off a quote
+(AMD's −50% stop sat at 9.45 when the true fill 12.55 put it at 6.28). Correct
+thresholds computed off a fantasy fill price are still fantasy. The two problems
+are independent and only the first one was ours.
+
+**Direction — to validate option strategy properly, one of:**
+
+* a different paper broker whose option fills respect the book; or
+* go live at minimum size (1 contract), accepting real but small loss exposure.
+
+Until then the option path is exercised for CORRECTNESS only — that the rules
+fire on the right thresholds, in the right order, against the right symbol — and
+never for PROFITABILITY. n=1 round trip either way, so nothing is being given up
+today.
+
+**Blocks:** "Options exit thresholds are arbitrary (not hardcoded —
+unvalidated)" above cannot be closed from SIM data. It needs one of the two
+options above first; that entry's premise is that the thresholds can be judged
+on outcomes, and in this account they cannot.
