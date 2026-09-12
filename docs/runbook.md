@@ -75,6 +75,24 @@ the bare `|` is the only broken form. This has produced false all-clears on stop
 exits, futures activity and sentiment checks, so it is promoted out of the
 CRITICAL note above to its own heading.
 
+**No newlines inside the quotes either.** Wrapping a long alternation across
+lines for readability splits it into two patterns, and the first one is left
+ending in a bare `|` — an empty alternative:
+
+```bash
+grep -nE "at most 400|disallows timeframes|
+GEN-FAIL|^DONE"                       # ← BROKEN, two patterns, first ends in `|`
+grep -nE "at most 400|disallows timeframes|GEN-FAIL|^DONE"   # ← correct
+```
+
+What happens next depends on which `grep` is on PATH, and **both outcomes are
+silent**: GNU grep treats the empty alternative as matching every line, so you
+get the whole file back and every line looks like a hit; `ugrep` (what is
+actually installed here) rejects the pattern with `empty (sub)expression` and
+prints **zero** matches, which piped into `wc -l` or `head` reads as a clean
+all-clear. Same failure family as the missing `-E` — keep the alternation on one
+line and let it run long.
+
 ### Exit / stop event check — and never filter on `strategy: `
 
 **Correct pattern:**
@@ -391,9 +409,10 @@ Run after 07:30 UTC **any day** — `OnCalendar=*-*-* 03:00:00 America/New_York`
 is every day, not weekdays; the timer demonstrably fired Sat 08-29 and Sun 08-30.
 
 ```bash
+# Keep the whole alternation on ONE line — no newlines inside quotes!
 awk '/autodiscover START/{buf=""} {buf=buf $0 ORS} END{printf "%s", buf}' \
   ~/strategy-discovery/logs/autodiscover.log |
-  grep -nE "seasonality|at most 400|disallows timeframes|^DONE"
+  grep -nE "at most 400|disallows timeframes|GEN-FAIL|^DONE"
 ```
 
 A clean run has **no** `at most 400` and **no** `disallows timeframes` lines, and
