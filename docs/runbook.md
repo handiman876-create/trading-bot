@@ -81,8 +81,8 @@ ending in a bare `|` — an empty alternative:
 
 ```bash
 grep -nE "at most 400|disallows timeframes|
-GEN-FAIL|^DONE"                       # ← BROKEN, two patterns, first ends in `|`
-grep -nE "at most 400|disallows timeframes|GEN-FAIL|^DONE"   # ← correct
+GEN-FAIL|seasonality|^DONE"           # ← BROKEN, two patterns, first ends in `|`
+grep -nE "at most 400|disallows timeframes|GEN-FAIL|seasonality|^DONE"  # ← correct
 ```
 
 What happens next depends on which `grep` is on PATH, and **both outcomes are
@@ -412,7 +412,7 @@ is every day, not weekdays; the timer demonstrably fired Sat 08-29 and Sun 08-30
 # Keep the whole alternation on ONE line — no newlines inside quotes!
 awk '/autodiscover START/{buf=""} {buf=buf $0 ORS} END{printf "%s", buf}' \
   ~/strategy-discovery/logs/autodiscover.log |
-  grep -nE "at most 400|disallows timeframes|GEN-FAIL|^DONE"
+  grep -nE "at most 400|disallows timeframes|GEN-FAIL|seasonality|^DONE"
 ```
 
 A clean run has **no** `at most 400` and **no** `disallows timeframes` lines, and
