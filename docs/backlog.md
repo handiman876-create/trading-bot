@@ -101,7 +101,7 @@ Corroborating: -1.21% mean drift from entry to same-day close across all 14
 closed shorts, underwater at the close on 79% of them, vs +0.16% / 52% for
 longs over the same window.
 
-**See the `## SHORT_MAX_ATR_PCT` section below (line 143 as of this commit) for
+**See the `## SHORT_MAX_ATR_PCT` section below (line 211 as of this commit) for
 the full analysis and ledger evidence,** including the caveat that drift-to-close
 is corroboration rather than independent proof (median hold 143.7h; only 5 of 45
 trips are intraday). Search the heading, not the line number — adding this gate
@@ -114,7 +114,7 @@ and an uncapped overnight short gap is the one loss this book cannot bound. The
 `## Earnings blackout for short entries` section below has the worked CRWD
 example.
 
-**Action:** set `ENABLE_SHORTING = False` at `config.py:397` before deploying
+**Action:** set `ENABLE_SHORTING = False` at `config.py:416` before deploying
 live. **Estimated time: 1 line, 5 minutes** — and verified cheap, not assumed:
 
 - No test depends on the ambient value. `test_ema_gap`, `test_cross_sustain`,
@@ -129,6 +129,37 @@ live. **Estimated time: 1 line, 5 minutes** — and verified cheap, not assumed:
 
 Revisit only if death-cross-short clears `ci_lower > 1.0` in the discovery
 pipeline. Confirmed 2026-09-04 by `entry_time_analysis.py` (`3c3f8f9`).
+
+### 2026-09-14: first production suppression of a sustained short signal
+
+CRWV bearish cross held **30.2 min** and fired: `SUSTAIN CONFIRMED CRWV bearish
+cross: held 30.2 min (>= 30), firing signal` at `19:59:15` UTC — **15:59 ET, the
+session's last poll**; the market closed 45 s later. Every other entry gate would
+have passed: RSI 44.7 > `RSI_OVERSOLD` 30, `held == 0`, effective regime
+`risk_on` >= `SHORT_MIN_REGIME` `risk_on`, `block_new_entries` False. **Old code
+would have shorted here** — seconds before the bell, and note there is no
+late-session entry cutoff among the gates.
+
+**Caveat: the suppression was NOT observed.** `ENABLE_SHORTING` is checked in the
+`elif` condition itself (`strategy.py:2984`), so the branch never executed and
+nothing was logged or counted. This record is *inferred* from the absent `SHORT
+ENTRY` line, not from positive evidence. The `block_shorts` gate 12 lines below
+is checked INSIDE the branch specifically so it can be seen firing; the master
+switch has no such counter — see the section below.
+
+## Add a counter to the ENABLE_SHORTING gate
+
+The master switch is checked in the `elif` condition (`strategy.py:2984`), so a
+suppressed short produces no log line and no counter — the 2026-09-14 CRWV
+suppression above had to be inferred from an absent `SHORT ENTRY` line.
+
+The `block_shorts` gate 12 lines below is checked INSIDE the branch specifically
+so it can be seen firing, and its own comment says a safety net you cannot see
+firing is one you cannot later argue for removing. The master switch should get
+the same treatment before the live-gate decision is revisited, or there will be
+no evidence base for it either way.
+
+**Estimated time:** restructure one `elif`, add one counter + log line.
 
 ## A/B tracker: option IV needs an entitled Polygon key
 
