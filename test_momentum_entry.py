@@ -18,6 +18,17 @@ import strategy
 _orders = []          # (symbol, side, qty) captured from place_equity_order
 
 
+def _capture_logs():
+    """Swap strategy.logger.info for a collector. Mirrors the helper in
+    test_breakeven_lock_label.py — the suite deliberately avoids pytest's
+    caplog fixture because every test file here is also runnable standalone
+    (`python3 test_momentum_entry.py`), where fixtures do not exist."""
+    msgs = []
+    orig = strategy.logger.info
+    strategy.logger.info = lambda fmt, *a: msgs.append(fmt % a if a else fmt)
+    return msgs, orig
+
+
 def _fake_place(account_id, symbol, side, qty):
     _orders.append((symbol, side, qty))
     return {"order": {"id": "T1"}}
@@ -38,6 +49,7 @@ def _reset():
     strategy._short_entries = 0
     strategy._short_covers = 0
     strategy._regime_short_blocks = 0
+    strategy._shorting_disabled_blocks = 0
     strategy._entries_delayed = 0
     strategy._latches_reconstructed = 0
     strategy._signaled_buy_today.clear()
@@ -231,6 +243,49 @@ def test_shorting_disabled_no_short():
                             regime="cautious")
     assert _sides("sell_short") == [], "ENABLE_SHORTING=False disables shorting"
     assert strategy._regime_short_blocks == 0, "master switch must block first"
+    assert strategy._shorting_disabled_blocks == 1, \
+        "the master switch must COUNT what it suppressed"
+
+
+def test_shorting_disabled_block_is_observable():
+    """The master-switch suppression must be visible, not inferred.
+
+    Until 2026-09-14 `ENABLE_SHORTING` sat in the short branch's elif condition,
+    so a suppressed short produced no log line and no counter. The 2026-09-14
+    CRWV death cross sustained 30.2 min and fired with every other gate open,
+    and the suppression had to be reconstructed from the ABSENCE of a SHORT
+    ENTRY line. This pins that a fired-and-suppressed short now says so.
+    """
+    _reset(); _set_sig(bearish_cross=True)
+    strategy.config.ENABLE_SHORTING = False
+    msgs, orig_log = _capture_logs()
+    try:
+        strategy.evaluate_stock("CRWV", "ACCT", [], 100000.0,
+                                is_momentum=False, momentum_generation="",
+                                regime="risk_on")
+    finally:
+        strategy.logger.info = orig_log
+    assert _sides("sell_short") == []
+    line = next((m for m in msgs if "SHORTING DISABLED" in m), None)
+    assert line is not None, f"suppression must be logged, not silent: {msgs}"
+    assert "CRWV" in line and "#1" in line, line
+
+
+def test_shorting_disabled_not_counted_when_regime_blocks_anyway():
+    """The counter measures what the FLAG alone suppressed.
+
+    In defensive/crisis `block_new_entries` stops the entry whatever the master
+    switch says, so counting those would credit ENABLE_SHORTING with
+    suppressions it did not cause and overstate the case for keeping the gate.
+    """
+    _reset(); _set_sig(bearish_cross=True)
+    strategy.config.ENABLE_SHORTING = False
+    strategy.evaluate_stock("AAPL", "ACCT", [], 100000.0,
+                            is_momentum=False, momentum_generation="",
+                            regime="crisis")
+    assert _sides("sell_short") == []
+    assert strategy._shorting_disabled_blocks == 0, \
+        "regime already blocked it — not attributable to the master switch"
 
 
 def test_shorting_disabled_still_covers_an_open_short():

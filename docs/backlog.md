@@ -140,26 +140,34 @@ have passed: RSI 44.7 > `RSI_OVERSOLD` 30, `held == 0`, effective regime
 would have shorted here** — seconds before the bell, and note there is no
 late-session entry cutoff among the gates.
 
-**Caveat: the suppression was NOT observed.** `ENABLE_SHORTING` is checked in the
-`elif` condition itself (`strategy.py:2984`), so the branch never executed and
-nothing was logged or counted. This record is *inferred* from the absent `SHORT
-ENTRY` line, not from positive evidence. The `block_shorts` gate 12 lines below
-is checked INSIDE the branch specifically so it can be seen firing; the master
-switch has no such counter — see the section below.
+**Caveat: this specific suppression was NOT observed.** At the time,
+`ENABLE_SHORTING` was checked in the `elif` condition itself, so the branch never
+executed and nothing was logged or counted — the record above is *inferred* from
+the absent `SHORT ENTRY` line, not from positive evidence. **Fixed the same day**
+(see below), after the close — so the counter goes live with the 2026-09-15
+session, and this should be the last entry in this file reconstructed that way.
 
-## Add a counter to the ENABLE_SHORTING gate
+## DONE 2026-09-14: counter on the ENABLE_SHORTING gate
 
-The master switch is checked in the `elif` condition (`strategy.py:2984`), so a
-suppressed short produces no log line and no counter — the 2026-09-14 CRWV
-suppression above had to be inferred from an absent `SHORT ENTRY` line.
+`ENABLE_SHORTING` moved out of the short branch's `elif` condition and into the
+branch body, ahead of the `block_shorts` check, with counter
+`_shorting_disabled_blocks` and log line `SHORTING DISABLED: skipping short
+<SYM> — death cross fired (RSI=…, regime=…) with every other entry gate open;
+ENABLE_SHORTING=False suppressed it #N`. The startup `Shorting :` banner names
+the counter in both the equities and futures modes (one shared string).
 
-The `block_shorts` gate 12 lines below is checked INSIDE the branch specifically
-so it can be seen firing, and its own comment says a safety net you cannot see
-firing is one you cannot later argue for removing. The master switch should get
-the same treatment before the live-gate decision is revisited, or there will be
-no evidence base for it either way.
+**What the counter deliberately does NOT count:** `block_new_entries` stays in
+the `elif`, so a death cross in defensive/crisis is not attributed to the master
+switch — the regime would have blocked it anyway. The counter answers one
+question: how many shorts would this flag *alone* have let through. A reading of
+0 means the gate is costing nothing; a rising reading is the evidence base for
+the live-gate decision, which previously had none.
 
-**Estimated time:** restructure one `elif`, add one counter + log line.
+Safe by inspection: the short branch is the last in its `if/elif` chain with no
+trailing `else`, so moving the flag into the body cannot divert a fall-through.
+Pinned by three tests in `test_momentum_entry.py` — the counter increments, the
+line is logged, and crisis regime does *not* increment it. Full suite 699 passed
+(3 pre-existing futures-403 failures unrelated).
 
 ## A/B tracker: option IV needs an entitled Polygon key
 

@@ -409,7 +409,9 @@ def _shorting_banner(scope: str) -> str:
     """
     if not config.ENABLE_SHORTING:
         return ("DISABLED — long-only; no NEW short entries. ENTRY-only gate: "
-                "open shorts still trail, stop and cover normally.")
+                "open shorts still trail, stop and cover normally. "
+                "Counter: SHORTING DISABLED (a death cross that fired with "
+                "every other gate open; 0 means the flag is costing nothing).")
     return "ENABLED (%s, death-cross entries)" % scope
 
 

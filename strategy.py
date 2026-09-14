@@ -465,6 +465,12 @@ _low_vol_stops = 0         # stops armed WIDER  than normal (ATR/price <= 2%)
 _cross_gap_blocks = 0      # would-be signals suppressed by EMA_CROSS_MIN_GAP_PCT
 _cross_sustain_blocks = 0  # gap-valid entry crosses deferred by CROSS_SUSTAIN_MINUTES
 _regime_short_blocks = 0   # would-be short entries suppressed by SHORT_MIN_REGIME
+_shorting_disabled_blocks = 0  # would-be short entries suppressed by ENABLE_SHORTING
+                               # itself — a death cross that fired with every OTHER
+                               # entry gate open. Counts only suppressions the master
+                               # switch alone caused (see the branch for why
+                               # block_new_entries is excluded), so this is the
+                               # evidence base for keeping or dropping the live gate.
 _stops_trailed = 0         # stop moves the ATR TRAIL itself caused. NOT every
                            # stop move: a move a floor pushed beyond the trail
                            # belongs to that floor and is excluded (fixed
@@ -2784,6 +2790,7 @@ def evaluate_stock(symbol: str, account_id: str, positions: list[dict],
                    blocked_symbols=frozenset()) -> None:
     global _momentum_align_entries, _short_entries, _short_covers, _entries_delayed
     global _crisis_exits, _sentiment_sector_blocks, _regime_short_blocks
+    global _shorting_disabled_blocks
     global _friday_short_closes
 
     history = tc.get_historical(symbol, days=90)
@@ -2981,12 +2988,33 @@ def evaluate_stock(symbol: str, account_id: str, positions: list[dict],
     # block_new_entries. Mirrors the long BUY: same RSI gate, same held==0.
     # Stays EDGE-based: it is an entry. On state it would re-short every poll.
     elif (_bearish_cross_edge(sig, symbol) and sig["rsi"] > config.RSI_OVERSOLD
-          and held == 0 and config.ENABLE_SHORTING and not block_new_entries):
-        # SHORT_MIN_REGIME gate. Checked INSIDE the branch, not as an extra elif
-        # condition, so a blocked short is counted and logged rather than
+          and held == 0 and not block_new_entries):
+        # BOTH short gates are checked INSIDE the branch, not as extra elif
+        # conditions, so a blocked short is counted and logged rather than
         # silently falling through to nothing — a safety net you cannot see
         # firing is one you cannot later argue for removing.
-        if block_shorts:
+        #
+        # ENABLE_SHORTING sat in the elif condition itself until 2026-09-14, and
+        # that is exactly how the rule above got violated by the master switch:
+        # the 2026-09-14 CRWV death cross sustained 30.2 min and fired with
+        # every other gate open, yet produced no log line and no counter, so the
+        # suppression had to be reconstructed from the ABSENCE of a SHORT ENTRY
+        # line. See docs/backlog.md `### 2026-09-14: first production
+        # suppression of a sustained short signal`.
+        #
+        # `block_new_entries` deliberately stays in the elif. In
+        # defensive/crisis the regime blocks the entry whatever the master
+        # switch says, so counting those would credit ENABLE_SHORTING with
+        # suppressions it did not cause. The counter answers one question only:
+        # how many shorts would this flag alone have let through.
+        if not config.ENABLE_SHORTING:
+            _shorting_disabled_blocks += 1
+            logger.info("SHORTING DISABLED: skipping short %s — death cross "
+                        "fired (RSI=%.1f, regime=%s) with every other entry "
+                        "gate open; ENABLE_SHORTING=False suppressed it "
+                        "#%d", symbol, sig["rsi"], regime,
+                        _shorting_disabled_blocks)
+        elif block_shorts:
             _regime_short_blocks += 1
             logger.info("REGIME BLOCK: skipping short %s — regime=%s below "
                         "SHORT_MIN_REGIME=%s (market not fearful enough to "
