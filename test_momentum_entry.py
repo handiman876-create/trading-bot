@@ -54,6 +54,13 @@ def _reset():
     strategy._latches_reconstructed = 0
     strategy._signaled_buy_today.clear()
     strategy._signaled_sell_today.clear()
+    # Per-episode counter dedupe. MUST be cleared between tests: it is keyed by
+    # (symbol, direction) and survives a _reset otherwise, so a later test
+    # reusing the same symbol would see its counter stay at 0 and "pass" for the
+    # wrong reason.
+    strategy._counted_cross_episodes.clear()
+    strategy._cross_first_seen.clear()
+    strategy._cross_confirmed.clear()
     # These tests exercise SIGNAL logic, not the clock: pin the entry gate open
     # so they pass regardless of when the suite runs. The gate's own behaviour is
     # covered in test_entry_delay.py.
@@ -269,6 +276,90 @@ def test_shorting_disabled_block_is_observable():
     line = next((m for m in msgs if "SHORTING DISABLED" in m), None)
     assert line is not None, f"suppression must be logged, not silent: {msgs}"
     assert "CRWV" in line and "#1" in line, line
+
+
+def _poll_short_suppression(symbol, polls, regime="cautious"):
+    """Drive N cycles of evaluate_stock on a live death cross for `symbol`."""
+    for _ in range(polls):
+        strategy.evaluate_stock(symbol, "ACCT", [], 100000.0,
+                                is_momentum=False, momentum_generation="",
+                                regime=regime)
+
+
+def test_shorting_disabled_counts_one_per_cross_not_per_poll():
+    """The counter's unit is a SIGNAL, not a poll.
+
+    2026-09-15: one NVDA death cross held from 11:17 ET to the close and read
+    264 — the 60s poll count, not the signal count. The "edge" it sits behind is
+    a BAR-level edge (indicators.py: prev bar on the far side, current bar
+    across), and on the daily timeframe the prior bar stays on the far side all
+    session, so the edge is true on every poll of the day it fired. 264 reads as
+    264 forgone shorts when the honest number is 1, which would badly overstate
+    the case for reopening the ENABLE_SHORTING gate.
+    """
+    _reset(); _set_sig(bearish_cross=True)
+    strategy.config.ENABLE_SHORTING = False
+    msgs, orig_log = _capture_logs()
+    try:
+        _poll_short_suppression("NVDA", 264)       # the real 2026-09-15 poll count
+    finally:
+        strategy.logger.info = orig_log
+    assert _sides("sell_short") == [], "still no short, obviously"
+    assert strategy._shorting_disabled_blocks == 1, \
+        f"one cross = one increment, got {strategy._shorting_disabled_blocks}"
+    # The LOG stays per-poll on purpose — that is how you see the signal is
+    # still live right now — so the line count is the poll rate and the #N in it
+    # is the signal count.
+    lines = [m for m in msgs if "SHORTING DISABLED" in m]
+    assert len(lines) == 264, f"log line should still fire every poll: {len(lines)}"
+    assert lines[-1].endswith("#1"), lines[-1]
+
+
+def test_shorting_disabled_counts_each_symbol_separately():
+    """A second name suppressed is a second forgone short."""
+    _reset(); _set_sig(bearish_cross=True)
+    strategy.config.ENABLE_SHORTING = False
+    _poll_short_suppression("NVDA", 30)
+    _poll_short_suppression("AAPL", 30)
+    assert strategy._shorting_disabled_blocks == 2, \
+        f"two distinct crosses = 2, got {strategy._shorting_disabled_blocks}"
+
+
+def test_shorting_disabled_dedupe_survives_interleaved_symbols():
+    """Regression against a single-slot "last counted symbol" dedupe.
+
+    The cycle loop walks the whole watchlist every poll, so two names with live
+    death crosses alternate NVDA, AAPL, NVDA, AAPL... A "did the symbol change
+    since last time?" check returns True on every one of those and counts polls
+    again, just twice as fast. Only a per-(symbol, direction) key is correct.
+    """
+    _reset(); _set_sig(bearish_cross=True)
+    strategy.config.ENABLE_SHORTING = False
+    for _ in range(20):
+        _poll_short_suppression("NVDA", 1)
+        _poll_short_suppression("AAPL", 1)
+    assert strategy._shorting_disabled_blocks == 2, \
+        f"still two crosses, not 40 polls, got {strategy._shorting_disabled_blocks}"
+
+
+def test_shorting_disabled_recounts_a_genuinely_new_cross():
+    """Dedupe must not swallow a real second signal.
+
+    The cross lapsing is what ends an episode, so a cross that clears and later
+    re-forms is a NEW forgone short and counts again. Without this the counter
+    would undercount to 1 forever per symbol per process.
+    """
+    _reset(); _set_sig(bearish_cross=True)
+    strategy.config.ENABLE_SHORTING = False
+    _poll_short_suppression("NVDA", 10)
+    assert strategy._shorting_disabled_blocks == 1
+    _set_sig(bearish_cross=False)                  # cross lapses -> episode over
+    _poll_short_suppression("NVDA", 3)
+    assert strategy._shorting_disabled_blocks == 1, "no cross, no new count"
+    _set_sig(bearish_cross=True)                   # a genuinely new cross
+    _poll_short_suppression("NVDA", 10)
+    assert strategy._shorting_disabled_blocks == 2, \
+        f"re-formed cross is a new signal, got {strategy._shorting_disabled_blocks}"
 
 
 def test_shorting_disabled_not_counted_when_regime_blocks_anyway():

@@ -147,6 +147,38 @@ def _bullish_state(sig: dict, symbol: str = "") -> bool:
 _cross_first_seen: dict[tuple[str, str], float] = {}
 _cross_confirmed: set = set()
 
+# Cross episodes already tallied by a per-episode counter, per (symbol, direction).
+# Lives here, beside the clocks, because it shares their lifecycle exactly: an
+# entry is added the first time an episode is counted and dropped by
+# _clear_cross_clock the moment the cross stops being valid, so a cross that
+# lapses and re-forms is a NEW episode and counts again.
+#
+# Needed because the "edge" above is a bar-level edge polled every 60s: on the
+# daily timeframe the prior bar sits on the far side for the whole session, so a
+# single death cross presents as ~390 consecutive true readings. A counter that
+# increments on each one measures POLL RATE, not signals — the 2026-09-15 NVDA
+# cross read 264 when the honest answer was 1.
+_counted_cross_episodes: set[tuple[str, str]] = set()
+
+
+def _first_tally_for_episode(symbol: str, kind: str) -> bool:
+    """True the FIRST time this cross episode is tallied, False on every later
+    poll of the same episode. Guard a per-signal counter with this; leave the
+    log line ungated so the running total still prints every poll.
+
+    Keyed identically to the cross clocks so _clear_cross_clock is the single
+    reset point. A symbol-and-direction pair is the right key, not a "last
+    counted symbol": the cycle loop walks the whole watchlist, so two names
+    suppressed in the same session alternate every poll and a single-slot
+    "changed since last time?" check would return True on each one — counting
+    polls again, just twice as fast.
+    """
+    key = (symbol or "<unnamed>", kind)
+    if key in _counted_cross_episodes:
+        return False
+    _counted_cross_episodes.add(key)
+    return True
+
 
 def _sustain_minutes() -> int:
     """The active persistence requirement, or 0 when the rule is off."""
@@ -205,6 +237,10 @@ def _clear_cross_clock(symbol: str, kind: str, what: str = "") -> None:
     first = _cross_first_seen.pop(key, None)
     confirmed = key in _cross_confirmed
     _cross_confirmed.discard(key)
+    # The episode is over, so the next appearance is a new signal and must be
+    # counted again. Dropped BEFORE the early returns below: an episode that
+    # never started a clock still needs its tally slot cleared.
+    _counted_cross_episodes.discard(key)
     if first is None or confirmed:
         return
     need = _sustain_minutes()
@@ -225,6 +261,7 @@ def _clear_cross_clocks_for(symbol: str) -> None:
         key = (symbol or "<unnamed>", kind)
         _cross_first_seen.pop(key, None)
         _cross_confirmed.discard(key)
+        _counted_cross_episodes.discard(key)
 
 
 def _bullish_cross_edge(sig: dict, symbol: str = "") -> bool:
@@ -471,6 +508,11 @@ _shorting_disabled_blocks = 0  # would-be short entries suppressed by ENABLE_SHO
                                # switch alone caused (see the branch for why
                                # block_new_entries is excluded), so this is the
                                # evidence base for keeping or dropping the live gate.
+                               # ONE per distinct cross episode, NOT one per poll
+                               # (_first_tally_for_episode): the unit has to be
+                               # "shorts this flag cost us", and a poll-rate count
+                               # cannot answer that. Fixed 2026-09-15, when a single
+                               # 4.5-hour NVDA death cross had read 264.
 _stops_trailed = 0         # stop moves the ATR TRAIL itself caused. NOT every
                            # stop move: a move a floor pushed beyond the trail
                            # belongs to that floor and is excluded (fixed
@@ -3008,7 +3050,12 @@ def evaluate_stock(symbol: str, account_id: str, positions: list[dict],
         # suppressions it did not cause. The counter answers one question only:
         # how many shorts would this flag alone have let through.
         if not config.ENABLE_SHORTING:
-            _shorting_disabled_blocks += 1
+            # ONE increment per distinct cross, not per poll. The log line stays
+            # ungated on purpose: seeing the suppression restated every cycle
+            # with the running total is how you confirm the signal is still live
+            # right now, which a once-per-episode line could not tell you.
+            if _first_tally_for_episode(symbol, "bear"):
+                _shorting_disabled_blocks += 1
             logger.info("SHORTING DISABLED: skipping short %s — death cross "
                         "fired (RSI=%.1f, regime=%s) with every other entry "
                         "gate open; ENABLE_SHORTING=False suppressed it "

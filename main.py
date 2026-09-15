@@ -411,7 +411,10 @@ def _shorting_banner(scope: str) -> str:
         return ("DISABLED — long-only; no NEW short entries. ENTRY-only gate: "
                 "open shorts still trail, stop and cover normally. "
                 "Counter: SHORTING DISABLED (a death cross that fired with "
-                "every other gate open; 0 means the flag is costing nothing).")
+                "every other gate open; 0 means the flag is costing nothing). "
+                "Counts once per distinct cross, but the log line repeats every "
+                "poll with the running total, so the LINE count is the poll rate "
+                "and the #N in it is the signal count — read the #N.")
     return "ENABLED (%s, death-cross entries)" % scope
 
 
