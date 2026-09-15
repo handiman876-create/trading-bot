@@ -501,7 +501,9 @@ _high_vol_stops = 0        # stops armed TIGHTER than normal (ATR/price > 5%)
 _low_vol_stops = 0         # stops armed WIDER  than normal (ATR/price <= 2%)
 _cross_gap_blocks = 0      # would-be signals suppressed by EMA_CROSS_MIN_GAP_PCT
 _cross_sustain_blocks = 0  # gap-valid entry crosses deferred by CROSS_SUSTAIN_MINUTES
-_regime_short_blocks = 0   # would-be short entries suppressed by SHORT_MIN_REGIME
+_regime_short_blocks = 0   # would-be short entries suppressed by SHORT_MIN_REGIME.
+                           # ONE per distinct cross episode, not one per poll —
+                           # see _shorting_disabled_blocks below for why.
 _shorting_disabled_blocks = 0  # would-be short entries suppressed by ENABLE_SHORTING
                                # itself — a death cross that fired with every OTHER
                                # entry gate open. Counts only suppressions the master
@@ -3062,7 +3064,12 @@ def evaluate_stock(symbol: str, account_id: str, positions: list[dict],
                         "#%d", symbol, sig["rsi"], regime,
                         _shorting_disabled_blocks)
         elif block_shorts:
-            _regime_short_blocks += 1
+            # Same per-episode unit as the master switch above, same reason: one
+            # death cross is true on every poll of the session it fired, so a
+            # per-poll increment here would report the poll rate as "shorts
+            # SHORT_MIN_REGIME cost us".
+            if _first_tally_for_episode(symbol, "bear"):
+                _regime_short_blocks += 1
             logger.info("REGIME BLOCK: skipping short %s — regime=%s below "
                         "SHORT_MIN_REGIME=%s (market not fearful enough to "
                         "short) #%d", symbol, regime,

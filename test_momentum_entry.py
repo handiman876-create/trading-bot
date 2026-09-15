@@ -362,6 +362,31 @@ def test_shorting_disabled_recounts_a_genuinely_new_cross():
         f"re-formed cross is a new signal, got {strategy._shorting_disabled_blocks}"
 
 
+def test_regime_short_block_counts_one_per_cross_not_per_poll():
+    """The regime gate's counter has the same unit as the master switch's.
+
+    It sits in the sibling branch behind the same bar-level edge, so it had the
+    identical per-poll defect — it just never showed up in production because
+    ENABLE_SHORTING=False takes the branch first, so the regime gate has never
+    yet been the sole blocker on a sustained cross. Fixing it with the flag off
+    means the number is already right whenever that gate is reached.
+    """
+    orig = strategy.config.SHORT_MIN_REGIME
+    try:
+        # The deployed floor is "risk_on", which makes the filter a no-op, so the
+        # gate has to be raised for this branch to be reachable at all.
+        strategy.config.SHORT_MIN_REGIME = "cautious"
+        _reset(); _set_sig(bearish_cross=True, close=100.0)
+        strategy.config.ENABLE_SHORTING = True     # let the regime gate be reached
+        _poll_short_suppression("NVDA", 264, regime="risk_on")   # below the floor
+        assert _sides("sell_short") == [], "risk_on is below a cautious floor"
+        assert strategy._shorting_disabled_blocks == 0, "master switch is ON here"
+        assert strategy._regime_short_blocks == 1, \
+            f"one cross = one increment, got {strategy._regime_short_blocks}"
+    finally:
+        strategy.config.SHORT_MIN_REGIME = orig
+
+
 def test_shorting_disabled_not_counted_when_regime_blocks_anyway():
     """The counter measures what the FLAG alone suppressed.
 

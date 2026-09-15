@@ -103,6 +103,30 @@ def _read_new_bytes(path: str, offset: int) -> tuple[str, int]:
     return chunk.decode("utf-8", errors="replace"), offset + len(chunk)
 
 
+def _webhook_url() -> str:
+    """The webhook URL, with the legacy `discordapp.com` host normalized.
+
+    Every read that actually TALKS to Discord goes through this. The two bare
+    `if not config.DISCORD_WEBHOOK_URL` guards elsewhere are enabled/disabled
+    truthiness checks, which the host cannot affect.
+
+    It matters because `requests` follows redirects on POST by default and
+    downgrades a 30x to GET, dropping the JSON body. The final response is then
+    a 200 from that GET, so the `status_code >= 300` check below sees success,
+    the watermark advances, and the alert is gone with no error logged anywhere
+    — the one failure shape this module is built to prevent. Verified
+    2026-09-15: the live `.env` URL was on `discordapp.com`, which serves the
+    POST directly today, so this is a latent trap rather than a live outage.
+
+    Not normalized in config.py on purpose: config is the raw env read, tests
+    monkeypatch `config.DISCORD_WEBHOOK_URL` directly, and a normalization that
+    can be bypassed by assignment is not a safety net. One implementation, at
+    the point of use.
+    """
+    return (config.DISCORD_WEBHOOK_URL or "").replace(
+        "discordapp.com", "discord.com")
+
+
 def _post(text: str, source: str) -> bool:
     """Send one batch to Discord, in chunks. True only if ALL chunks landed.
 
@@ -129,7 +153,7 @@ def _post(text: str, source: str) -> bool:
         payload = {"content": f"🚨 **TRADING BOT CRITICAL**{tag}  `{source}`\n"
                               f"```\n{chunk}\n```"}
         try:
-            resp = requests.post(config.DISCORD_WEBHOOK_URL, json=payload,
+            resp = requests.post(_webhook_url(), json=payload,
                                  timeout=config.DISCORD_ALERT_TIMEOUT)
         except Exception as exc:            # network, DNS, timeout, anything
             _failures += 1

@@ -313,3 +313,59 @@ def test_truncation_resets_watermark(sinks, posted):
     discord_alerts.check_critical_alerts()
     assert len(posted) == 2, "a shrunken file must not strand later alerts"
     assert "after truncate" in posted[1]["json"]["content"]
+
+
+# ── 9. webhook host normalization ─────────────────────────────────────────────
+
+_LEGACY = "https://discordapp.com/api/webhooks/1545586381223366660/tok-en_123"
+_MODERN = "https://discord.com/api/webhooks/1545586381223366660/tok-en_123"
+
+
+def test_legacy_discordapp_host_is_normalized(sinks, posted, monkeypatch):
+    """A 30x on POST would lose the alert with no error anywhere.
+
+    `requests` follows redirects on POST by default and downgrades them to GET,
+    dropping the JSON body. The final response is a 200 from that GET, so the
+    `status_code >= 300` check passes, the watermark advances, and the CRITICAL
+    line is gone silently — defeating the module's whole no-silent-drop
+    contract. The live `.env` URL really was on this host (verified
+    2026-09-15); it serves POST directly today, so this pins the trap shut
+    before Discord's behaviour changes rather than after.
+    """
+    equities, _ = sinks
+    monkeypatch.setattr(config, "DISCORD_WEBHOOK_URL", _LEGACY)
+    equities.write_text("[CRITICAL] exit rejected\n")
+    discord_alerts.check_critical_alerts()
+
+    assert len(posted) == 1, posted
+    assert posted[0]["url"] == _MODERN, posted[0]["url"]
+    assert "discordapp.com" not in posted[0]["url"]
+
+
+def test_normalization_preserves_id_and_token(sinks, posted, monkeypatch):
+    """Only the host may change. Mangling the token gives a 401 at push time —
+    the 2026-09-05 stray-character failure, which no shape check caught."""
+    equities, _ = sinks
+    monkeypatch.setattr(config, "DISCORD_WEBHOOK_URL", _LEGACY)
+    equities.write_text("[CRITICAL] x\n")
+    discord_alerts.check_critical_alerts()
+
+    assert posted[0]["url"].endswith("/1545586381223366660/tok-en_123")
+
+
+def test_modern_host_is_left_alone(sinks, posted, monkeypatch):
+    equities, _ = sinks
+    monkeypatch.setattr(config, "DISCORD_WEBHOOK_URL", _MODERN)
+    equities.write_text("[CRITICAL] y\n")
+    discord_alerts.check_critical_alerts()
+
+    assert posted[0]["url"] == _MODERN
+
+
+def test_webhook_url_tolerates_unset(monkeypatch):
+    """`_webhook_url` is called on the push path only, but must not raise if the
+    URL is empty or None — a crash here would propagate into _run_cycle."""
+    monkeypatch.setattr(config, "DISCORD_WEBHOOK_URL", "")
+    assert discord_alerts._webhook_url() == ""
+    monkeypatch.setattr(config, "DISCORD_WEBHOOK_URL", None)
+    assert discord_alerts._webhook_url() == ""
