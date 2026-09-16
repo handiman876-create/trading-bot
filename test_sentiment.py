@@ -632,10 +632,8 @@ def _drive_entry(symbol, blocked):
     ran earlier, so it passed in the full suite and failed standalone — which
     defeats the point of every file here being runnable on its own. Pinned and
     restored locally rather than via monkeypatch, matching the suite convention
-    of taking no pytest fixtures. (`python3 test_sentiment.py` still stops later
-    on an unrelated ordering bug — the __main__ block sits above _override's
-    def, so it runs before that name exists. `pytest test_sentiment.py` is clean
-    and is what CI runs.)
+    of taking no pytest fixtures — both `pytest test_sentiment.py` and
+    `python3 test_sentiment.py` are green on 62 tests.
 
     USE_TRAILING_STOP is pinned False for the same reason test_exit_state.py
     pins it — "isolate signal logic from stops" — and it was leaking identically.
@@ -861,27 +859,6 @@ def test_banner_normal_report_is_not_a_warning():
     assert "fear=4/10" in cap.text
 
 
-if __name__ == "__main__":
-    _orig = {"fetch": sa._fetch_headlines, "call": sa._call_claude,
-             "report_file": config.SENTIMENT_REPORT_FILE}
-    try:
-        tests = [v for k, v in sorted(globals().items())
-                 if k.startswith("test_") and callable(v)]
-        passed = 0
-        for t in tests:
-            # each file-writing test resets the report path itself; restore doubles
-            sa._fetch_headlines = _orig["fetch"]
-            sa._call_claude = _orig["call"]
-            t()
-            print(f"  PASS  {t.__name__}")
-            passed += 1
-        print(f"All {passed} tests passed.")
-    finally:
-        sa._fetch_headlines = _orig["fetch"]
-        sa._call_claude = _orig["call"]
-        config.SENTIMENT_REPORT_FILE = _orig["report_file"]
-
-
 # ── 7a3. SENTIMENT_OVERRIDE_MIN_FEAR — the fear floor ─────────────────────────
 # Re-enabled the override 2026-08-20, but gated on the fear SCORE rather than
 # left binary. The floor is on the score, not the regime, because 4/5/6 all map
@@ -992,3 +969,31 @@ def test_participation_predicate_matches_the_combine():
             heard = strategy.sentiment_participates(fear)
             combined = strategy.effective_regime("risk_on", "crisis", fear)
             assert heard == (combined == "crisis"), fear
+
+
+# ── Standalone runner ─────────────────────────────────────────────────────────
+# MUST STAY LAST IN THE FILE. It collects globals() at call time, so any test or
+# helper defined below it simply does not exist yet when it runs. Section 7a3 was
+# appended after this block on 2026-08-20 and `python3 test_sentiment.py` died
+# with NameError on _override, while `pytest test_sentiment.py` stayed green —
+# pytest imports the whole module before running anything, so it cannot see this
+# class of bug. Append new sections ABOVE this line.
+if __name__ == "__main__":
+    _orig = {"fetch": sa._fetch_headlines, "call": sa._call_claude,
+             "report_file": config.SENTIMENT_REPORT_FILE}
+    try:
+        tests = [v for k, v in sorted(globals().items())
+                 if k.startswith("test_") and callable(v)]
+        passed = 0
+        for t in tests:
+            # each file-writing test resets the report path itself; restore doubles
+            sa._fetch_headlines = _orig["fetch"]
+            sa._call_claude = _orig["call"]
+            t()
+            print(f"  PASS  {t.__name__}")
+            passed += 1
+        print(f"All {passed} tests passed.")
+    finally:
+        sa._fetch_headlines = _orig["fetch"]
+        sa._call_claude = _orig["call"]
+        config.SENTIMENT_REPORT_FILE = _orig["report_file"]
