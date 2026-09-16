@@ -497,3 +497,78 @@ file is the graceful degradation, but the unit must go FAILED so it is visible.
 A timer showing green with a rotting universe file is the failure mode this
 whole section exists to prevent. `count` is expected to be **503**, not 500: three
 companies carry dual share classes (`GOOGL`/`GOOG`, `FOXA`/`FOX`, `NWSA`/`NWS`).
+
+## Test Suite Health
+
+### Full suite (authoritative)
+
+```bash
+cd ~/trading-bot && .venv/bin/python -m pytest -q 2>/dev/null | tail -3
+```
+
+Expected: **712 passed, 3 failed**. The three are `test_futures_orders.py`
+(403 Forbidden from the sim futures endpoint) and are the standing baseline —
+treat any *fourth* failure as real. Note `pytest` is not on the system python;
+it only exists in `.venv`.
+
+### `__main__` ordering check — the bug pytest structurally cannot see
+
+Every test file ends with an `if __name__ == "__main__":` runner that builds its
+list from `globals()` **at call time**. Anything defined *below* that block does
+not exist yet when it runs. pytest imports the whole module before running
+anything, so it never sees this — the file stays green while the direct runner
+is wrong.
+
+```bash
+cd ~/trading-bot && for f in test_*.py; do
+  m=$(grep -n '^if __name__ == "__main__":' "$f" | head -1 | cut -d: -f1)
+  [ -z "$m" ] && continue
+  n=$(awk -v m="$m" 'NR>m && /^(def |class |@)/' "$f" | wc -l)
+  [ "$n" -gt 0 ] && echo "$f: $n definition(s) AFTER the __main__ block"
+done; echo "(no output = clean)"
+```
+
+Two failure modes, and the quiet one is the dangerous one:
+
+* **Loud** — the runner calls a helper defined below it and dies with
+  `NameError`. This was `test_sentiment.py` (`_override`), fixed ba7a5c8.
+* **Silent** — a *test* is defined below it, so it is simply never collected.
+  No error, and the runner still prints `All N assertions passed`. This was
+  `test_broker_floor.py`: pytest ran 21, the direct run ran 20 and reported
+  success. The uncollected test was the one asserting a rejected broker floor
+  does not latch `_floors_reconciled`. A runner reporting success without doing
+  the work — same shape as the `"materials"` dead-key trap in
+  `sentiment_analyzer.py`.
+
+When a mismatch is suspected, compare the two counts directly rather than
+trusting either summary line:
+
+```bash
+f=test_broker_floor.py
+.venv/bin/python -m pytest $f -q 2>/dev/null | tail -1   # pytest's count
+.venv/bin/python $f 2>/dev/null | grep -c "PASS  "       # direct run's count
+```
+
+**The counts must match.** `All N passed` with the wrong N is the silent case.
+
+### Standalone convention — partial, do not treat failures as regressions
+
+```bash
+cd ~/trading-bot && for f in test_*.py; do
+  grep -q '^if __name__ == "__main__":' "$f" || continue
+  .venv/bin/python "$f" >/dev/null 2>&1 || echo "FAILS standalone: $f"
+done
+```
+
+As of 2026-09-16 this is **27 passing / 13 failing**, and the 13 are a known
+backlog, not a regression. They fail because `conftest.py` pins config and
+patches doubles for the pytest path and nothing does so for the direct path, so
+each file inherits whatever the previously-run file happened to leave behind —
+the same leak fixed in `test_sentiment.py::_drive_entry` at ec93029
+(`CROSS_SUSTAIN_MINUTES`, `USE_TRAILING_STOP`, and a double whose fixed arity
+could not absorb the broker floor's `order_type=`).
+
+A crashing direct run **does** exit non-zero, so the check above is trustworthy;
+the summary line is not, because the format varies per file (`All N tests
+passed.` / `All N assertions passed.` / `RESULTS: N passed`) and an aborted run
+prints no summary at all. Never conclude from `tail -1` alone.
