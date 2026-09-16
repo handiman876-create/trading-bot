@@ -1,11 +1,11 @@
 """
 Polygon.io REST client — momentum-screen data source ONLY.
 
-Used exclusively by momentum_screen.py for the twice-monthly watchlist rotation.
+Used exclusively by momentum_screen.py for the weekly watchlist rotation.
 Deliberately tiny and self-contained: the live trading path never touches
 Polygon (that stays on tradestation_client). The grouped-daily endpoint returns
 OHLCV for every US stock in a single call, so a whole-universe screen costs ~35
-calls; this client self-throttles to POLYGON_MAX_CALLS_PER_MIN so a biweekly EOD
+calls; this client self-throttles to POLYGON_MAX_CALLS_PER_MIN so a weekly EOD
 run fits comfortably inside the free tier's 5-calls/minute limit.
 """
 

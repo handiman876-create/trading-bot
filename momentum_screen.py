@@ -1,5 +1,5 @@
 """
-Momentum screen — twice-monthly watchlist rotation (see config "Momentum
+Momentum screen — weekly watchlist rotation (see config "Momentum
 Rotation"). Screens the S&P 500 for momentum leaders and writes the dynamic
 slot the bot folds into its live list.
 

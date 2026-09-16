@@ -8,7 +8,7 @@ The live list is assembled fresh every cycle as:
 
 - CORE_WATCHLIST: the fixed 15 (config.CORE_MEGA + CORE_GROWTH).
 - momentum slot: up to MOMENTUM_SLOT_SIZE names from data/momentum_watchlist.json,
-  refreshed twice monthly by momentum_screen.py. Any read failure degrades to an
+  refreshed weekly by momentum_screen.py. Any read failure degrades to an
   empty slot (core-only trading) rather than crashing the cycle.
 - held symbols: names we still hold. This is the orphan-guard — when a name
   rotates OUT of the momentum slot while we still hold shares, keeping it in the

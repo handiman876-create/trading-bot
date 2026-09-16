@@ -1,11 +1,23 @@
 [Unit]
-Description=Run the momentum screen on the 1st and 15th at 06:00 America/New_York
+Description=Run the momentum screen every Monday at 06:00 America/New_York
 
 [Timer]
-# 1st and 15th of each month, 06:00 Eastern (pre-market, ~biweekly). The
-# America/New_York suffix tracks EST/EDT automatically. Running pre-market means
-# the fresh list is ready before the open and the swap never lands mid-session.
-OnCalendar=*-*-01,15 06:00:00 America/New_York
+# Every Monday, 06:00 Eastern. The America/New_York suffix tracks EST/EDT
+# automatically.
+#
+# WEEKLY since 2026-09-16, was *-*-01,15 (twice-monthly). The screen ranks on a
+# 20-day return, so a twice-monthly rotation acted on a signal that had already
+# moved on for most of its life; weekly tracks it without going to daily, which
+# would just resample noise on a 4-week lookback.
+#
+# 06:00 PRE-MARKET IS LOAD-BEARING, DO NOT MOVE IT INTO THE SESSION. The swap
+# rewrites the effective watchlist, and the screen takes ~10 min on Polygon's
+# free tier, so a start inside RTH can add or drop symbols mid-cycle. 10:00 ET
+# is the worst candidate specifically: CROSS_ENTRY_DELAY_MINUTES=30 means the
+# post-open entry gate opens at exactly 10:00, so the list would be changing at
+# the moment entries unlock. Pre-market means the fresh list is simply ready
+# before the open.
+OnCalendar=Mon *-*-* 06:00:00 America/New_York
 # If the machine was off at the scheduled time, run once at next boot instead of
 # skipping the rotation entirely.
 Persistent=true

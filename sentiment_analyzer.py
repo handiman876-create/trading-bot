@@ -53,7 +53,7 @@ logger = logging.getLogger("sentiment")
 # reported it: a name absent from this map is not blocked and not counted, so the
 # hole looks identical to "no tech name crossed today". main.py now runs
 # _check_sector_map_coverage() at startup and WARNS on any unmapped watchlist name
-# — this map is hand-maintained against a momentum slot that rotates twice-monthly,
+# — this map is hand-maintained against a momentum slot that rotates WEEKLY,
 # so it WILL drift again and the warning is how you find out.
 #
 # Grouping is by RISK BEHAVIOUR, not by GICS. GICS (data/sp500.json) puts TSLA and

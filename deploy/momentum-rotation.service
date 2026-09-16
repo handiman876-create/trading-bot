@@ -1,5 +1,5 @@
 [Unit]
-Description=S&P 500 momentum screen — twice-monthly watchlist rotation
+Description=S&P 500 momentum screen — weekly watchlist rotation
 Documentation=file:/root/trading-bot/deploy/run-momentum-screen.sh
 After=network-online.target
 Wants=network-online.target

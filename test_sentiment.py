@@ -184,7 +184,7 @@ def _mapped_symbols():
 def test_core_watchlist_fully_mapped():
     """Every CORE watchlist name must have a sector, or the gate cannot see it.
 
-    CORE only — the momentum slot is regenerated twice-monthly and WILL rotate in
+    CORE only — the momentum slot is regenerated weekly and WILL rotate in
     names this hand-maintained map has never heard of. That drift is caught at
     runtime by main._check_sector_map_coverage(); it cannot be asserted here
     without this test failing every time the screen runs.

@@ -2371,7 +2371,7 @@ def _maybe_take_profit(symbol: str, held: int, sig: dict, account_id: str) -> bo
 
 def _momentum_entry_taken(symbol: str, generation: str) -> bool:
     """True if we've already taken our one alignment entry for `symbol` in the
-    current rotation. A changed `generation` (new twice-monthly screen) re-arms."""
+    current rotation. A changed `generation` (new weekly screen) re-arms."""
     rec = _load_json(_MOM_ENTRIES_PATH).get(symbol)
     return bool(rec and rec.get("generation") == generation)
 

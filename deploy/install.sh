@@ -32,9 +32,9 @@ echo "Done. Start (or restart) the bots with:"
 echo "  systemctl start trading-bot-equities trading-bot-futures   # first time"
 echo "  ./restart.sh equities   /   ./restart.sh futures           # thereafter"
 echo
-echo "Momentum rotation (twice-monthly watchlist screen) is installed but NOT"
+echo "Momentum rotation (weekly watchlist screen) is installed but NOT"
 echo "enabled. Add POLYGON_API_KEY to .env, then turn it on with:"
-echo "  systemctl enable --now momentum-rotation.timer            # schedule 1st & 15th"
+echo "  systemctl enable --now momentum-rotation.timer            # schedule Mon 06:00 ET"
 echo "  systemctl start momentum-rotation.service                 # run once now (optional)"
 echo
 echo "Sentiment analysis (weekday 08:00 ET Claude read) is installed but NOT enabled."

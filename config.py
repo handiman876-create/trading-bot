@@ -168,7 +168,7 @@ CROSS_SUSTAIN_MINUTES = 30
 # The live stock list is assembled every cycle by
 # watchlist.effective_stock_watchlist() as:  CORE_WATCHLIST ∪ momentum slot ∪
 # currently-held symbols. Edit the two core buckets here; the momentum slot is
-# generated twice-monthly into data/momentum_watchlist.json, not hand-edited.
+# generated weekly into data/momentum_watchlist.json, not hand-edited.
 CORE_MEGA = ["SPY", "QQQ", "AAPL", "MSFT", "GOOGL",
              "META", "NVDA", "AMZN", "TSLA", "AMD"]
 CORE_GROWTH = ["AVGO", "ARM", "CRWV", "JPM", "PLTR"]
@@ -450,7 +450,7 @@ ENABLE_REGIME_SHORT_FILTER = True
 SHORT_MIN_REGIME = "risk_on"
 
 # ── Momentum alignment entry (momentum slot only) ─────────────────────────────
-# Momentum leaders are already trending when the twice-monthly screen adds them,
+# Momentum leaders are already trending when the weekly screen adds them,
 # so they never produce a *fresh* EMA cross for the bot to enter on. Give the
 # momentum bucket a one-shot "enter on alignment" signal instead; core names keep
 # the patient fresh-cross entry. One entry per symbol per rotation, latched in
@@ -494,13 +494,36 @@ MOMENTUM_ALIGN_RSI_MAX = 65      # skip alignment entry when RSI is above this (
 MOMENTUM_ENTRY_FILE    = "data/momentum_entries.json"   # generated (gitignored)
 
 # ── Momentum Rotation (dynamic watchlist slot) ────────────────────────────────
-# Twice a month (1st & 15th, pre-market) momentum_screen.py screens the S&P 500
-# for momentum leaders and writes MOMENTUM_WATCHLIST_FILE; the bot folds up to
-# MOMENTUM_SLOT_SIZE of them into the live list. The screen criteria below are
-# shared with momentum_screen.py — one source of truth for both.
+# WEEKLY, every Monday 06:00 ET (deploy/momentum-rotation.timer).
+# momentum_screen.py screens the S&P 500 for momentum leaders and writes
+# MOMENTUM_WATCHLIST_FILE; the bot folds up to MOMENTUM_SLOT_SIZE of them into
+# the live list. The screen criteria below are shared with momentum_screen.py —
+# one source of truth for both.
+#
+# Cadence rationale: the screen ranks on a 20-day return (MOM_LOOKBACK), so the
+# signal turns over roughly monthly. Twice-monthly (the schedule until
+# 2026-09-16) acted on a read that was already half-stale for most of its life.
+# Weekly tracks it. DAILY WOULD NOT BE BETTER — it resamples a 4-week signal
+# every day and mostly reshuffles noise, while multiplying the drift documented
+# below.
+#
+# Pre-market is deliberate and the timer comment explains why at length: the
+# swap rewrites the effective watchlist and takes ~10 min, so it must not land
+# inside RTH.
+#
+# KNOWN COST OF WEEKLY: sentiment_analyzer.SECTOR_TO_SYMBOLS is HAND-maintained
+# and is NOT derived from the GICS map in data/sp500.json — a rotated-in name is
+# invisible to the sentiment sector gate until someone adds it. Rotating weekly
+# roughly doubles the rate at which that drifts. main._check_sector_map_coverage
+# warns at startup with the gap list; that warning is now expected more often,
+# not less.
 MOMENTUM_SLOT_SIZE      = 5
 MOMENTUM_WATCHLIST_FILE = "data/momentum_watchlist.json"   # generated (gitignored)
 MOMENTUM_UNIVERSE_FILE  = "data/sp500.json"                # vendored S&P 500 list
+# NOTE: sized for the old twice-monthly cadence (max ~16 days between runs), so
+# at weekly it now tolerates THREE consecutive missed rotations before warning.
+# Tightening it to ~10 would surface a single miss; left alone here because it
+# changes when the bot warns, which is a tuning call, not part of the reschedule.
 MOMENTUM_MAX_AGE_DAYS   = 21     # warn if the generated list is older than this
 
 # Screen criteria (20-day momentum leaders)

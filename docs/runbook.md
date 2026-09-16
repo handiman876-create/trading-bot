@@ -564,6 +564,13 @@ done
 2026-09-16. This was 27/13 until the 13 were fixed; treat any new failure here
 as a real regression, not as known drift.
 
+One exception before you go hunting: `test_smoke.py` and `test_smoke_futures.py`
+are LIVE read-only checks against TradeStation, not hermetic unit tests. Each
+invocation re-authenticates, and the token endpoint throttles rapid cold
+refreshes (~4 in a few minutes → 401), so a back-to-back sweep can flake one of
+them. **Re-run that single file before believing it.** Every other file in the
+list is offline and a failure there is real.
+
 What made those 13 fail, and what to do when a new one appears: `conftest.py`
 pins three stop sources OFF before every pytest test —
 `ENABLE_WATER_FLOOR`, `ENABLE_PROFIT_FLOOR`, `ENABLE_BROKER_STOP_FLOOR` — because
