@@ -65,10 +65,25 @@ logger = logging.getLogger("sentiment")
 # CRL is NOT tech. It is GICS Health Care / Life Sciences Tools & Services and was
 # mis-filed under tech until 2026-09-08, so every "tech high" reading blocked a
 # lab-services name while leaving the actual AI complex open.
+#
+# "materials" IS INTENTIONALLY ABSENT — DO NOT ADD IT TO SILENCE THE WARNING.
+# NEM (Materials/Gold) and MOS (Materials/Fertilizers & Agricultural Chemicals)
+# are real watchlist names that sit in no scored risk bucket: Claude scores only
+# the six sectors in _SECTORS below, so sectors_blocked() iterates the REPORT's
+# sector_risks and would never consult a "materials" key here. Adding one would
+# clear the SECTOR MAP GAP warning while gating exactly nothing — a validator
+# reporting success without the work being done. The warning naming these two is
+# the CORRECT signal. Gating them needs a 7th scored sector: prompt + _validate
+# + _neutral_report + tests. (Leaving gold ungated is arguably right on the
+# merits too — it is counter-cyclical to tech fear — but that is a second
+# reason, not the operative one.)
 SECTOR_TO_SYMBOLS = {
+    # NOW/SWKS/HPQ added 2026-09-16 — all three are GICS Information Technology
+    # AND trade as tech, so unlike TSLA/COIN above they need no behavioural
+    # reinterpretation; they were simply missed after a momentum rotation.
     "tech":        ["NVDA", "AMD", "AVGO", "ARM", "CRWV", "PLTR", "AMZN",
                     "TSLA", "MSFT", "AAPL", "GOOGL", "META", "SPY", "QQQ",
-                    "COIN"],
+                    "COIN", "NOW", "SWKS", "HPQ"],
     "financials":  ["JPM", "FDS"],
     "healthcare":  ["CRL"],
     "industrials": [],

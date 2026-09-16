@@ -228,6 +228,66 @@ def test_crl_is_healthcare_not_tech():
     assert "CRL" in sa.sectors_blocked(rep2), "healthcare high must block CRL"
 
 
+def test_2026_09_16_rotation_names_are_tech():
+    """NOW/SWKS/HPQ arrived on a momentum rotation and warned at the 2026-09-16
+    restart. All three are GICS Information Technology AND behave as tech, so
+    they need no behavioural reinterpretation — they were plain drift."""
+    for sym in ("NOW", "SWKS", "HPQ"):
+        assert sym in sa.SECTOR_TO_SYMBOLS["tech"], f"{sym} must be gated as tech"
+    rep = _report(datetime(2026, 9, 16, tzinfo=UTC),
+                  sectors={"tech": "high", "financials": "low", "energy": "low",
+                           "healthcare": "low", "consumer": "low",
+                           "industrials": "low"})
+    blocked = sa.sectors_blocked(rep)
+    for sym in ("NOW", "SWKS", "HPQ"):
+        assert sym in blocked, f"tech high must now actually block {sym}"
+
+
+def test_materials_names_stay_unmapped_and_warn():
+    """MOS and NEM are GICS Materials, which is NOT a scored sector, so they sit
+    in no risk bucket and the GAP warning is the correct output for them.
+
+    This pins the ABSENCE as intentional. The tempting "fix" is a "materials"
+    key in SECTOR_TO_SYMBOLS: it would clear the warning while gating nothing,
+    because sectors_blocked() iterates the report's sector_risks and Claude
+    never scores materials. That is a validator passing without doing the work.
+    """
+    assert "materials" not in sa.SECTOR_TO_SYMBOLS, \
+        "a 'materials' key gates nothing and only silences the coverage check"
+    for sym in ("MOS", "NEM"):
+        assert sym not in _mapped_symbols(), \
+            f"{sym} is GICS Materials — mapping it needs a 7th scored sector"
+
+    import main
+    with _LogCap() as cap:
+        logging.getLogger("bot").addHandler(cap._h)
+        logging.getLogger("bot").setLevel(logging.DEBUG)
+        gaps = main._check_sector_map_coverage(["NVDA", "NOW", "MOS", "NEM"])
+        logging.getLogger("bot").removeHandler(cap._h)
+    assert gaps == ["MOS", "NEM"], gaps
+    assert "SECTOR MAP GAP" in cap.text and "2 of 4" in cap.text
+
+
+def test_materials_key_would_be_dead_even_if_added():
+    """The structural reason, asserted rather than asserted-about.
+
+    Even with a populated "materials" bucket, a report scoring every sector
+    "high" cannot block MOS — sectors_blocked() is driven by the report's keys,
+    and no report has a materials key. This is what makes the dead-key fix dead.
+    """
+    original = dict(sa.SECTOR_TO_SYMBOLS)
+    try:
+        sa.SECTOR_TO_SYMBOLS["materials"] = ["MOS", "NEM"]
+        rep = _report(datetime(2026, 9, 16, tzinfo=UTC),
+                      sectors={s: "high" for s in sa._SECTORS})
+        blocked = sa.sectors_blocked(rep)
+        assert "MOS" not in blocked and "NEM" not in blocked, \
+            "a materials key must NOT gate — if it does, add the 7th sector properly"
+    finally:
+        sa.SECTOR_TO_SYMBOLS.clear()
+        sa.SECTOR_TO_SYMBOLS.update(original)
+
+
 def test_reconcile_warns_on_unmapped_watchlist_symbol():
     import main
     before = main._sector_map_gap_checks
