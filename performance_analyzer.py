@@ -1345,9 +1345,25 @@ def _ab_screen_lines(tracking: dict | None = None) -> list[str]:
 
     L = ["=== A/B Screen Comparison ==="]
     rotations = (tracking or {}).get("rotations") or []
-    completed = [r for r in rotations if r.get("two_week_results")]
+    all_measured = [r for r in rotations if r.get("two_week_results")]
+    # `tally_epoch` restarts the experiment WITHOUT deleting history. The count
+    # that gates a recommendation is derived from the rotation list, so a reset
+    # cannot be done by zeroing a field — measurements taken before the epoch
+    # are kept for reference but must not count toward SCREEN_AB_MIN_ROTATIONS
+    # or be averaged in. Set 2026-09-16 when the cadence went 14d -> 7d, which
+    # made the earlier results measurements of a different quantity.
+    epoch = (tracking or {}).get("tally_epoch")
+    if epoch:
+        completed = [r for r in all_measured
+                     if r["two_week_results"].get("measured_on", "") >= epoch]
+        archived = len(all_measured) - len(completed)
+    else:
+        completed, archived = all_measured, 0
     min_rot = config.SCREEN_AB_MIN_ROTATIONS
     L.append(f"Rotations completed: {len(completed)} (min {min_rot} needed)")
+    if archived:
+        L.append(f"  ({archived} earlier measurement(s) retained but NOT counted — "
+                 f"tally reset {epoch}; see reset_note in the tracking file)")
     if not rotations:
         L.append("  (no A/B rotations recorded yet — screen_ab_tracker.py has not run)")
         return L

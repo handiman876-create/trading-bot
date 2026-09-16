@@ -282,6 +282,33 @@ def test_report_section_waits_before_min_rotations():
     assert "Current leader: Screen A" in text
 
 
+def test_tally_epoch_excludes_pre_reset_measurements_without_deleting_them():
+    """A reset must not be achievable by zeroing a field, because the gating
+    count is DERIVED from the rotation list. `tally_epoch` is what restarts the
+    experiment: measurements taken before it stay in the file for reference but
+    must not count toward SCREEN_AB_MIN_ROTATIONS or feed the averages.
+
+    Set 2026-09-16, when both timers went weekly and the forward-return horizon
+    changed from ~14d to ~7d — the earlier results measure a different quantity.
+    """
+    old = [_completed_rotation(f"2026-08-{d:02d}", {"AAA": 0.05}, {"BBB": 0.02}, "screen_a")
+           for d in (1, 15)]
+    new = [_completed_rotation("2026-09-21", {"AAA": 0.01}, {"BBB": 0.06}, "screen_b")]
+    doc = {"rotations": old + new, "tally_epoch": "2026-09-16",
+           "winner_tally": {"screen_a": 0, "screen_b": 1, "tie": 0}}
+    text = "\n".join(pa._ab_screen_lines(doc))
+    assert "Rotations completed: 1" in text, text
+    assert "2 earlier measurement(s) retained but NOT counted" in text, text
+    assert "need 3 more rotation" in text, text
+    # History is still on disk, not deleted.
+    assert len(doc["rotations"]) == 3
+
+    # Without an epoch the old behaviour is unchanged — all measurements count.
+    no_epoch = {"rotations": old + new,
+                "winner_tally": {"screen_a": 0, "screen_b": 1, "tie": 0}}
+    assert "Rotations completed: 3" in "\n".join(pa._ab_screen_lines(no_epoch))
+
+
 def test_report_section_recommends_after_min_rotations():
     rots = [_completed_rotation(f"2026-0{m}-01", {"AAA": 0.01}, {"BBB": 0.06}, "screen_b")
             for m in range(1, 5)]
