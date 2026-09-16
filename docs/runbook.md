@@ -478,8 +478,13 @@ has no staleness check whatsoever. The refresh on 2026-09-03 found the drift was
 
 So the practical effect of 7 weeks of staleness was **two** newly screenable
 names missed and one stale one carried. That's the expected magnitude — index
-changes are rare, which is why monthly (not twice-monthly) is sufficient and the
-15th rotation screening a ≤2-week-old universe is an acceptable window.
+changes are rare, which is why monthly is sufficient.
+
+Note the staleness bound moved on 2026-09-16: it used to be ≤2 weeks, set by the
+15th being the last rotation in a month. The momentum rotation is now **weekly**,
+so the last Monday of a month screens a universe up to **~4 weeks** old. That is
+still well inside the measured tolerance above, so the monthly refresh stands —
+but if constituent churn ever picks up, this is the number that moved.
 
 ### Checks
 

@@ -1,12 +1,14 @@
 """
 A/B screen tracker — observation only, NEVER feeds the live bot.
 
-Each rotation (1st/15th, run right after the live momentum screen) this:
+Each rotation (weekly, Monday, run right after the live momentum screen) this:
 
   1. Collects the S&P 500 grouped-daily bars ONCE (via momentum_screen).
-  2. MEASURES the previous rotation's picks: their 2-week forward return, using
-     the entry close recorded last time and the latest close now. Aug 1 picks are
-     measured on Aug 15; Aug 15 picks on Sep 1 (the next-rotation cadence).
+  2. MEASURES the previous rotation's picks: their forward return, using the
+     entry close recorded last time and the latest close now. THE HORIZON IS THE
+     GAP BETWEEN RUNS, not a configured window — it was ~14 days on the old
+     1st/15th schedule and is ~7 from 2026-09-16, when the timer went weekly.
+     Each measurement records its own horizon_days so the two are never mixed.
   3. RECORDS this rotation's two screens:
        Screen A = the live 20-day momentum top 5 (same ranking the bot uses).
        Screen B = the same ranking filtered to 4/5-quarters-profitable names.
@@ -28,7 +30,7 @@ import json
 import logging
 import os
 import sys
-from datetime import datetime
+from datetime import date, datetime
 from zoneinfo import ZoneInfo
 
 import config
@@ -123,7 +125,7 @@ def _build_screen_record(picks: list[dict], by_date: dict, dates_asc: list[str],
 
 
 def _measure_returns(screen_block: dict, by_date: dict, latest: str) -> dict:
-    """2-week forward return per pick = latest_close / entry_close - 1, plus the
+    """Forward return per pick = latest_close / entry_close - 1, plus the
     average. Picks whose exit close is missing are skipped (and noted by absence),
     never counted as zero."""
     returns: dict[str, float] = {}
@@ -139,7 +141,7 @@ def _measure_returns(screen_block: dict, by_date: dict, latest: str) -> dict:
 
 
 def _decide_winner(a_ret: dict, b_ret: dict, b_had_picks: bool) -> str:
-    """Higher average 2-week return wins. An empty Screen B counts as a Screen A
+    """Higher average forward return wins. An empty Screen B counts as a Screen A
     win by default (config decision): no filtered candidates means the filter
     would have left the bot core-only, which the live screen beats by definition."""
     if not b_had_picks:
@@ -182,6 +184,14 @@ def run(dry_run: bool = False) -> int:
         winner = _decide_winner(a_ret, b_ret, b_had_picks)
         prev["two_week_results"] = {
             "measured_on":     today,
+            # The horizon is IMPLICIT in the schedule — this measures from the
+            # previous run to this one — so it changed silently when the timer
+            # went from twice-monthly to weekly on 2026-09-16 (~14 days -> ~7).
+            # Recorded per measurement so a 14-day result and a 7-day result are
+            # never averaged as if they were the same quantity. Records written
+            # before that date have no horizon_days and are all ~14.
+            "horizon_days":    (date.fromisoformat(today)
+                                - date.fromisoformat(prev["rotation_date"])).days,
             "screen_a_returns": a_ret,
             "screen_b_returns": b_ret,
             "winner":          winner,

@@ -520,11 +520,10 @@ MOMENTUM_ENTRY_FILE    = "data/momentum_entries.json"   # generated (gitignored)
 MOMENTUM_SLOT_SIZE      = 5
 MOMENTUM_WATCHLIST_FILE = "data/momentum_watchlist.json"   # generated (gitignored)
 MOMENTUM_UNIVERSE_FILE  = "data/sp500.json"                # vendored S&P 500 list
-# NOTE: sized for the old twice-monthly cadence (max ~16 days between runs), so
-# at weekly it now tolerates THREE consecutive missed rotations before warning.
-# Tightening it to ~10 would surface a single miss; left alone here because it
-# changes when the bot warns, which is a tuning call, not part of the reschedule.
-MOMENTUM_MAX_AGE_DAYS   = 21     # warn if the generated list is older than this
+# ~1.4 weekly cycles: warns after ONE missed rotation. Was 21, which was sized
+# for the twice-monthly cadence (~16 days between runs) and would have tolerated
+# three consecutive misses once the timer went weekly.
+MOMENTUM_MAX_AGE_DAYS   = 10     # warn if the generated list is older than this
 
 # Screen criteria (20-day momentum leaders)
 MOM_LOOKBACK   = 20      # trading-day lookback for return & average volume
@@ -551,8 +550,11 @@ EXCLUDED_SECTORS = [
 # ── A/B screen experiment (observation only — NOT fed to the live bot) ────────
 # screen_ab_tracker.py runs the live screen (Screen A) alongside an experimental
 # profitability-filtered screen (Screen B) each rotation, records both to
-# SCREEN_AB_TRACKING_FILE, and measures each rotation's 2-week forward returns on
-# the NEXT rotation. Screen A here is the SAME 20-day ranking the live bot uses
+# SCREEN_AB_TRACKING_FILE, and measures each rotation's forward returns on the
+# NEXT rotation. The horizon is therefore the GAP BETWEEN RUNS, not a setting:
+# ~14 days on the old 1st/15th schedule, ~7 since both timers went weekly on
+# 2026-09-16. Each measurement stores its own horizon_days so the two are not
+# silently averaged together. Screen A here is the SAME 20-day ranking the live bot uses
 # (MOM_LOOKBACK) so the profitability filter is the only variable between A and B.
 # The tracker NEVER writes MOMENTUM_WATCHLIST_FILE — the live path is untouched.
 SCREEN_AB_TRACKING_FILE   = "data/screen_ab_tracking.json"   # generated (gitignored)

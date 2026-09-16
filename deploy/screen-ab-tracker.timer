@@ -1,12 +1,22 @@
 [Unit]
-Description=Run the A/B screen tracker on the 1st and 15th at 07:00 America/New_York
+Description=Run the A/B screen tracker every Monday at 07:00 America/New_York
 
 [Timer]
-# 1st and 15th, 07:00 Eastern — one hour after momentum-rotation.timer (06:00) so
+# Every Monday, 07:00 Eastern — one hour after momentum-rotation.timer (06:00) so
 # the live screen has finished (its timeout is 30 min) and the two never hit the
-# shared free-tier Polygon key concurrently. Same twice-monthly cadence, which is
-# exactly the 2-week horizon the tracker measures forward returns over.
-OnCalendar=*-*-01,15 07:00:00 America/New_York
+# shared free-tier Polygon key concurrently.
+#
+# WEEKLY since 2026-09-16, following momentum-rotation.timer off *-*-01,15. The
+# one-hour offset is the load-bearing part and must move WITH the rotation: this
+# tracker measures the PREVIOUS run's picks, so if it drifts out of step it stops
+# sampling every rotation.
+#
+# CHANGES WHAT IS MEASURED, deliberately. The tracker's forward-return horizon is
+# the gap between its own runs, not a configured window, so this takes it from
+# ~14 days to ~7. Each measurement now stores horizon_days, and the analyzer
+# labels the average with the horizons that went into it and flags a mix, so the
+# pre-2026-09-16 14-day results are never silently averaged with 7-day ones.
+OnCalendar=Mon *-*-* 07:00:00 America/New_York
 # If the machine was off at the scheduled time, run once at next boot rather than
 # skipping the rotation's snapshot.
 Persistent=true

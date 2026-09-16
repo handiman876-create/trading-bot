@@ -1367,7 +1367,17 @@ def _ab_screen_lines(tracking: dict | None = None) -> list[str]:
                         if isinstance(d.get("iv"), (int, float))]
         avg_ret = round(sum(all_rets) / len(all_rets), 4) if all_rets else None
         avg_iv = round(sum(all_ivs) / len(all_ivs), 1) if all_ivs else None
-        lines.append(f"  Avg 2-week return: {_fmt_pct(avg_ret)}")
+        # The measurement horizon is the gap between tracker runs, so it changed
+        # from ~14d to ~7d when the timer went weekly on 2026-09-16. Averaging a
+        # 7-day return with a 14-day one produces a number that is not a return
+        # over anything, and the old hardcoded "Avg 2-week return" label would
+        # have gone on asserting it was. Say which horizons went in; records
+        # written before the switch carry no horizon_days and are all ~14.
+        horizons = sorted({(r["two_week_results"].get("horizon_days") or 14) // 7 * 7
+                           for r in completed})
+        htxt = "/".join(f"{h}d" for h in horizons) if horizons else "n/a"
+        mixed = " — MIXED HORIZONS, not comparable" if len(horizons) > 1 else ""
+        lines.append(f"  Avg forward return [{htxt}]{mixed}: {_fmt_pct(avg_ret)}")
         lines.append(f"  Avg IV: {_fmt_iv(avg_iv)}")
         return lines, avg_ret
 
