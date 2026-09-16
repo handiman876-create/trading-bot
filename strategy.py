@@ -318,15 +318,39 @@ def _exit_short_signal(sig: dict, symbol: str = "") -> bool:
 _entry_delay_logged: dict[str, str] = {}
 
 
-def _note_entry_delayed(symbol: str, would_enter: bool) -> None:
+def _note_entry_delayed(symbol: str, would_enter: bool,
+                        real_cross: bool = False) -> None:
     """Count an entry the post-open delay deferred. `would_enter` is the caller's
-    answer to 'would this poll have placed an order but for the gate?'"""
+    answer to 'would this poll have placed an order but for the gate?'
+
+    `real_cross` narrows what the COUNTER is allowed to claim. Only a fresh-cross
+    entry is one this delay alone deferred. The momentum-alignment branch also
+    reaches here, but that path is gated on USE_MOMENTUM_ALIGNMENT, which has
+    been False since the 2026-07-24 whipsaw fix — those names could not have
+    entered with or WITHOUT this gate, so counting them credits the delay with
+    suppressions it did not cause. Measured 2026-09-16 over all eight retained
+    archives: 30 ENTRY DELAYED events, zero with a matching SUSTAIN line (so
+    zero fresh crosses), zero entries ever. The honest score was 0-for-0; the
+    counter read 30.
+
+    Same rule the ENABLE_SHORTING counter states in evaluate_stock: a counter
+    answers exactly one question. Dead-path deferrals still LOG — a signal you
+    cannot see is one you cannot argue about later — but on a line that carries
+    no tally, so the number and the log can never disagree.
+    """
     global _entries_delayed
     if not would_enter:
         return
     if _entry_delay_logged.get(symbol) == date.today().isoformat():
         return
     _entry_delay_logged[symbol] = date.today().isoformat()
+    if not real_cross:
+        logger.info("ENTRY DELAYED %s — momentum-state signal present while the "
+                    "daily bar is still forming (needs %d min after the session "
+                    "open). NOT COUNTED: no fresh cross, so USE_MOMENTUM_ALIGNMENT "
+                    "— not this delay — is what actually holds it back",
+                    symbol, config.CROSS_ENTRY_DELAY_MINUTES)
+        return
     _entries_delayed += 1
     logger.info("ENTRY DELAYED %s — entry signal present but the daily bar is "
                 "still forming (needs %d min after the session open). Re-checked "
@@ -2974,9 +2998,16 @@ def evaluate_stock(symbol: str, account_id: str, positions: list[dict],
     # so this gates the momentum path too. Exits above are deliberately outside
     # it: acting on noise costs an early exit, entering on noise costs capital.
     if not mh.entries_allowed():
-        _note_entry_delayed(symbol, held == 0 and (
-            _bullish_cross_edge(sig, symbol)
-            or (is_momentum and _bullish_state(sig, symbol))))
+        # _bullish_cross_edge and _bullish_state both have side effects (cross
+        # clocks, gap-block counter), so this keeps the original short-circuit
+        # order exactly: the edge is still evaluated only when held == 0, and
+        # the state only when the edge came back False.
+        real_cross = held == 0 and _bullish_cross_edge(sig, symbol)
+        _note_entry_delayed(
+            symbol,
+            real_cross or (held == 0 and is_momentum
+                           and _bullish_state(sig, symbol)),
+            real_cross)
         return
 
     # One entry per name per day (what the old single gate actually protected).
@@ -3412,9 +3443,11 @@ def evaluate_option(
     # 9:30:05 open would be bought on the same stub EMAs as QQQ was.
     if held == 0:
         if not mh.entries_allowed():
+            # Options have no alignment path: this predicate IS the fresh cross.
             _note_entry_delayed(occ_symbol,
                                 _bullish_cross_edge(sig, occ_symbol) if is_call
-                                else _bearish_cross_edge(sig, occ_symbol))
+                                else _bearish_cross_edge(sig, occ_symbol),
+                                real_cross=True)
             return
         if _already_bought_today(occ_symbol) or _already_sold_today(occ_symbol):
             return
@@ -3606,8 +3639,10 @@ def evaluate_future(root: str, account_id: str, positions: list[dict],
         return
 
     if not fmh.entries_allowed():
+        # Futures are fresh-cross only (no alignment path), so this always counts.
         _note_entry_delayed(trade_symbol,
-                            held == 0 and _bullish_cross_edge(sig, trade_symbol))
+                            held == 0 and _bullish_cross_edge(sig, trade_symbol),
+                            real_cross=True)
         return
 
     if _already_bought_today(trade_symbol) or _already_sold_today(trade_symbol):

@@ -31,6 +31,16 @@ def _sides(side):
     return [o for o in _orders if o[1] == side]
 
 
+def _capture_logs():
+    """Swap strategy.logger.info for a collector. Mirrors the helper in
+    test_momentum_entry.py — the suite deliberately avoids pytest's caplog
+    fixture because every test file here is also runnable standalone."""
+    msgs = []
+    orig = strategy.logger.info
+    strategy.logger.info = lambda fmt, *a: msgs.append(fmt % a if a else fmt)
+    return msgs, orig
+
+
 def _reset():
     _orders.clear()
     strategy._stop_exits = 0
@@ -240,6 +250,40 @@ def test_momentum_entry_also_blocked_while_delayed():
     assert _sides("buy") == [], "momentum path is gated too"
     assert not strategy._momentum_entry_taken("DAL", "G1"), \
         "latch NOT consumed — the shot survives to retry once the bar forms"
+
+
+def test_delayed_counter_ignores_dead_momentum_path():
+    """A momentum-state name with USE_MOMENTUM_ALIGNMENT off is NOT a deferral.
+
+    The alignment path is the only thing a bullish STATE with no fresh cross can
+    reach, and it is gated on USE_MOMENTUM_ALIGNMENT — False since the
+    2026-07-24 whipsaw fix. Such a name could not have entered with or without
+    the post-open delay, so counting it credits the delay with a suppression it
+    did not cause. Measured 2026-09-16 across all eight retained bot.log
+    archives: 30 ENTRY DELAYED events, none with a matching SUSTAIN line (so
+    none from a real cross), and zero entries ever — a counter reading 30 when
+    the honest score was 0-for-0.
+
+    It must still LOG, on a line carrying no tally: the suppression stays
+    visible for argument later, but can never inflate the number.
+    """
+    _reset(); _set_sig(ema_short=105.0, ema_long=100.0)   # bullish state, no cross
+    strategy.config.USE_MOMENTUM_ALIGNMENT = False
+    strategy.mh.entries_allowed = lambda *a, **k: False
+    msgs, orig_log = _capture_logs()
+    try:
+        strategy.evaluate_stock("DAL", "ACCT", [], 100000.0,
+                                is_momentum=True, momentum_generation="G1")
+    finally:
+        strategy.logger.info = orig_log
+    assert _sides("buy") == [], "entry still gated by the delay"
+    assert strategy._entries_delayed == 0, \
+        f"dead alignment path is not a deferral (got {strategy._entries_delayed})"
+    line = next((m for m in msgs if "ENTRY DELAYED" in m), None)
+    assert line is not None, f"suppression must stay visible, not silent: {msgs}"
+    assert "NOT COUNTED" in line and "DAL" in line, line
+    assert "delayed entries #" not in line, \
+        f"an uncounted deferral must not carry a tally: {line}"
 
 
 if __name__ == "__main__":
