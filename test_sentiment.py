@@ -622,17 +622,52 @@ def test_main_cost_alert_over_cap():
 # ── 9. evaluate_stock respects blocked_symbols (integration) ──────────────────
 def _drive_entry(symbol, blocked):
     """Drive evaluate_stock with a fresh bullish cross; return placed orders.
-    Saves/restores every strategy double so nothing leaks to later test files."""
+    Saves/restores every strategy double so nothing leaks to later test files.
+
+    CROSS_SUSTAIN_MINUTES is pinned to 0 for the same reason test_exit_state.py
+    and test_momentum_entry.py pin it in their _reset: these cases assert on the
+    SECTOR gate, not on how long a cross has held, and the live value is 30 so a
+    single poll only ever reaches SUSTAIN PENDING and never places an order.
+    Until 2026-09-16 this file inherited a 0 left behind by whichever test file
+    ran earlier, so it passed in the full suite and failed standalone — which
+    defeats the point of every file here being runnable on its own. Pinned and
+    restored locally rather than via monkeypatch, matching the suite convention
+    of taking no pytest fixtures. (`python3 test_sentiment.py` still stops later
+    on an unrelated ordering bug — the __main__ block sits above _override's
+    def, so it runs before that name exists. `pytest test_sentiment.py` is clean
+    and is what CI runs.)
+
+    USE_TRAILING_STOP is pinned False for the same reason test_exit_state.py
+    pins it — "isolate signal logic from stops" — and it was leaking identically.
+
+    It is NOT sufficient on its own, though: _enter_long → _arm_stop_on_entry →
+    _place_broker_floor places a broker-native GTC stop unconditionally, through
+    the order_type= overload of place_equity_order. So the double has to accept
+    **kw or a successful entry dies with a TypeError. That was MASKED by the
+    sustain leak — before this fix no entry ever got far enough to reach it — so
+    repairing one defect exposed the other.
+    """
     saved = (strategy.tc.get_historical, strategy.ind.compute_indicators,
              strategy.mh.entries_allowed, strategy.tc.place_equity_order,
              strategy.tc.get_quote, strategy.log_trade)
+    saved_sustain = strategy.config.CROSS_SUSTAIN_MINUTES
+    saved_trail = strategy.config.USE_TRAILING_STOP
     orders = []
     try:
+        strategy.config.CROSS_SUSTAIN_MINUTES = 0
+        strategy.config.USE_TRAILING_STOP = False
+        # Keyed by (symbol, direction) and NOT cleared by anything else here, so
+        # a clock left by an earlier case would survive into the next one.
+        strategy._cross_first_seen.clear()
+        strategy._cross_confirmed.clear()
+        strategy._counted_cross_episodes.clear()
         strategy.tc.get_historical = lambda *a, **k: [{"bar": 1}]
         strategy.ind.compute_indicators = lambda *a, **k: {
             "close": 100.0, "ema_short": 105.0, "ema_long": 100.0, "rsi": 55.0,
             "bullish_cross": True, "bearish_cross": False, "atr": 4.0}
-        strategy.tc.place_equity_order = lambda acct, sym, side, qty: \
+        # **kw, not a fixed arity: the broker floor calls this with order_type=
+        # and stop_price=. A strict signature turns that into a TypeError.
+        strategy.tc.place_equity_order = lambda acct, sym, side, qty, **kw: \
             orders.append((sym, side, qty)) or {"order": {"id": "X"}}
         strategy.tc.get_quote = lambda s: {"last": 100.0, "close": 100.0}
         strategy.mh.entries_allowed = lambda *a, **k: True
@@ -646,6 +681,8 @@ def _drive_entry(symbol, blocked):
         (strategy.tc.get_historical, strategy.ind.compute_indicators,
          strategy.mh.entries_allowed, strategy.tc.place_equity_order,
          strategy.tc.get_quote, strategy.log_trade) = saved
+        strategy.config.CROSS_SUSTAIN_MINUTES = saved_sustain
+        strategy.config.USE_TRAILING_STOP = saved_trail
     return orders
 
 
