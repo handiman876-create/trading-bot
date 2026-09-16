@@ -551,7 +551,7 @@ f=test_broker_floor.py
 
 **The counts must match.** `All N passed` with the wrong N is the silent case.
 
-### Standalone convention — partial, do not treat failures as regressions
+### Standalone convention — a guarantee; any failure IS a regression
 
 ```bash
 cd ~/trading-bot && for f in test_*.py; do
@@ -560,13 +560,29 @@ cd ~/trading-bot && for f in test_*.py; do
 done
 ```
 
-As of 2026-09-16 this is **27 passing / 13 failing**, and the 13 are a known
-backlog, not a regression. They fail because `conftest.py` pins config and
-patches doubles for the pytest path and nothing does so for the direct path, so
-each file inherits whatever the previously-run file happened to leave behind —
-the same leak fixed in `test_sentiment.py::_drive_entry` at ec93029
-(`CROSS_SUSTAIN_MINUTES`, `USE_TRAILING_STOP`, and a double whose fixed arity
-could not absorb the broker floor's `order_type=`).
+**Expected: no output.** All 40 files with a runner pass standalone as of
+2026-09-16. This was 27/13 until the 13 were fixed; treat any new failure here
+as a real regression, not as known drift.
+
+What made those 13 fail, and what to do when a new one appears: `conftest.py`
+pins three stop sources OFF before every pytest test —
+`ENABLE_WATER_FLOOR`, `ENABLE_PROFIT_FLOOR`, `ENABLE_BROKER_STOP_FLOOR` — because
+each one silently overrides the ATR trail whenever it is more protective, so a
+test that never mentions them still measures them. The standalone runner has no
+conftest and gets the production values. **Restate those pins in the file's
+`_reset`**; the module that owns a feature re-enables its own flag per test
+(`test_water_floor.py`, `test_profit_floor.py`, `test_broker_floor.py`).
+
+Two other shapes showed up in the same sweep:
+
+* **Doubles with fixed arity.** `_place_broker_floor` runs on every entry and is
+  NOT behind `USE_TRAILING_STOP`, passing `order_type=`/`stop_price=`. A
+  `def _fake_place(account_id, symbol, side, qty)` stub dies on `TypeError`.
+  Give every order double `**kw`.
+* **Assertions on a leaked flag.** `test_vix_regime` asserted the `CAUTIOUS MODE`
+  line, which is gated on `USE_MOMENTUM_ALIGNMENT` — `False` in production since
+  2026-07-24. It only ever passed on a `True` leaked from another module. If a
+  case needs a non-production flag, it must pin it itself and say why.
 
 A crashing direct run **does** exit non-zero, so the check above is trustworthy;
 the summary line is not, because the format varies per file (`All N tests

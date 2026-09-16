@@ -278,10 +278,22 @@ def test_filter_disabled_forces_risk_on_without_fetching():
 # ── 6. per-cycle logging: level line + mode line ──────────────────────────────
 def test_note_regime_logs_level_and_mode_lines():
     _reset_regime_state()
-    with _LogCap() as cap:
-        strategy.note_regime(22.3, "cautious")
-    assert "VIX=22.3 regime=cautious" in cap.text
-    assert "CAUTIOUS MODE - skipping momentum alignment (VIX=22.3)" in cap.text
+    # The CAUTIOUS MODE line is gated on USE_MOMENTUM_ALIGNMENT, which has been
+    # False in production since 2026-07-24 — the sentence would advertise
+    # protection the bot is not providing. So this assertion only means anything
+    # with the flag ON, and it has to say so: under pytest it was passing on a
+    # True leaked from test_exit_state/test_momentum_entry's _reset, and
+    # standalone it failed because production False is what the file actually
+    # got. Pinned and restored so the case tests the line, not the leak.
+    _prev_align = config.USE_MOMENTUM_ALIGNMENT
+    config.USE_MOMENTUM_ALIGNMENT = True
+    try:
+        with _LogCap() as cap:
+            strategy.note_regime(22.3, "cautious")
+        assert "VIX=22.3 regime=cautious" in cap.text
+        assert "CAUTIOUS MODE - skipping momentum alignment (VIX=22.3)" in cap.text
+    finally:
+        config.USE_MOMENTUM_ALIGNMENT = _prev_align
 
     _reset_regime_state()
     with _LogCap() as cap:

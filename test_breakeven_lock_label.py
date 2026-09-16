@@ -131,6 +131,13 @@ def _reset(quote_price=None):
     config.ENABLE_PROFIT_FLOOR_BROKER_RAISE = False
     config.ENABLE_BROKER_STOP_FLOOR = True
     config.VIX_CRISIS_SHADOW = True     # crisis floor armed-only unless a test opts in
+    # The water floor SUPERSEDES the breakeven lock (it is the trail width for
+    # every winner), so with it live the lock never arms and every count here
+    # reads 0. conftest.py pins this off for every pytest test and says so; the
+    # standalone runner has no conftest, so it got the production True and this
+    # file failed on `python3 test_breakeven_lock_label.py` while pytest passed.
+    # Pinned here so both runners agree.
+    config.ENABLE_WATER_FLOOR = False
     _testlib.safe_remove(strategy._STOPS_PATH)
 
 

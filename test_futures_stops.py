@@ -145,6 +145,12 @@ def _reset(quote_price=None):
     # specifically about the floor travelling with the stop, so turn it back on
     # here — inside the test body, where monkeypatch will still undo it.
     config.ENABLE_BROKER_STOP_FLOOR = True
+    # The water floor overrides the ATR trail whenever it is armed, so with it
+    # live every stop_price assertion below reads the floor instead of the trail
+    # these cases are about. conftest.py pins it off for pytest; the standalone
+    # runner has no conftest and got the production True. Pinned here so both
+    # runners agree.
+    config.ENABLE_WATER_FLOOR = False
     strategy._stop_exits = 0
     strategy._stops_trailed = 0
     strategy._floors_placed = 0

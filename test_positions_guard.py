@@ -197,7 +197,15 @@ def test_sustained_outage_escalates_to_error(caplog=None):
         main.logger.removeHandler(handler)
         restore()
 
-    levels = [r.levelno for r in records]
+    # Filter to the guard's OWN records. _run_cycle always logs an unconditional
+    # "cycle work=..." INFO in its finally, so the raw capture ends on that INFO
+    # rather than the escalation. Under pytest the root level happened to hide
+    # INFO and this passed; standalone it did not. Asserting on content instead
+    # of on a level the test does not control removes the coin-flip.
+    levels = [r.levelno for r in records
+              if r.getMessage().startswith("Skipping cycle")]
+    assert len(levels) == main._POSITIONS_FAILURE_ESCALATE_AFTER, \
+        f"one skip log per failed cycle, got {levels}"
     assert levels[0] == logging.WARNING, f"first skip is a warning, got {levels}"
     assert levels[-1] == logging.ERROR, \
         f"skip #{main._POSITIONS_FAILURE_ESCALATE_AFTER} must escalate, got {levels}"

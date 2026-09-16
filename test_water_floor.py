@@ -73,6 +73,14 @@ def _capture_logs():
 def _reset(quote_price, k=0.5):
     config.ENABLE_WATER_FLOOR = True          # conftest pins this False
     config.WATER_FLOOR_K = k
+    # The OTHER two stop sources conftest pins off, restated for the standalone
+    # runner which has no conftest. The ladder is the one that bites: these
+    # fixtures drive price to large excursions on purpose, so a profit-floor rung
+    # outbids the water floor and the assertion reads the rung (149.0) instead of
+    # the floor (148.0) — measuring two features at once, in the one module whose
+    # job is to pin that the WATER floor is what dominates the trail.
+    config.ENABLE_PROFIT_FLOOR = False
+    config.ENABLE_BROKER_STOP_FLOOR = False
     strategy._stop_exits = 0
     strategy._stops_trailed = 0
     strategy._breakeven_locks = 0

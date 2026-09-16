@@ -29,7 +29,11 @@ import strategy
 _orders = []
 
 
-def _fake_place(account_id, symbol, side, qty):
+def _fake_place(account_id, symbol, side, qty, **kw):
+    # **kw, not a fixed arity: _enter_long -> _arm_stop_on_entry ->
+    # _place_broker_floor places a broker-native GTC stop UNCONDITIONALLY (it is
+    # not behind USE_TRAILING_STOP) and passes order_type= and stop_price=. A
+    # strict signature turns any successful entry into a TypeError.
     _orders.append((symbol, side, qty))
     return {"order": {"id": "T1"}}
 

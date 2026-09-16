@@ -92,6 +92,12 @@ def _reset(quote_price=None):
     strategy.tc.get_quote = _fake_quote(quote_price)
     config.ENABLE_PROFIT_FLOOR = True
     config.ENABLE_PROFIT_FLOOR_BROKER_RAISE = False
+    # The water floor overrides the ATR trail whenever armed, so with it live the
+    # stop_price assertions here read the floor rather than the profit-floor
+    # behaviour under test — including test_disabled_has_no_effect, whose whole
+    # point is that nothing moves. conftest.py pins it off for pytest; the
+    # standalone runner has no conftest. Pinned here so both runners agree.
+    config.ENABLE_WATER_FLOOR = False
     # Pinned, not assumed: these are module-level globals that other test modules
     # flip and do not always restore, so under `pytest` (one process, all modules)
     # the raise tests would otherwise pass or fail depending on collection order.

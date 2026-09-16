@@ -29,7 +29,9 @@ def _capture_logs():
     return msgs, orig
 
 
-def _fake_place(account_id, symbol, side, qty):
+def _fake_place(account_id, symbol, side, qty, **kw):
+    # **kw: the broker floor placed on every entry passes order_type= and
+    # stop_price=. See the note in test_cross_sustain.py.
     _orders.append((symbol, side, qty))
     return {"order": {"id": "T1"}}
 

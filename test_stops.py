@@ -13,6 +13,7 @@ import os
 import tempfile
 
 import _testlib
+import config
 import strategy
 
 # ── Test doubles ──────────────────────────────────────────────────────────────
@@ -31,6 +32,15 @@ def _fake_quote(price):
 
 def _reset(quote_price=None):
     """Fresh empty stop file + cleared captured state before each test."""
+    # The three stop sources conftest.py pins off before every pytest test.
+    # This module has zero references to any of them and measures the ATR trail
+    # alone, which is exactly why they have to be off: each one silently
+    # overrides the trail when it is more protective, so with the production
+    # values the assertions here measure two features at once. conftest.py says
+    # the same thing at length; the standalone runner just never sees it.
+    config.ENABLE_WATER_FLOOR = False
+    config.ENABLE_PROFIT_FLOOR = False
+    config.ENABLE_BROKER_STOP_FLOOR = False
     _orders.clear()
     strategy._stop_exits = 0
     strategy._signaled_buy_today.clear()

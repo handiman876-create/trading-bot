@@ -70,6 +70,15 @@ def _capture_logs():
 
 
 def _reset(quote_price):
+    # The three stop sources conftest.py pins off before every pytest test.
+    # Restated here because the standalone runner has no conftest: with the
+    # production values, the water floor overrode the ATR trail and
+    # test_genuine_trail_move_counts_and_reads_clean read "held by water floor"
+    # instead of a trail move. Individual cases still set ENABLE_PROFIT_FLOOR
+    # True/False themselves; those assignments run after this and win.
+    config.ENABLE_WATER_FLOOR = False
+    config.ENABLE_BROKER_STOP_FLOOR = False
+    config.ENABLE_PROFIT_FLOOR = False
     strategy._stop_exits = 0
     strategy._stops_trailed = 0
     strategy._breakeven_locks = 0

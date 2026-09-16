@@ -32,6 +32,14 @@ def _reset():
     strategy._profit_takes = 0
     strategy.tc.place_equity_order = _fake_place
     _testlib.safe_remove(strategy._STOPS_PATH)
+    # The three stop sources conftest.py pins off for every pytest test. This
+    # file has no conftest under `python3 test_profit_take.py`, so it got the
+    # production values: _maybe_take_profit re-places the broker floor after a
+    # partial sell, and _place_broker_floor reads rec["atr_mult"], which _seed
+    # deliberately omits — KeyError on a feature these tests never asked about.
+    config.ENABLE_BROKER_STOP_FLOOR = False
+    config.ENABLE_PROFIT_FLOOR = False
+    config.ENABLE_WATER_FLOOR = False
     # ensure config is at documented defaults for the arithmetic below
     config.ENABLE_PROFIT_TAKING = True
     config.PROFIT_TAKE_PCT = 0.12
