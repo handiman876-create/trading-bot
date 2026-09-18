@@ -1192,8 +1192,11 @@ they are not a k-fit.
 
 ## Monitor K=0.5 effect on TSLA — first live test of the water floor
 
-**Status: K=0.75 REMAINS SET, verdict SPLIT as of 2026-09-09 — monitoring EXTENDED
-to 2026-09-18, AMD is the tiebreaker.** Water floor shipped 2026-08-31
+**Status: CLOSED 2026-09-18. K=0.75 REMAINS SET — not because it won, but because
+K is not a tunable single threshold. The appointed tiebreaker (AMD) traversed the
+decisive band and armed above it, so it could not break the tie. See
+**CLOSURE 2026-09-18** at the end of this section; the live-exit question moves to
+its own successor item.** Water floor shipped 2026-08-31
 (`72c1aa2`); the original TSLA question resolved on day one and K was raised to
 0.75 on 09-01 (`36e02a8`). Whether 0.75 is *right* is a separate question that
 went n=0 for five sessions and then produced evidence both ways on 2026-09-09 —
@@ -1483,6 +1486,106 @@ close that window and did not close it here, because the run never reached K. No
 value of K fixes a position that gives back its entire excursion from 0.56 ATR —
 that points at trail width and entry timing, not at K. Backlog point 6
 (non-stop exit paths carry no stop attribution) is unchanged.
+
+### CLOSURE 2026-09-18 — the tiebreaker missed the band. Item closed structurally, K=0.75 stays.
+
+**Decision: CLOSE this item. NO config change — `WATER_FLOOR_K` stays 0.75.**
+The reason for closing is *not* that the 09-09 split resolved. It is that AMD —
+appointed on 09-09 as "the tiebreaker" — landed outside the only range where the
+two candidate K values disagree, which makes the third data point structurally
+unobtainable from it. Two of the three post-arming cases now sit outside the band.
+A threshold you cannot get band-resident samples for is not a threshold worth
+tuning from live flow.
+
+#### What AMD actually did (09-17 session, read from `data/stop_prices.json` + `bot.log.1`)
+
+First arming **14:58:18 UTC**, stop **483.48 → 525.03** in one move — straight from
+a trail 40 points below entry to a floor above it. Then **19 ratchets**
+(`long water floors #1`–`#19`, 14:58:18 → 16:22:11 UTC) walking the stop
+525.03 → **533.956** as the run went 0.78 → 1.17 ATR. Each line correctly reports
+`held by water floor` and `trails still #17`, so the trail counter was not polluted.
+
+| fact | value |
+|---|---|
+| entry / `atr_at_entry` / `atr_mult` | 524.37 / **23.0854** / 2.5x (regime=risk_on) |
+| `high_water` | **551.27** — peak run 26.90 = **1.165 ATR** |
+| `stop_price` == `water_floor_price` | **533.956**, `water_floor_active: true` ✓ |
+| First arming water / predicted threshold | 542.34 / **541.68** — overshoot $0.66, one poll |
+| Locked if hit | 91 × 9.586 = **+$872.33** |
+| Peak unrealized | 91 × 26.90 = **+$2,447.90** |
+| **capture-if-hit** | **35.6%** |
+| ATR trail counterfactual | 551.27 − 2.5×23.0854 = 493.56 → **−$2,804.03** |
+| Floor's advantage over the trail | **+$3,676** |
+| Close 09-17 / unrealized | 545.28 / +$1,902.81 |
+
+**The arithmetic predicted on 09-09 is now confirmed live twice** (META within
+$0.21, AMD within $0.66). That part of the design is settled.
+
+#### Why AMD cannot be the tiebreaker — the band, restated
+
+The decisive band is **[535.91, 541.68)**: K=0.50 arms, K=0.75 does not. AMD
+**traversed** it without exiting and armed at 0.78 ATR. Above the band both values
+arm and the higher K is strictly roomier, so AMD does not separate them on the
+*arming* question at all. It is a second META (2.11 ATR), not a second CRWV
+(0.560 ATR).
+
+| position | peak run | in band? | K=0.75 | K=0.50 | separates? |
+|---|---|---|---|---|---|
+| CRWV long | 0.560 ATR | **yes** | never arms → −$2,146.50 | +$187 | **yes → 0.50** |
+| META long | 2.11 ATR | no | +$2,189.78, capture 64.4% | tighter floor | no |
+| AMD long | **1.165 ATR** | **no** | +$872.33 armed, capture 35.6% | floor 539.727, +$525.18 more | no |
+
+**1 of 3 cases is band-resident.** The 09-09 note already called the distribution
+bimodal and said that "weakens the case for treating this as a single-threshold
+tuning problem at all." AMD is the third draw and it confirms the bimodality
+rather than filling the gap. That is the structural argument for closing, and it
+is independent of any P&L sign — the pre-registered discipline of this section.
+
+#### Condition 2's capture test currently FAILS, and that is recorded, not buried
+
+Exit condition 2 required "floor causes the exit at a capture ratio > ~50%" to keep
+K=0.75. AMD's capture-if-hit is **35.6%**; the K=0.50 counterfactual is **57.1%**.
+On that test 0.75 is losing. Two things stop it from being a verdict:
+
+1. **AMD has not exited.** Capture only fixes at the exit. Every further ratchet
+   raises the floor toward the water and raises capture; a gap through the floor
+   lowers realized capture below 35.6%. The number is live, not final.
+2. **Direction of intervention is still asymmetric** (see above): lowering K acts
+   *immediately* on AMD's armed floor (533.956 → 539.727, +$525.18 locked, 5.77
+   points = 0.25 ATR less room), while raising K only affects future armings. The
+   09-09 reason to require more evidence before lowering is unchanged.
+
+So: **K stays 0.75 and the tuning question is retired, but the capture ledger is
+not.** Do not later cite this closure as "K=0.75 validated" — it was 1-for-1 on
+arming arithmetic and 0-for-1 against the 50% capture bar at the time of closing.
+
+#### What replaces this item
+
+1. **Successor item — AMD's exit is still owed a reading.** Record the realized
+   capture ratio and `_stop_source` when AMD closes, against the 35.6% standing
+   figure. This is a single observation to log, not a monitoring window.
+2. **Run-length distribution becomes the primary object**, as the 09-09 note asked.
+   Current sample of peak runs at/after the water floor shipped: 0.268 (META 09-04
+   snapshot), 0.5065, 0.560 (CRWV), **1.165 (AMD)**, 2.11 (META). The gap in
+   [0.6, 1.1) is the whole reason K can't be tuned. Widening this sample is worth
+   more than any further K argument.
+3. **No new check date.** Reopening requires a *band-resident* case — a peak run
+   inside [0.50, 0.75) — not the passage of time. That is the pre-registered
+   reopen condition.
+
+**Unchanged and still open:** the give-back-on-a-winner problem. AMD is not a
+sixth case (its floor is holding $872 the trail would have given back in full,
+plus $2,804), but CRWV remains the fifth and the diagnosis there still points at
+trail width and entry timing, not at K.
+
+#### Observability note — the broker floor is NOT at the water floor
+
+`BROKER FLOOR RAISE` tracked every ratchet (`raises #10`–`#19`, order
+`971669646`), but it sits at **522.41** — `broker_floor_lock` 1.83%, set **11.54
+behind** the water floor and **$1.96 BELOW entry 524.37**. The in-process floor at
+533.956 is the one holding the $872.33; if the process dies, the broker protects
+−$178.36 instead. That is the known deferred broker-native-stop gap, not a new
+bug — but do not read the GTC order as the water floor.
 
 ### ESU26 note — CORRECTION to the obvious reading
 
