@@ -2007,8 +2007,49 @@ hook acceptable in production code here. `test_state_isolation.py` asserts all
 of it, including the production-safety property, and `main.py` now names the
 resolved state dir at startup so live and redirected cannot look alike.
 
-Remaining, deliberately: `performance_analyzer.LEDGER_PATH` builds
-`data/trade_ledger.json` from `_HERE` rather than from config, so it is outside
-this floor. The analyzer is not part of the test sweep today, so nothing writes
-it during tests — but it is the one state path a future test could still reach.
-Route it through config if the analyzer ever grows tests that call `_save`.
+One state path is still outside this floor — see
+"performance_analyzer.LEDGER_PATH outside the standalone floor" below.
+
+---
+
+## performance_analyzer.LEDGER_PATH outside the standalone floor
+
+**The gap, stated narrowly.** `performance_analyzer.py:38` builds
+`LEDGER_PATH = os.path.join(_HERE, "data", "trade_ledger.json")` from `_HERE`,
+not from `config._state_path()`. The line directly below it,
+`STOPS_PATH = os.path.join(_HERE, config.STOP_PRICE_FILE)`, does go through
+config and therefore inherited the 36ce546 floor for free. The ledger did not.
+
+**Two things that are NOT true of it, checked rather than assumed:**
+
+* *"The analyzer is never exercised by tests."* It is — eleven files touch it
+  (`test_performance_analyzer.py`, `test_ledger_reconcile.py`,
+  `test_report_summary.py`, `test_fill_pricing.py`, `test_water_floor.py`,
+  `test_screen_ab.py`, and five more), calling `_pair_round_trips`,
+  `_reconcile_open_entries`, `_aggregate`, `_exit_reason` and friends.
+* *"It is unprotected."* Under **pytest** it is protected: `conftest.py:197`
+  monkeypatches `pa.LEDGER_PATH` to a `tmp_path`, alongside `REPORT_JSON`,
+  `REPORT_TXT` and `STOPS_PATH`. Only the **standalone** path is exposed, which
+  is the same pytest-only shape d96e1d8 had before the config floor replaced it.
+
+**Why it is latent today, precisely.** `LEDGER_PATH` is read at only four sites,
+all inside `_load_ledger`/`_save_ledger`, and **`_save_ledger(ledger)` takes no
+path argument** — it reads the module global. No test calls `_save_ledger`,
+`_load_ledger`, `main` or `run`, so the write never happens. Verified
+empirically on 2026-09-21: standalone runs of all four analyzer test files left
+`data/trade_ledger.json` md5-identical.
+
+**Why that is a thin guarantee.** The trigger is a single new test away, and
+because `_save_ledger` reads a global instead of taking a path, nothing at the
+call site would look suspicious — a test that calls it reads exactly like every
+other analyzer test. This is the same shape as the SPY incident: protection that
+holds only because nobody has written the obvious next test yet.
+
+**Fix:** route it through `config._state_path("trade_ledger.json")`, matching
+the `STOPS_PATH` line above it, and add it to `run_test._GUARDED`.
+`test_state_isolation.test_wrapper_guard_list_covers_every_state_path` then
+enforces it automatically, and `conftest.py:197` becomes redundant and can go.
+
+**Priority: LOW** — latent, not active, and the pytest path is already covered.
+Do it opportunistically, or immediately if anyone adds a test that calls
+`_save_ledger` or the analyzer's `run()`.
