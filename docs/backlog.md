@@ -2053,3 +2053,21 @@ enforces it automatically, and `conftest.py:197` becomes redundant and can go.
 **Priority: LOW** — latent, not active, and the pytest path is already covered.
 Do it opportunistically, or immediately if anyone adds a test that calls
 `_save_ledger` or the analyzer's `run()`.
+
+**DONE 2026-09-21 (same day).** `config.TRADE_LEDGER_FILE = _state_path(...)`,
+and the analyzer now joins `_HERE` onto it exactly as it already did for
+`STOP_PRICE_FILE`. Added to `run_test._GUARDED`, so the guard test enforces it
+— verified by removing the entry and watching
+`test_wrapper_guard_list_covers_every_state_path` fail with
+`['trade_ledger.json']`. Production path byte-identical
+(`/root/trading-bot/data/trade_ledger.json`).
+
+Proven rather than reasoned: calling `_save_ledger()` from a standalone-detected
+process now lands in `data/test/trade_ledger.json` and leaves the live file
+md5-unchanged. Worth recording that the severity was higher than this LOW
+suggests — `_save_ledger` writes a FULL overwrite, so the one test that
+triggered it would not have corrupted the ledger but replaced it, and `data/`
+has no backup. Low likelihood, total blast radius.
+
+`conftest.py:197` is kept. It is not merely redundant depth: the monkeypatch is
+PER-TEST where the config floor is per-process, which is strictly finer.

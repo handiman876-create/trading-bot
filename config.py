@@ -614,6 +614,14 @@ EXCLUDED_SECTORS = [
 # (MOM_LOOKBACK) so the profitability filter is the only variable between A and B.
 # The tracker NEVER writes MOMENTUM_WATCHLIST_FILE — the live path is untouched.
 SCREEN_AB_TRACKING_FILE   = _state_path("screen_ab_tracking.json")   # generated (gitignored)
+
+# performance_analyzer's durable ledger. Lives here rather than as a literal in
+# that module so it inherits the test floor the same way STOPS_PATH does — the
+# analyzer joins _HERE onto this, exactly as it already does for
+# STOP_PRICE_FILE. It was the last state file building its own path from _HERE,
+# which left it isolated under pytest (conftest pins it) but NOT under a direct
+# `python3 test_foo.py`.
+TRADE_LEDGER_FILE = _state_path("trade_ledger.json")   # generated (gitignored)
 SCREEN_AB_MIN_ROTATIONS   = 4        # don't declare a winner before this many rotations
 # Screen B: from the top SCREEN_B_TOP_N momentum names, keep those with at least
 # SCREEN_B_MIN_PROFITABLE_Q of the last SCREEN_B_QUARTERS_LOOKBACK quarters showing

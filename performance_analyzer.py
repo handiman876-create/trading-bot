@@ -35,7 +35,7 @@ from trade_logger import _STOP_ATTR_KEYS
 logger = logging.getLogger("performance_analyzer")
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
-LEDGER_PATH  = os.path.join(_HERE, "data", "trade_ledger.json")
+LEDGER_PATH  = os.path.join(_HERE, config.TRADE_LEDGER_FILE)
 STOPS_PATH   = os.path.join(_HERE, config.STOP_PRICE_FILE)
 REPORT_JSON  = os.path.join(_HERE, config.LOG_DIR, "performance_report.json")
 REPORT_TXT   = os.path.join(_HERE, config.LOG_DIR, "performance_report.txt")
