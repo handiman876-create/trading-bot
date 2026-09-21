@@ -1914,3 +1914,76 @@ today.
 unvalidated)" above cannot be closed from SIM data. It needs one of the two
 options above first; that entry's premise is that the thresholds can be judged
 on outcomes, and in this account they cannot.
+
+---
+
+## Standalone test runs mutate live state
+
+**Observed (2026-09-21):** running the suite left a synthetic SPY position in
+the real `data/stop_prices.json` — `entry_price 100.0`, `atr_at_entry 4.0`,
+`broker_order_id "X"` — and the equities bot loaded it on the next restart. A
+fabricated stop record is worse than a fabricated log line: the bot ACTS on
+this file.
+
+`conftest.py` had redirected the LOG paths to a tmpdir since the CRITICAL-sink
+work, but never `data/`, so every state path stayed live and any test calling a
+`_save_*()` wrote the running bots' state.
+
+**Partly fixed (d96e1d8):** conftest now also redirects the six mutable state
+files — `STOP_PRICE_FILE`, `MOMENTUM_ENTRY_FILE`, `MOMENTUM_WATCHLIST_FILE`,
+`OPTIONS_POSITION_FILE`, `SCREEN_AB_TRACKING_FILE`, `SENTIMENT_REPORT_FILE`.
+Read-mostly reference data (`MOMENTUM_UNIVERSE_FILE` / sp500.json,
+`FUNDAMENTALS_CACHE_FILE`) is deliberately left live: tests read genuine sector
+and fundamentals data from it and an empty tmp copy would quietly change what
+they assert. Verified — the suite now leaves `data/` md5-identical.
+
+**What is still open:** conftest is a *pytest* hook. The standalone convention
+(`python3 test_foo.py`, which exists precisely because pytest cannot see
+`__main__` ordering bugs — see docs/runbook.md) never imports it, so the
+standalone path is entirely unprotected.
+
+Bisected all 43 files standalone on 2026-09-21:
+
+* `test_sentiment.py` writes the live `data/stop_prices.json` via `_drive_entry`
+  (it drives a real SPY entry, which arms a stop, which calls `_save_stops`).
+  It was the only file that did, but that is a fact about today's tests, not a
+  property anything enforces.
+* standalone runs also create `logs/test_bot.log` and a rotated set
+  (`.1` … `.7.gz`), because `trade_logger` binds a FileHandler on import.
+
+Both paths are gitignored, so nothing reaches the repo. The risk is
+operational: **the deploy box is also the dev box**, so a standalone run there
+mutates the live bots' state directly.
+
+**Direction — two options, and they are not equally safe:**
+
+1. **Extend `_testlib.py` to all 43 files** (18 use it today) and move the
+   redirect into it. Mechanical and boring, but it is opt-in by construction:
+   the 44th test file added without the import silently reopens the hole, and
+   nothing fails to tell you.
+2. **Detect test context at `config` import** (`sys.modules.get("pytest")`, or
+   `sys.argv[0]` basename starting with `test_`) and redirect once, centrally —
+   the "common write path" that covers both entry points with no per-file
+   discipline. **This is the more dangerous option and should not be taken
+   lightly:** it puts a test branch in production code, and a false positive in
+   the live bot would silently point `STOP_PRICE_FILE` at a tmpdir — the bot
+   would boot with no stops and write them somewhere that vanishes on reboot.
+   That failure is far worse than the bug being fixed. If taken, it needs an
+   affirmative startup log line naming the resolved path, so "live" and
+   "redirected" can never look the same.
+
+A third option worth costing: make the standalone runner a thin wrapper
+(`python3 run_standalone.py test_sentiment.py`) that applies the same redirect
+before importing the target. Keeps the redirect in one place and out of
+production code, at the cost of changing the muscle memory the convention
+exists to serve.
+
+**Prerequisite before option 1 or 3:** add a test that ASSERTS the redirect is
+in effect (e.g. `config.STOP_PRICE_FILE` resolves under a tmpdir), so coverage
+is enforced rather than assumed. Without it, either fix decays the same way the
+sector map did — see "hand-maintained lists drift" — and the 44th file is the
+one that bites.
+
+**Priority: MEDIUM.** Gitignored and does not reach the repo, but standalone
+runs on the deploy box mutate live trading state, and the 2026-09-21 instance
+was loaded by a live bot before it was caught.
