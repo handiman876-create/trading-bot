@@ -34,3 +34,6 @@ bot.futures.log.*
 critical_alerts.log
 futures_critical_alerts.log
 test_critical_alerts.log
+
+# standalone test runs write state here (config._state_path floor)
+data/test/

@@ -558,16 +558,43 @@ f=test_broker_floor.py
 
 ### Standalone convention — a guarantee; any failure IS a regression
 
+**Use the wrapper.** It spawns one fresh process per file (which is the whole
+point of the convention) and isolates every state file to a throwaway tmpdir
+first:
+
 ```bash
-cd ~/trading-bot && for f in test_*.py; do
-  grep -q '^if __name__ == "__main__":' "$f" || continue
-  .venv/bin/python "$f" >/dev/null 2>&1 || echo "FAILS standalone: $f"
-done
+cd ~/trading-bot && .venv/bin/python run_test.py            # all files
+cd ~/trading-bot && .venv/bin/python run_test.py test_stops.py test_water_floor.py
 ```
 
-**Expected: no output.** All 40 files with a runner pass standalone as of
-2026-09-16. This was 27/13 until the 13 were fixed; treat any new failure here
-as a real regression, not as known drift.
+**Expected: `44/44 passed`, exit 0.** Treat any failure here as a real
+regression, not as known drift. This was 27/13 until the 13 were fixed
+(2026-09-16), and 40/40 before `run_test.py` and `test_state_isolation.py`
+were added.
+
+The bare form still works and is still safe:
+
+```bash
+.venv/bin/python test_stops.py
+```
+
+`config._detect_test_run()` fires on an argv[0] starting with `test_`, so a
+direct run writes state under `data/test/` and logs as `logs/test_bot.log` —
+never the live files. The wrapper only upgrades that to a tmpdir that cleans
+itself up and leaves no `data/test/` behind.
+
+**Why this exists (2026-09-21):** conftest.py is a *pytest* hook, so for a long
+time the direct form had no redirects at all. A standalone run wrote a synthetic
+SPY position — `entry_price 100.0`, `atr_at_entry 4.0`, `broker_order_id "X"` —
+into the live `data/stop_prices.json`, and the equities bot loaded it on the
+next restart. The deploy box is also the dev box, so this was live state, not a
+sandbox. `config._state_path()` is now the single floor for both entry points;
+`test_state_isolation.py` asserts it, including that a stray
+`export TB_TEST_TMPDIR=...` can never redirect a *production* process.
+
+If you ever see `REDIRECT FAILED — production state at risk`, the wrapper and
+`config.py` have drifted: a new state file was added to config without being
+added to `run_test._GUARDED`. Fix that before running tests on this box.
 
 One exception before you go hunting: `test_smoke.py` and `test_smoke_futures.py`
 are LIVE read-only checks against TradeStation, not hermetic unit tests. Each

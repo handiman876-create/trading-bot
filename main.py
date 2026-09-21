@@ -484,6 +484,19 @@ def main() -> None:
 
     logger.info("=" * 60)
     logger.info("TradeStation Trading Bot starting up  [mode=%s]", MODE.upper())
+    # Name the resolved state directory unconditionally. "Live" and "redirected
+    # to a tmpdir" must never look the same in the log — a bot that booted with
+    # its stop file pointing somewhere throwaway would otherwise be invisible
+    # until the stops silently failed to persist.
+    if config.STATE_DIR == "data":
+        logger.info("State dir   : %s (live)", config.STATE_DIR)
+    else:
+        logger.warning("State dir   : %s — REDIRECTED, this process is NOT "
+                       "writing live state", config.STATE_DIR)
+    if config.TEST_TMPDIR_IGNORED:
+        logger.warning("TB_TEST_TMPDIR is set but this is not a detected test "
+                       "run, so it was IGNORED and state is LIVE. If you meant "
+                       "to isolate, use run_test.py.")
     if config.TS_SANDBOX:
         logger.info("Environment : SANDBOX (paper trading)")
     else:

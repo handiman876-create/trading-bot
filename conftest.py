@@ -44,6 +44,15 @@ import pytest
 _LOG_TMPDIR = tempfile.mkdtemp(prefix="bot-testlogs-")
 atexit.register(shutil.rmtree, _LOG_TMPDIR, True)
 
+# State isolation is config's job now, for BOTH entry points (config._IS_TEST is
+# true under pytest and under a direct `python3 test_foo.py`). Exporting the
+# tmpdir here rather than reassigning config's attributes afterwards keeps ONE
+# mechanism: config computes the paths, config.STATE_FILES stays consistent with
+# them, and test_state_isolation can assert against it. Reassigning after import
+# left STATE_FILES describing paths nothing used.
+# MUST precede `import config` — the paths are computed at import time.
+os.environ.setdefault("TB_TEST_TMPDIR", _LOG_TMPDIR)
+
 import config  # noqa: E402  (must follow the tmpdir creation above)
 
 config.LOG_DIR        = _LOG_TMPDIR
@@ -63,29 +72,9 @@ config.DISCORD_WATERMARK_FILE = os.path.join(_LOG_TMPDIR, "alert_watermarks.json
 # exercises pushing sets this itself and restores it.
 config.DISCORD_WEBHOOK_URL = ""
 
-# ── Layer 2b: mutable STATE files, not just logs ──────────────────────────────
-# The log redirect above never covered data/, so every path here stayed LIVE and
-# any test calling a _save_*() wrote the running bots' state. On 2026-09-21 a
-# test run left a synthetic SPY position in the real data/stop_prices.json
-# (entry 100.0, atr 4.0, broker_order_id "X") and the equities bot loaded it on
-# the next restart. A fabricated stop record is strictly worse than a fabricated
-# log line: the bot ACTS on this file.
-#
-# Only files the bot WRITES are redirected. Read-mostly reference data
-# (MOMENTUM_UNIVERSE_FILE / sp500.json, FUNDAMENTALS_CACHE_FILE) is deliberately
-# left pointing at the real thing — tests read genuine sector and fundamentals
-# data from it, and an empty tmp copy would silently change what they assert.
-_STATE_TMPDIR = tempfile.mkdtemp(prefix="bot-teststate-")
-atexit.register(shutil.rmtree, _STATE_TMPDIR, True)
-for _attr, _name in (
-    ("STOP_PRICE_FILE",         "stop_prices.json"),
-    ("MOMENTUM_ENTRY_FILE",     "momentum_entries.json"),
-    ("MOMENTUM_WATCHLIST_FILE", "momentum_watchlist.json"),
-    ("OPTIONS_POSITION_FILE",   "options_positions.json"),
-    ("SCREEN_AB_TRACKING_FILE", "screen_ab_tracking.json"),
-    ("SENTIMENT_REPORT_FILE",   "sentiment_report.json"),
-):
-    setattr(config, _attr, os.path.join(_STATE_TMPDIR, _name))
+# Layer 2b (mutable STATE files) moved INTO config as _state_path/STATE_DIR, so
+# that a direct `python3 test_foo.py` — which never imports this file — is
+# protected too. The TB_TEST_TMPDIR export above is all that is left here.
 
 
 def _redirect_existing_log_handlers() -> int:

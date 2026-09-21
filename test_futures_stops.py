@@ -177,8 +177,16 @@ def _stop_path_for(mode):
     the environment, and reloading config in-process would leave the already
     imported strategy module holding a stale _STOPS_PATH built from the old
     value — a test that passes while corrupting every later test in the file.
+
+    The test markers are stripped so this resolves the PRODUCTION path, which is
+    what the no-migration guarantee below is about. A subprocess inherits
+    PYTEST_CURRENT_TEST, which makes config._detect_test_run() say yes and
+    redirects STATE_DIR — correct for isolation, but it would mean this test
+    asserted on the test-time path and could no longer catch a real rename.
     """
     env = dict(os.environ, BOT_MODE=mode)
+    env.pop("PYTEST_CURRENT_TEST", None)
+    env.pop("TB_TEST_TMPDIR", None)
     out = subprocess.run(
         [sys.executable, "-c", "import config; print(config.STOP_PRICE_FILE)"],
         capture_output=True, text=True, env=env, cwd=os.path.dirname(

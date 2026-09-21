@@ -67,6 +67,62 @@ def is_occ_symbol(symbol: str) -> bool:
 # floor that holds even when a test is run directly, outside pytest.
 _LOG_PREFIX = "test_" if _IS_TEST else ("futures_" if _IS_FUTURES else "")
 
+# ── Test isolation for MUTABLE STATE ──────────────────────────────────────────
+# Logs got the prefix above on day one. The data/ paths got NOTHING until
+# 2026-09-21, when a test run left a synthetic SPY position (entry_price 100.0,
+# atr_at_entry 4.0, broker_order_id "X") in the live data/stop_prices.json and
+# the equities bot loaded it on the next restart. A fabricated log line is
+# noise; a fabricated stop record is something the bot ACTS on, so this floor
+# matters strictly more than the logging one it is modelled on.
+#
+# Two levels, mirroring the logs:
+#   floor    any detected test run writes under data/test/ — no opt-in, so a
+#            bare `python3 test_foo.py` is safe on its own.
+#   ceiling  run_test.py exports TB_TEST_TMPDIR for throwaway tmpdir isolation.
+#
+# TB_TEST_TMPDIR is read ONLY WHEN _IS_TEST IS ALREADY TRUE, and that ordering
+# is the entire safety argument. A stray `export TB_TEST_TMPDIR=...` left in a
+# production shell cannot point a live bot's stop file at a tmpdir, because the
+# variable can only ever strengthen an isolation that test detection has already
+# decided on — it can never create one. Inverting this (env var first, detection
+# second) would mean a leaked export boots the bot with no stops and writes them
+# somewhere that vanishes on reboot: far worse than the bug being fixed here.
+_TEST_TMPDIR_ENV = os.environ.get("TB_TEST_TMPDIR") or ""
+
+# Set, but ignored because this is not a test run. main.py warns on this rather
+# than letting it pass: someone expected isolation and is not getting it.
+TEST_TMPDIR_IGNORED = bool(_TEST_TMPDIR_ENV) and not _IS_TEST
+
+STATE_DIR = (_TEST_TMPDIR_ENV or "data/test") if _IS_TEST else "data"
+
+
+# Every path _state_path() built, in definition order. This is the AUTHORITATIVE
+# answer to "what are the state files" — test_state_isolation asserts the
+# wrapper's guard list against it, so an eighth state file cannot be added
+# without either being guarded or failing a test. Derived by construction rather
+# than by scanning config for "*_FILE in STATE_DIR": under run_test.py the logs
+# land in that same tmpdir, and a directory test cannot tell them apart.
+STATE_FILES: list[str] = []
+
+
+def _state_path(name: str) -> str:
+    """Path for a file the bot WRITES.
+
+    Centralised so test isolation is ONE decision rather than seven. The data
+    paths drifted out from under conftest precisely because each was its own
+    string literal, so adding a seventh state file inherited no protection.
+    Read-mostly reference data (sp500.json, fundamentals_cache.json) is
+    deliberately NOT routed through here — tests read genuine data from those
+    and an empty tmp copy would quietly change what they assert.
+    """
+    path = f"{STATE_DIR}/{name}"
+    STATE_FILES.append(path)
+    return path
+
+
+if _IS_TEST:
+    os.makedirs(STATE_DIR, exist_ok=True)
+
 # ── TradeStation OAuth Credentials ────────────────────────────────────────────
 TS_CLIENT_ID     = os.environ.get("TS_CLIENT_ID", "")
 TS_CLIENT_SECRET = os.environ.get("TS_CLIENT_SECRET", "")
@@ -206,7 +262,7 @@ OPTIONS_WATCHLIST = [
 # RECOMPUTED each cycle from _atm_strike(current price), so a move of more than
 # half a strike increment silently orphaned the contract. See the block comment
 # above strategy._option_key for the full failure story.
-OPTIONS_POSITION_FILE = "data/options_positions.json"   # generated (gitignored)
+OPTIONS_POSITION_FILE = _state_path("options_positions.json")   # generated (gitignored)
 
 # ── Bar-history outage reporting ─────────────────────────────────────────────
 # A history fetch that returns nothing aborts the poll for that symbol BEFORE
@@ -291,7 +347,7 @@ STOP_LOSS_ATR_PERIOD = 14     # ATR lookback (Wilder), computed once at entry
 # has to be split. The suffix (not a prefix) keeps the equities path byte-for-byte
 # unchanged — "data/stop_prices.json" — so the four live records and their resting
 # GTC order ids survive the upgrade with no migration step.
-STOP_PRICE_FILE      = f"data/stop_prices{_PROC_SUFFIX}.json"   # generated (gitignored)
+STOP_PRICE_FILE      = _state_path(f"stop_prices{_PROC_SUFFIX}.json")   # generated (gitignored)
 
 # Regime-based ATR multiplier — the stop WIDTH a position is armed with depends on
 # the market regime AT ENTRY. The chosen multiple is persisted per position
@@ -491,7 +547,7 @@ FEATURE_DISABLED_NOTES = {
 # (RSI < MIN, e.g. HCA @ 35.1) or when already extended (RSI > MAX).
 MOMENTUM_ALIGN_RSI_MIN = 45      # skip alignment entry when RSI is below this (weakness/breakdown)
 MOMENTUM_ALIGN_RSI_MAX = 65      # skip alignment entry when RSI is above this (overbought); was 60
-MOMENTUM_ENTRY_FILE    = "data/momentum_entries.json"   # generated (gitignored)
+MOMENTUM_ENTRY_FILE    = _state_path("momentum_entries.json")   # generated (gitignored)
 
 # ── Momentum Rotation (dynamic watchlist slot) ────────────────────────────────
 # WEEKLY, every Monday 06:00 ET (deploy/momentum-rotation.timer).
@@ -518,7 +574,7 @@ MOMENTUM_ENTRY_FILE    = "data/momentum_entries.json"   # generated (gitignored)
 # warns at startup with the gap list; that warning is now expected more often,
 # not less.
 MOMENTUM_SLOT_SIZE      = 5
-MOMENTUM_WATCHLIST_FILE = "data/momentum_watchlist.json"   # generated (gitignored)
+MOMENTUM_WATCHLIST_FILE = _state_path("momentum_watchlist.json")   # generated (gitignored)
 MOMENTUM_UNIVERSE_FILE  = "data/sp500.json"                # vendored S&P 500 list
 # ~1.4 weekly cycles: warns after ONE missed rotation. Was 21, which was sized
 # for the twice-monthly cadence (~16 days between runs) and would have tolerated
@@ -557,7 +613,7 @@ EXCLUDED_SECTORS = [
 # silently averaged together. Screen A here is the SAME 20-day ranking the live bot uses
 # (MOM_LOOKBACK) so the profitability filter is the only variable between A and B.
 # The tracker NEVER writes MOMENTUM_WATCHLIST_FILE — the live path is untouched.
-SCREEN_AB_TRACKING_FILE   = "data/screen_ab_tracking.json"   # generated (gitignored)
+SCREEN_AB_TRACKING_FILE   = _state_path("screen_ab_tracking.json")   # generated (gitignored)
 SCREEN_AB_MIN_ROTATIONS   = 4        # don't declare a winner before this many rotations
 # Screen B: from the top SCREEN_B_TOP_N momentum names, keep those with at least
 # SCREEN_B_MIN_PROFITABLE_Q of the last SCREEN_B_QUARTERS_LOOKBACK quarters showing
@@ -961,7 +1017,7 @@ ENABLE_SENTIMENT_OVERRIDE = True
 # anything and the binary switch was fine; if it is large, check whether the
 # suppressed cycles were the ones worth acting on before trusting the number 6.
 SENTIMENT_OVERRIDE_MIN_FEAR = 6
-SENTIMENT_REPORT_FILE   = "data/sentiment_report.json"   # generated (gitignored)
+SENTIMENT_REPORT_FILE   = _state_path("sentiment_report.json")   # generated (gitignored)
 SENTIMENT_MODEL         = "claude-sonnet-4-6"
 SENTIMENT_MAX_TOKENS    = 500
 SENTIMENT_NEWS_TICKERS  = ["SPY", "QQQ", "DIA"]  # index breadth; one Polygon call each
@@ -1029,10 +1085,14 @@ PID_FILE  = f"bot{_PROC_SUFFIX}.pid"
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 # Filenames are mode-prefixed so the two processes never interleave their logs.
-LOG_DIR        = "logs"
-APP_LOG_FILE   = f"logs/{_LOG_PREFIX}bot.log"
-TRADE_LOG_FILE = f"logs/{_LOG_PREFIX}trades.log"
-PERF_LOG_FILE  = f"logs/{_LOG_PREFIX}performance.log"
+# _LOG_ROOT follows TB_TEST_TMPDIR when run_test.py set one, so the wrapper
+# leaves no logs/test_bot.log behind either. Without it these stay under
+# logs/ and the "test_" prefix alone keeps them off the production files.
+_LOG_ROOT      = _TEST_TMPDIR_ENV if (_IS_TEST and _TEST_TMPDIR_ENV) else "logs"
+LOG_DIR        = _LOG_ROOT
+APP_LOG_FILE   = f"{_LOG_ROOT}/{_LOG_PREFIX}bot.log"
+TRADE_LOG_FILE = f"{_LOG_ROOT}/{_LOG_PREFIX}trades.log"
+PERF_LOG_FILE  = f"{_LOG_ROOT}/{_LOG_PREFIX}performance.log"
 
 # CRITICAL-only alert sink. Deliberately at the REPO ROOT, not under logs/:
 # /etc/logrotate.d/trading-bot globs `logs/*.log`, so a file there would be
@@ -1043,7 +1103,9 @@ PERF_LOG_FILE  = f"logs/{_LOG_PREFIX}performance.log"
 #
 # This does NOT page anyone; it only guarantees the record survives. It is a
 # durable sink, not an alert channel.
-CRITICAL_ALERT_FILE = f"{_LOG_PREFIX}critical_alerts.log"
+CRITICAL_ALERT_FILE = (f"{_TEST_TMPDIR_ENV}/{_LOG_PREFIX}critical_alerts.log"
+                       if (_IS_TEST and _TEST_TMPDIR_ENV)
+                       else f"{_LOG_PREFIX}critical_alerts.log")
 
 # ── Discord push channel for CRITICAL events ──────────────────────────────────
 # The sink above is durable but silent — it only "catches" a failure when a human
@@ -1081,7 +1143,7 @@ CRITICAL_ALERT_SINKS = ("critical_alerts.log", "futures_critical_alerts.log")
 # in-memory so a restart does not lose the offset — an in-memory watermark
 # initialised to the current size silently swallows every alert written while the
 # bot was down, which is precisely when you most want to hear about one.
-DISCORD_WATERMARK_FILE = "data/alert_watermarks.json"
+DISCORD_WATERMARK_FILE = _state_path("alert_watermarks.json")
 
 # ── Trade-note markers ────────────────────────────────────────────────────────
 # The analyzer classifies exits by pattern-matching the free-text `notes` field
