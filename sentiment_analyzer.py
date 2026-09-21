@@ -81,9 +81,18 @@ SECTOR_TO_SYMBOLS = {
     # NOW/SWKS/HPQ added 2026-09-16 — all three are GICS Information Technology
     # AND trade as tech, so unlike TSLA/COIN above they need no behavioural
     # reinterpretation; they were simply missed after a momentum rotation.
+    #
+    # DELL/CRWD/INTC/HOOD added 2026-09-21, the very next rotation — which is the
+    # point: patching the names that warned does not stop the drift, because the
+    # screen redraws five slots from 503 candidates every Monday against this
+    # hand-kept list. DELL/CRWD/INTC are GICS Information Technology and need no
+    # reinterpretation. HOOD is GICS Financials and is gated as tech for the same
+    # reason COIN above is: it trades as a high-beta retail-flow proxy, not as a
+    # bank. If it ever needs to move, move COIN with it — they are one case.
     "tech":        ["NVDA", "AMD", "AVGO", "ARM", "CRWV", "PLTR", "AMZN",
                     "TSLA", "MSFT", "AAPL", "GOOGL", "META", "SPY", "QQQ",
-                    "COIN", "NOW", "SWKS", "HPQ"],
+                    "COIN", "NOW", "SWKS", "HPQ", "DELL", "CRWD", "INTC",
+                    "HOOD"],
     "financials":  ["JPM", "FDS"],
     "healthcare":  ["CRL"],
     "industrials": [],

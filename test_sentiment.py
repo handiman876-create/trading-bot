@@ -203,8 +203,16 @@ def test_the_2026_09_08_gap_names_are_mapped():
 def test_stale_names_removed_from_map():
     """Names the bot no longer trades must not linger in the map. They are not
     harmful on their own, but they are why the map LOOKED maintained while the
-    live watchlist had drifted out from under it."""
-    stale = {"CRWD", "DDOG", "BLK", "MS", "CAH", "HCA", "TMO", "DHR",
+    live watchlist had drifted out from under it.
+
+    This set is a SNAPSHOT and the rotation can invalidate it in either
+    direction — a name is only stale until the screen picks it again. CRWD was
+    dropped from it on 2026-09-21 because that Monday's rotation put CRWD back
+    in the momentum slot, making it live again; it is now asserted as mapped by
+    test_momentum_slot_names_are_all_mapped. Re-adding a name here requires
+    checking it is not in the current slot first.
+    """
+    stale = {"DDOG", "BLK", "MS", "CAH", "HCA", "TMO", "DHR",
              "LII", "CAT", "KO", "COST", "TGT"}
     assert not (stale & _mapped_symbols()), \
         f"stale names still mapped: {sorted(stale & _mapped_symbols())}"
@@ -972,6 +980,73 @@ def test_participation_predicate_matches_the_combine():
 
 
 # ── Standalone runner ─────────────────────────────────────────────────────────
+# ── 7b. sector coverage re-check when a rotation lands ────────────────────────
+
+def test_sector_recheck_fires_when_watchlist_file_changes():
+    """The 2026-09-21 hole: rotation rewrites the slot file behind a process
+    that is already up, so the startup-only check never saw the new names."""
+    import main
+    import watchlist as wl
+    orig_file, orig_eff = config.MOMENTUM_WATCHLIST_FILE, wl.effective_stock_watchlist
+    orig_mtime = main._last_watchlist_mtime
+    path = os.path.join(tempfile.mkdtemp(), "momentum_watchlist.json")
+    try:
+        config.MOMENTUM_WATCHLIST_FILE = path
+        names = ["NVDA"]
+        wl.effective_stock_watchlist = lambda positions: list(names)
+        with open(path, "w") as fh:
+            fh.write("{}")
+        main._last_watchlist_mtime = None
+
+        before = main._sector_map_gap_checks
+        main._maybe_recheck_sector_coverage()
+        assert main._sector_map_gap_checks == before + 1, "first sighting must check"
+
+        # Unchanged file: silent no matter how many cycles run. This is the
+        # property that lets it live in the polling loop at all.
+        for _ in range(5):
+            main._maybe_recheck_sector_coverage()
+        assert main._sector_map_gap_checks == before + 1, "must not re-fire per cycle"
+
+        # Rotation lands, bringing in an unmapped name. mtime is set OLDER than
+        # before on purpose: the gate is "different from last seen", not "newer",
+        # so a file restored from backup still re-checks.
+        names[:] = ["NVDA", "ZZZZ"]
+        os.utime(path, (1, 1))
+        main._maybe_recheck_sector_coverage()
+        assert main._sector_map_gap_checks == before + 2, "changed file must re-check"
+        assert main._sector_map_gaps == ["ZZZZ"]
+    finally:
+        config.MOMENTUM_WATCHLIST_FILE = orig_file
+        wl.effective_stock_watchlist = orig_eff
+        main._last_watchlist_mtime = orig_mtime
+
+
+def test_sector_recheck_silent_when_watchlist_file_absent():
+    """No slot file yet (fresh box, before the first rotation) is not an error
+    and must never be the reason a cycle raises."""
+    import main
+    orig_file, orig_mtime = config.MOMENTUM_WATCHLIST_FILE, main._last_watchlist_mtime
+    try:
+        config.MOMENTUM_WATCHLIST_FILE = os.path.join(
+            tempfile.mkdtemp(), "no-such-rotation.json")
+        main._last_watchlist_mtime = None
+        before = main._sector_map_gap_checks
+        main._maybe_recheck_sector_coverage()
+        assert main._sector_map_gap_checks == before
+    finally:
+        config.MOMENTUM_WATCHLIST_FILE = orig_file
+        main._last_watchlist_mtime = orig_mtime
+
+
+def test_momentum_slot_names_are_all_mapped():
+    """The data check, not the mechanism: every name the 2026-09-21 rotation put
+    in the slot must be gateable. This is what actually went wrong."""
+    mapped = _mapped_symbols()
+    for sym in ("DELL", "SWKS", "HOOD", "CRWD", "INTC"):
+        assert sym in mapped, f"{sym} is in the momentum slot but the gate is blind to it"
+
+
 # MUST STAY LAST IN THE FILE. It collects globals() at call time, so any test or
 # helper defined below it simply does not exist yet when it runs. Section 7a3 was
 # appended after this block on 2026-08-20 and `python3 test_sentiment.py` died

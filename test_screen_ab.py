@@ -154,7 +154,29 @@ def test_measure_returns_and_avg():
     by_date = {"2026-08-15": {"AAA": {"close": 110.0}, "BBB": {"close": 190.0}}}
     res = tracker._measure_returns(block, by_date, "2026-08-15")
     assert res["AAA"] == 0.1 and res["BBB"] == -0.05
-    assert res["avg"] == 0.0   # mean of +0.10 and -0.05 = 0.025 → rounds to 0.0 at 1dp
+    # Returns are FRACTIONS. This asserted 0.0 until 2026-09-21 — the old _avg
+    # rounded to 1dp, so +10% and -5% averaged to "zero" and every measurement
+    # reported a tie. A screen had to move ±5% before it registered at all.
+    assert res["avg"] == 0.025
+
+
+def test_measure_returns_keeps_sub_percent_differences():
+    """The regression that made four measurements read 'tie': two screens that
+    differ by well under 5% must produce DIFFERENT averages, not two zeros."""
+    by_date = {"d": {"AAA": {"close": 101.0}, "BBB": {"close": 98.0}}}
+    a = tracker._measure_returns(
+        {"detail": [{"symbol": "AAA", "entry_close": 100.0}]}, by_date, "d")
+    b = tracker._measure_returns(
+        {"detail": [{"symbol": "BBB", "entry_close": 100.0}]}, by_date, "d")
+    assert a["avg"] == 0.01 and b["avg"] == -0.02
+    assert tracker._decide_winner(a, b, True) == "screen_a"
+
+
+def test_avg_precision_is_per_call_site():
+    """One helper, two scales — IV/RV stay at 1dp, returns do not round there."""
+    assert tracker._avg([36.2, 45.9, 56.0], ndigits=1) == 46.0
+    assert tracker._avg([0.0146, -0.0483], ndigits=6) == -0.01685
+    assert tracker._avg([], ndigits=1) is None
 
 
 def test_measure_returns_skips_missing_exit():
@@ -317,3 +339,64 @@ def test_report_section_recommends_after_min_rotations():
     text = "\n".join(lines)
     assert "Rotations completed: 4" in text
     assert "adopt B" in text
+
+
+# ── reconcile of derived columns ──────────────────────────────────────────────
+
+def test_reconcile_recomputes_stale_averages_and_winner():
+    """The live 2026-09-21 case: per-symbol returns are right, the derived avg
+    and winner were written by the old 1dp rounding and read as a tie."""
+    doc = {
+        "rotations": [_completed_rotation(
+            "2026-09-21",
+            {"COIN": 0.0146, "MOS": -0.0228, "NOW": -0.0483,
+             "SWKS": 0.1199, "HPQ": 0.0112},
+            {"NOW": -0.0483, "SWKS": 0.1199, "HPQ": 0.0112,
+             "GEN": -0.0764, "GDDY": -0.0671},
+            "tie")],
+        "winner_tally": {"screen_a": 0, "screen_b": 0, "tie": 1},
+        "tally_epoch": "2026-09-16",
+    }
+    res = doc["rotations"][0]["two_week_results"]
+    res["screen_a_returns"]["avg"] = 0.0      # what the old _avg actually wrote
+    res["screen_b_returns"]["avg"] = -0.0
+
+    changes = tracker.reconcile_measurements(doc)
+
+    assert res["screen_a_returns"]["avg"] == 0.01492
+    assert res["screen_b_returns"]["avg"] == -0.01214
+    assert res["winner"] == "screen_a"
+    assert doc["winner_tally"] == {"screen_a": 1, "screen_b": 0, "tie": 0}
+    assert changes and any("winner" in c for c in changes)
+
+
+def test_reconcile_is_idempotent():
+    """Re-running must be a no-op — the mean must not fold in its own previous
+    value via the 'avg' key, or every run would drift."""
+    doc = {"rotations": [_completed_rotation("2026-09-21", {"A": 0.10},
+                                             {"B": -0.04}, "tie")],
+           "winner_tally": {}, "tally_epoch": "2026-09-16"}
+    tracker.reconcile_measurements(doc)
+    first = json.loads(json.dumps(doc))
+    assert tracker.reconcile_measurements(doc) == []
+    assert doc == first
+
+
+def test_reconcile_counts_only_post_epoch_measurements():
+    """Pre-epoch rows are still re-derived, but must not enter the tally."""
+    doc = {"rotations": [_completed_rotation("2026-09-01", {"A": 0.05}, {"B": 0.01}, "tie"),
+                         _completed_rotation("2026-09-21", {"A": 0.01}, {"B": 0.05}, "tie")],
+           "winner_tally": {}, "tally_epoch": "2026-09-16"}
+    tracker.reconcile_measurements(doc)
+    assert doc["rotations"][0]["two_week_results"]["winner"] == "screen_a"   # re-derived
+    assert doc["rotations"][1]["two_week_results"]["winner"] == "screen_b"
+    assert doc["winner_tally"] == {"screen_a": 0, "screen_b": 1, "tie": 0}   # epoch filter
+
+
+def test_reconcile_skips_unmeasured_rotation():
+    doc = {"rotations": [{"rotation_date": "2026-09-21",
+                          "screen_a": {"picks": ["A"]}, "screen_b": {"picks": ["B"]},
+                          "two_week_results": None}],
+           "winner_tally": {"screen_a": 0, "screen_b": 0, "tie": 0},
+           "tally_epoch": "2026-09-16"}
+    assert tracker.reconcile_measurements(doc) == []

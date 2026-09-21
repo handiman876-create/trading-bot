@@ -220,6 +220,11 @@ def _evaluate_cycle(account_id: str) -> None:
                 logger.error("Error evaluating future %s: %s", root, exc)
         return
 
+    # A rotation may have landed since the last cycle — re-check sector coverage
+    # BEFORE the slot is read and acted on, so an unmapped new name is reported
+    # on the first cycle it could be traded rather than at the next restart.
+    _maybe_recheck_sector_coverage()
+
     # Momentum slot + rotation id, read once per cycle. is_momentum drives the
     # one-shot alignment entry; generation re-arms the latch each new rotation.
     momentum_symbols, generation = watchlist.momentum_slot()
@@ -279,6 +284,11 @@ def _wait_for_market_open() -> None:
 # and the only way to tell "clean" from "never ran" is to see it.
 _sector_map_gaps = []
 _sector_map_gap_checks = 0
+# mtime of MOMENTUM_WATCHLIST_FILE as of the last coverage check. The rotation
+# runs on its OWN timer and rewrites that file behind a live process, so the
+# file changing is the only in-process signal that the list the sector gate must
+# cover has moved. None = never checked.
+_last_watchlist_mtime: float | None = None
 
 
 def _check_sector_map_coverage(watchlist) -> list:
@@ -290,10 +300,10 @@ def _check_sector_map_coverage(watchlist) -> list:
     2026-09-08 CRWV entry, taken on a tech=high day (see the map's own comment).
 
     Returns the gap list so callers/tests can assert on it rather than scraping
-    the log. Called at startup once the effective watchlist is built, NOT per
-    cycle: the map is a module constant and the watchlist only changes on a
-    momentum rotation or a restart, so a per-cycle check would just be the same
-    warning 390 times a session — the exact noise this commit removes elsewhere.
+    the log. Called at startup once the effective watchlist is built, and again
+    from _maybe_recheck_sector_coverage whenever the momentum slot file is
+    rewritten — NOT per cycle: the map is a module constant, so an unconditional
+    per-cycle check would be the same warning 390 times a session.
     """
     global _sector_map_gaps, _sector_map_gap_checks
     _sector_map_gap_checks += 1
@@ -313,6 +323,55 @@ def _check_sector_map_coverage(watchlist) -> list:
         logger.info("Sector map  : COMPLETE — all %d watchlist symbols mapped "
                     "(checks #%d)", len(watchlist), _sector_map_gap_checks)
     return gaps
+
+
+def _watchlist_mtime() -> float | None:
+    """mtime of the momentum slot file, or None when it is not there yet.
+
+    Any OSError reads as "no usable signal" — a missing file is the normal state
+    on a fresh box before the first rotation, and this must never be the reason
+    a cycle fails.
+    """
+    try:
+        return os.path.getmtime(config.MOMENTUM_WATCHLIST_FILE)
+    except OSError:
+        return None
+
+
+def _seed_watchlist_mtime() -> None:
+    """Mark the current slot file as already covered by the startup check, so
+    the first cycle does not immediately repeat it."""
+    global _last_watchlist_mtime
+    _last_watchlist_mtime = _watchlist_mtime()
+
+
+def _maybe_recheck_sector_coverage() -> None:
+    """Re-run the coverage check when a rotation rewrites the momentum slot.
+
+    The startup check was sufficient only while a rotation implied a restart.
+    Rotation moved to its own weekly timer (12393fb) and the two came apart: on
+    2026-09-21 four unmapped names (DELL/HOOD/CRWD/INTC) entered the slot at
+    06:11 ET and the sector gate was blind to four of five momentum names for
+    the whole session with NOTHING in the log, because the process had been up
+    since before the rotation and the check never fired again. The 09-16 fix
+    added the names that had warned; it could not stop the next rotation from
+    drawing five fresh ones out of 503.
+
+    mtime-gated rather than unconditional so this is silent on the other ~390
+    cycles. Compares against the LAST SEEN value rather than ordering the
+    timestamps, so a file restored from backup with an OLDER mtime still
+    re-checks — "different" is the signal, not "newer".
+
+    Passes core ∪ momentum with NO held names, matching the startup call
+    deliberately: held names fold in live and would churn the gap list on every
+    open and close, and the drift this exists to catch comes from the slot.
+    """
+    global _last_watchlist_mtime
+    mtime = _watchlist_mtime()
+    if mtime is None or mtime == _last_watchlist_mtime:
+        return
+    _last_watchlist_mtime = mtime
+    _check_sector_map_coverage(watchlist.effective_stock_watchlist([]))
 
 
 def _log_sentiment_banner(rep: dict) -> None:
@@ -459,6 +518,7 @@ def main() -> None:
         # fold in live and are not known here, so a held-only name still reaches
         # the gate unchecked — core ∪ momentum is where the drift comes from.
         _check_sector_map_coverage(active)
+        _seed_watchlist_mtime()
         logger.info("Options     : %s", config.OPTIONS_WATCHLIST)
         logger.info("Next option exp.: %s", mh.next_monthly_expiration())
         logger.info("Stop loss   : %s (regime ATR mult — risk_on %.1fx/cautious %.1fx/"

@@ -67,12 +67,27 @@ def _save_tracking(doc: dict) -> None:
     os.replace(tmp, path)
 
 
-def _avg(values: list) -> float | None:
-    """Mean of the non-None numbers, rounded, or None if there are none."""
+def _avg(values: list, ndigits: int | None = None) -> float | None:
+    """Mean of the non-None numbers, or None if there are none.
+
+    `ndigits` is per-call because this helper averages two quantities that live
+    on different scales, and a single baked-in rounding was only ever correct
+    for one of them. IV and RV are percentage POINTS (36.2, 112.1) where one
+    decimal is the natural precision. Forward returns are FRACTIONS (0.0146,
+    -0.0483), and rounding those to one decimal collapsed every screen average
+    to 0.0 — which handed _decide_winner two zeros and made all four recorded
+    measurements report "tie" no matter what the screens actually did. The bug
+    hid because A and B picked identical baskets for the first two rotations,
+    so the ties looked correct, and because test_decide_winner exercised the
+    comparison with hand-written values _avg could never have produced.
+
+    Default None = do not round; each call site states the precision it wants.
+    """
     nums = [v for v in values if isinstance(v, (int, float))]
     if not nums:
         return None
-    return round(sum(nums) / len(nums), 1)
+    mean = sum(nums) / len(nums)
+    return mean if ndigits is None else round(mean, ndigits)
 
 
 def _sector_breakdown(picks: list[dict], sectors: dict) -> dict:
@@ -118,8 +133,8 @@ def _build_screen_record(picks: list[dict], by_date: dict, dates_asc: list[str],
     return {
         "picks":  [d["symbol"] for d in detail],
         "detail": detail,
-        "avg_iv": _avg([d["iv"] for d in detail]),
-        "avg_rv": _avg([d["rv"] for d in detail]),
+        "avg_iv": _avg([d["iv"] for d in detail], ndigits=1),
+        "avg_rv": _avg([d["rv"] for d in detail], ndigits=1),
         "sector_breakdown": _sector_breakdown(picks, sectors),
     }
 
@@ -136,7 +151,10 @@ def _measure_returns(screen_block: dict, by_date: dict, latest: str) -> dict:
         cur = bar.get("close") if bar else None
         if entry and cur:
             returns[sym] = round(cur / entry - 1.0, 4)
-    returns["avg"] = _avg(list(returns.values()))
+    # 6dp: per-symbol returns are stored at 4dp, so this keeps the mean exact to
+    # well past any margin that could decide a winner, while not writing float
+    # noise like 0.014920000000000002 into the file.
+    returns["avg"] = _avg(list(returns.values()), ndigits=6)
     return returns
 
 
@@ -158,6 +176,55 @@ def _decide_winner(a_ret: dict, b_ret: dict, b_had_picks: bool) -> str:
     if b > a:
         return "screen_b"
     return "tie"
+
+
+def reconcile_measurements(doc: dict) -> list[str]:
+    """Re-derive every stored screen average, winner and the tally from the
+    per-symbol returns already on record. Returns one line per change.
+
+    A RECONCILE, not a one-shot backfill. `avg` and `winner` are derived
+    columns: each was written with whatever _avg and _decide_winner did on the
+    day, so they age as that logic changes. The 1-decimal rounding that made
+    four measurements read "tie" is the first such drift to be caught, not
+    structurally the last — re-running this after any change to the averaging
+    or the winner rule re-derives the file in place instead of needing a fresh
+    migration script each time.
+
+    Per-symbol returns are the source of truth here and are NOT recomputed:
+    they came from price data this function has no access to. Only the columns
+    derived FROM them move.
+
+    The tally is rebuilt from zero over post-epoch measurements only — the same
+    filter reset_note describes — so a re-run cannot double-count.
+    """
+    epoch = doc.get("tally_epoch") or ""
+    tally = {"screen_a": 0, "screen_b": 0, "tie": 0}
+    changes: list[str] = []
+    for rot in doc.get("rotations", []):
+        res = rot.get("two_week_results")
+        if not res:
+            continue
+        when = res.get("measured_on") or "?"
+        for key in ("screen_a_returns", "screen_b_returns"):
+            ret = res.get(key) or {}
+            # Exclude the derived key itself, or the mean folds in its own
+            # previous value and every re-run drifts further.
+            new = _avg([v for k, v in ret.items() if k != "avg"], ndigits=6)
+            if ret.get("avg") != new:
+                changes.append(f"{when} {key}: avg {ret.get('avg')} -> {new}")
+                ret["avg"] = new
+        winner = _decide_winner(res.get("screen_a_returns") or {},
+                                res.get("screen_b_returns") or {},
+                                bool((rot.get("screen_b") or {}).get("picks")))
+        if res.get("winner") != winner:
+            changes.append(f"{when} winner: {res.get('winner')} -> {winner}")
+            res["winner"] = winner
+        if when >= epoch:
+            tally[winner] = tally.get(winner, 0) + 1
+    if doc.get("winner_tally") != tally:
+        changes.append(f"winner_tally: {doc.get('winner_tally')} -> {tally}")
+        doc["winner_tally"] = tally
+    return changes
 
 
 def run(dry_run: bool = False) -> int:
@@ -242,7 +309,25 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="A/B momentum screen tracker (observation only)")
     parser.add_argument("--dry-run", action="store_true",
                         help="compute and print without writing the tracking file")
+    parser.add_argument("--reconcile", action="store_true",
+                        help="re-derive stored averages/winners/tally from the "
+                             "recorded per-symbol returns, then exit (no screening)")
     args = parser.parse_args()
+    if args.reconcile:
+        doc = _load_tracking()
+        changes = reconcile_measurements(doc)
+        for line in changes:
+            logger.info("RECONCILE %s", line)
+        if not changes:
+            logger.info("RECONCILE: nothing to change — stored values already "
+                        "match the current derivation.")
+        elif args.dry_run:
+            logger.info("[dry-run] %d change(s) NOT written", len(changes))
+        else:
+            _save_tracking(doc)
+            logger.info("Wrote %s (%d change(s))",
+                        config.SCREEN_AB_TRACKING_FILE, len(changes))
+        return 0
     try:
         return run(dry_run=args.dry_run)
     except Exception as exc:
