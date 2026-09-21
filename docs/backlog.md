@@ -1987,3 +1987,28 @@ one that bites.
 **Priority: MEDIUM.** Gitignored and does not reach the repo, but standalone
 runs on the deploy box mutate live trading state, and the 2026-09-21 instance
 was loaded by a live bot before it was caught.
+
+**RESOLVED 2026-09-21 (36ce546) — and not by any of the three options as
+written.** The fix turned out to be smaller: `config._detect_test_run()` ALREADY
+covered both entry points (pytest via `sys.modules`, standalone via `argv[0]`),
+and logs had been wired to it since day one via `_LOG_PREFIX`. Only the data/
+paths had never been connected to the mechanism that already existed. Routing
+them through `config._state_path()` protects the bare `python3 test_foo.py`
+form with no per-file discipline and no new detection — so option 1 (extend
+_testlib.py to 43 files) was never needed, and option 2's danger never had to
+be taken on.
+
+Option 3 was still built, as the ceiling rather than the fix: `run_test.py`
+gives a throwaway tmpdir, one fresh process per file, and a pre-flight
+assertion that refuses to run when config and the wrapper have drifted.
+`TB_TEST_TMPDIR` is honoured ONLY when test detection has already fired, so it
+can strengthen isolation but never create it — which is what makes an env-var
+hook acceptable in production code here. `test_state_isolation.py` asserts all
+of it, including the production-safety property, and `main.py` now names the
+resolved state dir at startup so live and redirected cannot look alike.
+
+Remaining, deliberately: `performance_analyzer.LEDGER_PATH` builds
+`data/trade_ledger.json` from `_HERE` rather than from config, so it is outside
+this floor. The analyzer is not part of the test sweep today, so nothing writes
+it during tests — but it is the one state path a future test could still reach.
+Route it through config if the analyzer ever grows tests that call `_save`.
