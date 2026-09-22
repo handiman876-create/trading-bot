@@ -1578,6 +1578,34 @@ sixth case (its floor is holding $872 the trail would have given back in full,
 plus $2,804), but CRWV remains the fifth and the diagnosis there still points at
 trail width and entry timing, not at K.
 
+#### 2026-09-22 — GOOGL long: first sample in the [0.6, 1.1) gap, NOT band-resident
+
+GOOGL long 09-18 → 09-22, x135, entry 355.24, `atr_at_entry` 8.3997. Exit
+11:31 ET, `water_caused_exit: true`, stop 357.15, fill **356.81** → **+$211.95**.
+Peak water 363.45 = **0.98 ATR** run. Capture-if-hit 1.57 / 8.21 = **19%**.
+Counterfactual at the ATR trail (346.65): ≈ **−$1,159.65**, so the floor beat the
+trail by **+$1,371.60**.
+
+* **Not band-resident, so it does NOT meet the reopen condition.** 0.98 ATR is above
+  [0.50, 0.75): both K values arm (K=0.50 at 13:35 UTC 09-22, K=0.75 at 13:44 UTC),
+  so it cannot separate them on *arming*. It is a smaller AMD, not a second CRWV.
+* **It is a second strike against 0.75 on *capture*.** Replaying the polled prices:
+  a K=0.50 floor (water − 4.20) would have been hit at **11:01 ET @ ~359.19**, ≈
+  **+$533** at the poll price before slippage, ≈ 48% capture, about **+$321 more**
+  than K=0.75 got. That is the same direction as AMD (35.6% vs 57.1%). Capture bar
+  is now **0-for-2** at K=0.75. That still isn't a verdict (the asymmetric-intervention
+  argument above stands, and n=2), but it is the pattern to watch.
+* **Shakeout determination: NOT a shakeout on the exit day.** EMA9 348.28 > EMA21
+  345.40 at the exit, but that test tells us nothing: these are daily-bar EMAs, and
+  any long still held when the floor fires has EMA9 > EMA21 by construction,
+  because a bearish cross would have signal-exited it first. What does tell us
+  something is the price path: 247 polls after exit, high **356.94** (two polls at
+  15:37–15:38 UTC, 13¢ over the fill and never back to the 357.15 stop), low
+  350.52, last 351.17. Holding would have been ≈ −$760 worse at the close. Re-check
+  only if GOOGL reclaims 363.45 before its next bearish cross.
+* **Run-length sample updated:** 0.268, 0.5065, 0.560 (CRWV), **0.98 (GOOGL)**,
+  1.165 (AMD), 2.11 (META). The gap has narrowed to [0.6, 0.95).
+
 #### Observability note — the broker floor is NOT at the water floor
 
 `BROKER FLOOR RAISE` tracked every ratchet (`raises #10`–`#19`, order
