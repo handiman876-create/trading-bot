@@ -622,7 +622,12 @@ SCREEN_AB_TRACKING_FILE   = _state_path("screen_ab_tracking.json")   # generated
 # which left it isolated under pytest (conftest pins it) but NOT under a direct
 # `python3 test_foo.py`.
 TRADE_LEDGER_FILE = _state_path("trade_ledger.json")   # generated (gitignored)
-SCREEN_AB_MIN_ROTATIONS   = 4        # don't declare a winner before this many rotations
+# futures_performance_analyzer's ledger — a SEPARATE file, never merged into the
+# one above. The equity ledger's -$39k history must keep meaning "equities +
+# options"; one file with a mode tag would make every existing total ambiguous.
+# Same floor as its sibling: a stray test run lands under data/test/.
+FUTURES_TRADE_LEDGER_FILE = _state_path("futures_trade_ledger.json")   # generated (gitignored)
+SCREEN_AB_MIN_ROTATIONS  = 4        # don't declare a winner before this many rotations
 # Screen B: from the top SCREEN_B_TOP_N momentum names, keep those with at least
 # SCREEN_B_MIN_PROFITABLE_Q of the last SCREEN_B_QUARTERS_LOOKBACK quarters showing
 # positive net income; take the first MOMENTUM_SLOT_SIZE that survive.
@@ -1101,6 +1106,13 @@ LOG_DIR        = _LOG_ROOT
 APP_LOG_FILE   = f"{_LOG_ROOT}/{_LOG_PREFIX}bot.log"
 TRADE_LOG_FILE = f"{_LOG_ROOT}/{_LOG_PREFIX}trades.log"
 PERF_LOG_FILE  = f"{_LOG_ROOT}/{_LOG_PREFIX}performance.log"
+# The futures process's trade log, spelled MODE-INDEPENDENTLY: equals
+# TRADE_LOG_FILE under --mode futures, but the weekly analyzer runs in equities
+# mode, where TRADE_LOG_FILE is logs/trades.log. Reading TRADE_LOG_FILE is why no
+# futures trip reached any ledger before 2026-09-23. A test run gets the test_
+# prefix ON TOP (test_futures_trades.log), so it never reads production futures
+# fills and never collides with the equity test log either.
+FUTURES_TRADE_LOG_FILE = f"{_LOG_ROOT}/{'test_' if _IS_TEST else ''}futures_trades.log"
 
 # CRITICAL-only alert sink. Deliberately at the REPO ROOT, not under logs/:
 # /etc/logrotate.d/trading-bot globs `logs/*.log`, so a file there would be

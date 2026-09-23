@@ -431,9 +431,17 @@ def _inject_bootstrap_entries(ledger: dict, stops: dict, open_keys: set) -> int:
 
 # ── Round-trip pairing + P&L ──────────────────────────────────────────────────
 
-def _pnl(direction: str, entry_price: float, exit_price: float, qty: float) -> float:
+def _pnl(direction: str, entry_price: float, exit_price: float, qty: float,
+         point_value: float = 1.0) -> float:
     """Realized P&L in dollars. Longs profit when price rises, shorts when it
-    falls; options are per-contract × 100 shares."""
+    falls; options are per-contract × 100 shares.
+
+    `point_value` is dollars per 1.0 of price per unit held: 1 for a share, the
+    contract multiplier for a future (NQ $20, ES $50). Defaulted rather than
+    looked up here so the equity ledger's arithmetic is unchanged by
+    construction — futures_performance_analyzer passes it explicitly, and an
+    unknown futures root fails there instead of quietly pricing at 1x (which
+    books NQZ26 09-23 at +$551.75 instead of +$11,035)."""
     qty = abs(qty or 0)
     if direction == "short":
         gross = (entry_price - exit_price) * qty
@@ -441,7 +449,18 @@ def _pnl(direction: str, entry_price: float, exit_price: float, qty: float) -> f
         gross = (exit_price - entry_price) * qty
     if direction == "option":
         gross *= OPTION_MULTIPLIER
-    return gross
+    return gross * point_value
+
+
+def _dollar_qty(trip: dict) -> float:
+    """Dollars per 1.0 of price move for a closed trip: qty × point_value.
+
+    The ONE place the floor/lock stats turn a price distance into dollars. All
+    three sections did `abs(a - b) * qty` inline, which is right for shares and
+    silently wrong for a future — capture = realized / peak would divide dollars
+    (multiplied) by points (not), and read NQZ26's 56.5% as 1,131%. Equity trips
+    carry no point_value key, so they get 1 and are unchanged."""
+    return (trip.get("qty") or 0) * (trip.get("point_value") or 1)
 
 
 def _pnl_pct(direction: str, entry_price: float, exit_price: float) -> float | None:
@@ -531,11 +550,15 @@ def _leg_price(event: dict):
     return event.get("price"), "signal"
 
 
-def _pair_round_trips(events: list):
+def _pair_round_trips(events: list, point_value_fn=None):
     """FIFO-pair entries and exits per (symbol, direction). An exit closes the
     OLDEST open entry of the same symbol+direction. Returns
     (closed_trips, orphan_exits) — orphan_exits are exits with no open entry
-    (missing/unlogged entry; surfaced in Data Quality)."""
+    (missing/unlogged entry; surfaced in Data Quality).
+
+    `point_value_fn(symbol) -> float`, when given, prices each trip at that
+    multiplier and records it on the trip as `point_value` (read back by
+    _dollar_qty). Omitted for equities, whose trips therefore carry no such key."""
     from collections import defaultdict
     open_q = defaultdict(list)              # (symbol, direction) -> [entry events]
     closed, orphans = [], []
@@ -561,8 +584,10 @@ def _pair_round_trips(events: list):
                 basis = entry_src
             else:
                 basis = "mixed"
-            pnl = _pnl(direction, entry_price, exit_price, qty)
-            closed.append({
+            pv = point_value_fn(ev["symbol"]) if point_value_fn else None
+            pnl = _pnl(direction, entry_price, exit_price, qty,
+                       point_value=pv if pv is not None else 1.0)
+            trip = {
                 "symbol":          ev["symbol"],
                 "direction":       direction,
                 "feature":         entry.get("feature"),
@@ -583,7 +608,10 @@ def _pair_round_trips(events: list):
                 "pnl":             round(pnl, 2),
                 "pnl_pct":         _pnl_pct(direction, entry_price, exit_price),
                 "win":             pnl > 0,
-            })
+            }
+            if pv is not None:
+                trip["point_value"] = pv
+            closed.append(trip)
     open_entries = [e for q in open_q.values() for e in q]
     return closed, orphans, open_entries
 
@@ -736,9 +764,11 @@ def _spy_comparison():
 
 # ── Ledger persistence ────────────────────────────────────────────────────────
 
-def _load_ledger() -> dict:
+def _load_ledger(path: str | None = None) -> dict:
+    """The ledger at `path` (default: the equity ledger). Shared with
+    futures_performance_analyzer, which keeps its own file."""
     try:
-        with open(LEDGER_PATH) as f:
+        with open(path or LEDGER_PATH) as f:
             data = json.load(f)
         if isinstance(data, dict) and isinstance(data.get("events"), dict):
             return data
@@ -747,13 +777,14 @@ def _load_ledger() -> dict:
     return {"version": LEDGER_VERSION, "events": {}, "closed_trips": []}
 
 
-def _save_ledger(ledger: dict) -> None:
-    os.makedirs(os.path.dirname(LEDGER_PATH), exist_ok=True)
-    tmp = f"{LEDGER_PATH}.tmp"
+def _save_ledger(ledger: dict, path: str | None = None) -> None:
+    path = path or LEDGER_PATH
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = f"{path}.tmp"
     with open(tmp, "w") as f:
         json.dump(ledger, f, indent=2)
         f.write("\n")
-    os.replace(tmp, LEDGER_PATH)
+    os.replace(tmp, path)
 
 
 # ── Open-position mark-to-market ──────────────────────────────────────────────
@@ -979,7 +1010,7 @@ def _profit_floor_stats(closed_trips: list) -> dict:
     room = 0.0
     for t in caused:
         fl, tr, qty = (t.get("profit_floor_price"),
-                       t.get("atr_trail_at_exit"), t.get("qty") or 0)
+                       t.get("atr_trail_at_exit"), _dollar_qty(t))
         if fl is not None and tr is not None:
             room += abs(fl - tr) * qty
 
@@ -1103,13 +1134,13 @@ def _breakeven_lock_stats(closed_trips: list) -> dict:
     scratches = sum(1 for t in caused
                     if abs(t.get("pnl") or 0)
                     < SCRATCH_BAND_PCT * abs((t.get("entry_price") or 0)
-                                             * (t.get("qty") or 0)))
+                                             * _dollar_qty(t)))
 
     protected = given_back = 0.0
     measurable = 0
     for t in caused:
         en, tr, qty = (t.get("entry_price"), t.get("atr_trail_at_exit"),
-                       t.get("qty") or 0)
+                       _dollar_qty(t))
         if en is not None and tr is not None:
             protected += abs(en - tr) * qty
         wa = t.get("water_at_exit")
@@ -1242,7 +1273,7 @@ def _water_floor_stats(closed_trips: list) -> dict:
     measured = 0
     for t in caused:
         fl, tr, qty = (t.get("water_floor_price"),
-                       t.get("atr_trail_at_exit"), t.get("qty") or 0)
+                       t.get("atr_trail_at_exit"), _dollar_qty(t))
         if fl is not None and tr is not None:
             room += abs(fl - tr) * qty
         en, wa = t.get("entry_price"), t.get("water_at_exit")
@@ -1576,6 +1607,10 @@ def render_txt(report: dict) -> str:
     L.append("")
     L.append("A/B SCREEN TRACKER")
     L.extend(_ab_screen_lines())
+    if "futures" in report:
+        import futures_performance_analyzer as fpa
+        L.append("")
+        L.extend(fpa.render_lines(report["futures"]))
     return "\n".join(L) + "\n"
 
 
@@ -1616,6 +1651,16 @@ def run(dry_run: bool = False, reconcile: bool = True) -> dict:
         "events_backfilled": backfilled,
     }, positions=positions)
 
+    # Futures keep their own ledger (futures_performance_analyzer); this report
+    # only CARRIES their section. A futures failure must not cost the equity
+    # report, and must not exit 0 either — main() checks for the error key.
+    try:
+        import futures_performance_analyzer as fpa
+        report["futures"] = fpa.run(dry_run=dry_run, reconcile=reconcile)
+    except Exception as exc:
+        logger.error("Futures performance analysis failed: %s", exc)
+        report["futures"] = {"error": f"{type(exc).__name__}: {exc}"}
+
     if not dry_run:
         _save_ledger(ledger)
         _write_reports(report)
@@ -1652,6 +1697,10 @@ def main() -> int:
         return 1
     if args.dry_run:
         print(render_txt(report))
+    # The equity report was written; the futures section says FAILED. Still
+    # non-zero, or the timer stays green while the futures book goes unreported.
+    if (report.get("futures") or {}).get("error"):
+        return 1
     return 0
 
 

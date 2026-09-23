@@ -292,24 +292,48 @@ def get_historical_orders(account_id: str, since: str) -> Optional[list[dict]]:
     try:
         data = _get(f"brokerage/accounts/{account_id}/historicalorders",
                     {"since": since})
-        out = []
-        for o in data.get("Orders", []):
-            for leg in (o.get("Legs") or []):
-                out.append({
-                    "order_id":  str(o.get("OrderID")),
-                    "symbol":    leg.get("Symbol"),
-                    "action":    leg.get("BuyOrSell"),
-                    "quantity":  _f(leg.get("ExecQuantity")),
-                    # ExecutionPrice is the leg's average; FilledPrice is the
-                    # whole-order average. Equal for single-leg equity orders.
-                    "price":     _f(leg.get("ExecutionPrice")) or _f(o.get("FilledPrice")),
-                    "status":    o.get("StatusDescription") or o.get("Status"),
-                    "opened":    o.get("OpenedDateTime"),
-                })
-        return out
+        return _order_leg_rows(data)
     except Exception as exc:
         logger.error("Historical orders fetch failed: %s", exc)
         return None
+
+
+def get_current_orders(account_id: str) -> Optional[list[dict]]:
+    """TODAY's orders in ANY status — filled included — or None on error.
+
+    READ-ONLY. Exists because historicalorders EXCLUDES the current day: on
+    2026-09-23 it returned every futures fill back to 07-21 except that
+    morning's NQZ26 exit. Anything recovering fills from history must read both.
+    get_working_orders hits the same endpoint but drops finished orders, which
+    is right for "what is resting" and wrong here.
+
+    Same row shape as get_historical_orders (one row per LEG) and the same
+    None-vs-[] contract."""
+    try:
+        return _order_leg_rows(_get(f"brokerage/accounts/{account_id}/orders"))
+    except Exception as exc:
+        logger.error("Current orders fetch failed: %s", exc)
+        return None
+
+
+def _order_leg_rows(data: dict) -> list[dict]:
+    """One row per order LEG with its execution. Shared by the historical and
+    current-day readers so the two cannot drift in what they report."""
+    out = []
+    for o in data.get("Orders", []):
+        for leg in (o.get("Legs") or []):
+            out.append({
+                "order_id":  str(o.get("OrderID")),
+                "symbol":    leg.get("Symbol"),
+                "action":    leg.get("BuyOrSell"),
+                "quantity":  _f(leg.get("ExecQuantity")),
+                # ExecutionPrice is the leg's average; FilledPrice is the
+                # whole-order average. Equal for single-leg equity orders.
+                "price":     _f(leg.get("ExecutionPrice")) or _f(o.get("FilledPrice")),
+                "status":    o.get("StatusDescription") or o.get("Status"),
+                "opened":    o.get("OpenedDateTime"),
+            })
+    return out
 
 
 def get_account_balance(account_id: str) -> Optional[dict]:
