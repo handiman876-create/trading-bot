@@ -1943,6 +1943,25 @@ unvalidated)" above cannot be closed from SIM data. It needs one of the two
 options above first; that entry's premise is that the thresholds can be judged
 on outcomes, and in this account they cannot.
 
+**Possible second instrument — futures, 2026-09-23 (SIM3297102F).** NQZ26 Sep 23:
+101.5-point exit slippage (vs 4.5-pt entry slippage in our favour). May be SIM
+artifact or fast market. Options already show phantom fills. Requires live
+trading to validate futures fill quality.
+
+| leg | signal | fill | slippage |
+|---|---|---|---|
+| buy 09-20 21:45 ET | 30118.75 | **30114.25** | 4.5 pts in our favour |
+| sell 09-23 10:20 ET | 30767.50 | **30666.00** | **101.5 pts against us ($2,030)** |
+
+The exit was the bot's own market order after a water-floor stop at 30768.89.
+The GTC broker floor at 30511.80 did not fill. True P&L on the fills is **+$11,035
+gross**. The signal price would give $13,065, and water-floor capture drops from
+67.1% to 56.5%. **The sign is the opposite of the option artifact**: options filled
+in our favour on both legs, and this one went against us. So it does not yet show
+the *same* engine behaviour on a second instrument. The policy line above
+("treat it as options-specific") stands until the 10:20 ET NQ 1-minute bar
+rules out a fast market. Not actionable in SIM.
+
 ---
 
 ## Standalone test runs mutate live state
