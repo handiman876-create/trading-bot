@@ -368,6 +368,64 @@ def test_stale_old_entry_not_paired_with_recent_exit():
     assert len(stale) == 1
 
 
+# The cutoff used to be `now - 90 days`, which advanced into the real ledger:
+# on the live ledger it would have left 0 trips / $0 realized by 2026-12-31. These
+# pin the clock far past 90 days and require the answer not to move.
+
+def _pinned_now(when):
+    """Run with _reference_now pinned; restores it (standalone-safe, no fixture)."""
+    from contextlib import contextmanager
+
+    @contextmanager
+    def cm():
+        saved = pa._reference_now
+        pa._reference_now = lambda: when
+        try:
+            yield
+        finally:
+            pa._reference_now = saved
+    return cm()
+
+
+def test_stale_cutoff_does_not_move_with_the_clock():
+    from datetime import datetime
+    with _pinned_now(datetime(2026, 9, 23)):
+        a = pa._stale_cutoff()
+    with _pinned_now(datetime(2030, 1, 1)):
+        b = pa._stale_cutoff()
+    assert a == b == pa.PRE_ANALYZER_CUTOFF
+    # The pre-analyzer population (04-17, 06-09) is behind it; the ledger's
+    # first real exit (07-02) and reconciled 07-01 entries are not.
+    assert datetime(2026, 6, 9) < a < datetime(2026, 7, 1)
+
+
+def test_closed_trip_survives_long_after_90_days():
+    from datetime import datetime
+    events = [
+        _ev("2026-07-02 09:30:00 EDT", "BUY",  "CRL", 10, 100.0, "EMA cross up"),
+        _ev("2026-07-10 09:30:00 EDT", "SELL", "CRL", 10, 90.0,  "EMA cross down"),
+    ]
+    with _pinned_now(datetime(2027, 6, 1)):
+        recent, stale = pa._partition_stale(events, pa._stale_cutoff())
+    closed, orphans, _ = pa._pair_round_trips(recent)
+    assert stale == [] and orphans == []
+    assert len(closed) == 1 and closed[0]["pnl"] == -100.0
+
+
+def test_position_held_past_90_days_stays_open_and_pairs_its_exit():
+    """The rolling rule dropped a long hold from open tracking and orphaned its
+    eventual exit."""
+    from datetime import datetime
+    entry = _ev("2026-07-10 09:30:00 EDT", "BUY", "AMD", 5, 100.0, "EMA cross up")
+    with _pinned_now(datetime(2026, 12, 1)):
+        recent, _ = pa._partition_stale([entry], pa._stale_cutoff())
+        assert len(pa._pair_round_trips(recent)[2]) == 1          # still open
+        exit_ = _ev("2026-11-30 10:00:00 EDT", "SELL", "AMD", 5, 150.0, "EMA cross down")
+        recent, _ = pa._partition_stale([entry, exit_], pa._stale_cutoff())
+    closed, orphans, _ = pa._pair_round_trips(recent)
+    assert orphans == [] and closed[0]["pnl"] == 250.0
+
+
 # ── SPY close lookup ──────────────────────────────────────────────────────────
 
 def test_spy_close_on_or_before():

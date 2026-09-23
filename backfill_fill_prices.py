@@ -102,8 +102,7 @@ def _rederive_slippage(event: dict) -> bool:
 
 def _realized(ledger: dict) -> tuple[float, int]:
     """Total realized P&L over the ledger's pairable events, and the trip count."""
-    cutoff = pa._reference_now() - timedelta(days=pa.STALE_OPEN_DAYS)
-    events, _ = pa._partition_stale(list(ledger["events"].values()), cutoff)
+    events, _ = pa._partition_stale(list(ledger["events"].values()), pa._stale_cutoff())
     closed, _, _ = pa._pair_round_trips(events)
     return sum(t["pnl"] for t in closed), len(closed)
 

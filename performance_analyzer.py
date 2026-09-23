@@ -27,7 +27,7 @@ import json
 import logging
 import os
 import sys
-from datetime import datetime, timedelta
+from datetime import datetime
 
 import config
 from trade_logger import _STOP_ATTR_KEYS
@@ -45,9 +45,27 @@ PERF_GLOB    = os.path.join(_HERE, config.PERF_LOG_FILE + "*")
 MIN_TRADES_FOR_STATS = 10          # a feature needs this many closed trips to judge
 OPTION_MULTIPLIER    = 100         # shares per option contract
 LEDGER_VERSION       = 1
-STALE_OPEN_DAYS      = 90           # an unpaired entry older than this is pre-analyzer
-                                    # noise (its exit rotated out before the ledger
-                                    # existed) — excluded from open tracking + pairing
+# Entries before this date are pre-analyzer noise: their exits rotated out of
+# the logs before the ledger existed (2026-07-15), so they can only ever sit as
+# phantom opens or grab a later exit FIFO (3 fake April-entry TSLA "wins",
+# 3582b60). Excluded from pairing and open tracking; counted in Data Quality.
+#
+# A FIXED DATE, NOT A ROLLING WINDOW. This was `now - 90 days` until 2026-09-23,
+# which is right for a population that keeps being created and wrong for one
+# that never grows: the April noise is a fixed set, but the rolling line kept
+# advancing into the real ledger. It dropped EVERY event behind it, exits
+# included, so closed trips would have started vanishing from the 10-04 report
+# (first exit 07-02) and the ledger would read 0 trips / $0 by 12-31. It also
+# dropped any position held longer than 90 days from open tracking and
+# orphaned its exit. Entries missed AFTER the ledger existed are the broker
+# reconcile's job (_reconcile_open_entries), not this cutoff's.
+#
+# Value = the rolling cutoff on the day it was frozen, so the report did not
+# move. Any date in (06-17, 07-01] partitions the ledger identically: 17 entries
+# on 04-17 plus one on 06-09 are stale, one on 06-17 is already reconciled, and
+# nothing sits between 06-17 and 07-01. Logs only get newer, so no event older
+# than this can ever be added.
+PRE_ANALYZER_CUTOFF  = datetime(2026, 6, 25)
 
 # The four report buckets, in display order.
 FEATURES = ["long_fresh_cross", "momentum_alignment", "short", "option"]
@@ -113,6 +131,13 @@ def _reference_now() -> datetime:
     """Naive 'now' for age comparisons against _parse_ts. Isolated so tests can
     monkeypatch it deterministically."""
     return datetime.now()
+
+
+def _stale_cutoff() -> datetime:
+    """The pre-analyzer boundary. A function, not a bare constant, so every
+    caller (build_report, backfill_fill_prices) takes it from one place — the
+    rolling version was computed separately at each site."""
+    return PRE_ANALYZER_CUTOFF
 
 
 def _partition_stale(events: list, cutoff: datetime):
@@ -898,9 +923,9 @@ def _now_ts() -> str:
 def build_report(ledger: dict, stops: dict, data_quality: dict,
                  positions: list[dict] | None = None) -> dict:
     all_events = list(ledger["events"].values())
-    cutoff = _reference_now() - timedelta(days=STALE_OPEN_DAYS)
-    # Drop pre-analyzer entries (>90d) so they can't sit as phantom opens or
-    # mispair with recent exits; keep them only as a count for Data Quality.
+    cutoff = _stale_cutoff()
+    # Drop pre-analyzer entries (before PRE_ANALYZER_CUTOFF) so they can't sit as
+    # phantom opens or mispair with later exits; keep them only as a count.
     events, stale_entries = _partition_stale(all_events, cutoff)
 
     # Pair once to see which held positions lack an OPEN entry, inject synthetic
@@ -1577,7 +1602,8 @@ def render_txt(report: dict) -> str:
     L.append(f"  correction trips excluded from per-feature stats: "
              f"{dq.get('correction_trips_excluded', 0)} "
              f"(hand-placed repairs; not strategy decisions)")
-    L.append(f"  pre-analyzer entries excluded (>{STALE_OPEN_DAYS}d): "
+    L.append(f"  pre-analyzer entries excluded (before "
+             f"{PRE_ANALYZER_CUTOFF:%Y-%m-%d}): "
              f"{dq.get('stale_pre_analyzer_entries', 0)}")
     L.append(f"  exits missing an entry (orphans): {len(dq['orphan_exits_missing_entry'])}")
     for o in dq["orphan_exits_missing_entry"][:5]:
