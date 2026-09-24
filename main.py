@@ -200,7 +200,7 @@ def _evaluate_cycle(account_id: str) -> None:
     # positions list (or the reverse) deletes every record and re-bootstraps it
     # with a reset water-mark — silently loosening a ratcheted stop. If the
     # per-process file split is ever undone, this call has to move back down.
-    strategy.reconcile_stops(positions)
+    strategy.reconcile_stops(positions, account_id)
 
     # Broker-native stop floors: cancel any GTC stop left resting behind a
     # position we no longer hold, and re-arm a held position whose floor the

@@ -881,6 +881,7 @@ def _bootstrap_stop(symbol: str, held: int, sig: dict, positions: list[dict],
 # not the feature working — it is the bot failing to exit and the backstop
 # catching what it missed, and each one deserves a look.
 _floors_placed = 0
+_floor_fires = 0           # floors the BROKER filled before the bot's stop fired
 _floors_cancelled = 0
 _floor_orphans = 0
 _floor_cancel_failures = 0
@@ -1616,13 +1617,101 @@ def _clear_stop(symbol: str) -> None:
         _save_stops(stops)
 
 
-def reconcile_stops(positions: list[dict]) -> None:
+def _record_broker_floor_fill(symbol: str, rec: dict,
+                              account_id: Optional[str]) -> None:
+    """Explain a position that vanished while its stop record was still live.
+
+    Every bot exit route tears its stop record down itself, so a record that
+    reconcile_stops finds orphaned belongs to a position the BOT did not close.
+    The resting GTC floor is the usual suspect, and the broker's order status is
+    the only way to tell. ARM 2026-09-24 is the case: it gapped through both
+    stops at the open, the floor filled 90 @ 318.74 at 13:30:01 with the bot stop
+    at 323.56 (-$433.80), and the only trace was a STOP PRUNE INFO line. No exit
+    line, no trades.log row, no alert, so the ledger never booked the leg.
+
+    "filled" → EXIT line, CRITICAL alert, and a trades.log row so the analyzer
+    can pair it. "working" → the floor is still resting behind a position we no
+    longer hold, and would open a fresh position when price trades through it,
+    so cancel it. "dead" → the floor was cancelled, so something else closed the
+    position. Nothing to book. "unknown" → the lookup failed, so leave the order
+    id in the log for a manual check. Never assume filled.
+    """
+    global _floor_fires
+    order_id = rec.get("broker_order_id")
+    if not order_id or not account_id:
+        return
+    outcome = tc.get_order_outcome(account_id, order_id)
+    state = outcome.get("state")
+    if state == "working":
+        logger.critical("CRITICAL: BROKER FLOOR %s — position gone but floor %s "
+                        "is STILL RESTING; cancelling so it cannot open a fresh "
+                        "position", symbol, order_id)
+        _cancel_broker_floor(symbol, rec, account_id)
+        return
+    if state == "unknown":
+        logger.error("BROKER FLOOR %s: position gone and floor %s status UNKNOWN "
+                     "(%s) — if it filled, the exit is unbooked; check the order",
+                     symbol, order_id, outcome.get("reason"))
+        return
+    if state != "filled":
+        return
+    fill = outcome["fill_price"]
+    qty = outcome.get("filled_qty")
+    direction = rec.get("direction", "long")
+    bot_stop = rec.get("stop_price")
+    # Positive = worse than the bot's own stop, the same sign convention
+    # log_trade uses for slippage against the signal.
+    diff = (fill - bot_stop) if direction == "short" else (bot_stop - fill)
+    _floor_fires += 1
+    water = rec.get("low_water") if direction == "short" else rec.get("high_water")
+    logger.warning("BROKER FLOOR EXIT %s %s x%s @ %.2f (broker stop=%s, bot stop=%.2f "
+                   "entry=%.2f water=%s) order=%s — floor fires #%d",
+                   symbol, direction, qty, fill, rec.get("broker_floor_price"),
+                   bot_stop, rec.get("entry_price") or 0.0, water, order_id,
+                   _floor_fires)
+    logger.critical("BROKER GTC FLOOR FIRED on %s: fill %.2f, bot stop was %.2f, "
+                    "slippage %+.2f pts. Bot exit logic did not fire first.",
+                    symbol, fill, bot_stop, diff)
+    if not qty:
+        # The ledger pairs by quantity, so a row with a guessed size is worse than
+        # none. The CRITICAL above already carries the order id's symbol.
+        logger.error("BROKER FLOOR %s: filled quantity unreadable for order %s — "
+                     "NOT writing trades.log; book it by hand", symbol, order_id)
+        return
+    # Same shape as the trailing-stop exit's attribution, so the ledger reads it
+    # as a stop exit. No floor "caused" it: the broker did, which is the point.
+    stop_attr = {
+        "profit_floor_active": bool(rec.get("profit_floor_active")),
+        "profit_floor_price":  rec.get("profit_floor_price"),
+        "atr_trail_at_exit":   None,
+        "floor_caused_exit":   False,
+        "breakeven_lock_held": False,
+        "lock_caused_exit":    False,
+        "stop_at_exit":        bot_stop,
+        "water_at_exit":       water,
+        "water_floor_active":  bool(rec.get("water_floor_active")),
+        "water_floor_price":   rec.get("water_floor_price"),
+        "water_caused_exit":   False,
+    }
+    # The bot stop is the "signal" here: slippage against it is the cost of the
+    # broker having fired instead of the bot, the number the alert reports.
+    _log_exit_trade("BUY_TO_COVER" if direction == "short" else "SELL", symbol,
+                    int(qty), bot_stop, order_id,
+                    f"broker GTC floor filled @ {fill:.2f} (floor "
+                    f"{rec.get('broker_floor_price')}, bot stop {bot_stop:.2f})",
+                    account_id, stop_attr=stop_attr)
+
+
+def reconcile_stops(positions: list[dict], account_id: Optional[str] = None) -> None:
     """Prune stop records for symbols we no longer hold. Called once per cycle.
 
     Guarded on an empty positions list: get_positions() returns [] on API error,
     and pruning against that would wipe every stop, then re-bootstrap next cycle
     with a reset high-water — silently loosening ratcheted stops. Skipping prune
-    on empty leaves stale records inert for a cycle (harmless)."""
+    on empty leaves stale records inert for a cycle (harmless).
+
+    With `account_id`, each pruned record's broker floor is checked first. See
+    _record_broker_floor_fill. Without it the prune is silent, as it always was."""
     global _occ_stop_prunes
     if not positions:
         return
@@ -1631,8 +1720,9 @@ def reconcile_stops(positions: list[dict]) -> None:
     stops = _load_stops()
     stale = [s for s in stops if s not in held]
     for s in stale:
-        del stops[s]
+        rec = stops.pop(s)
         logger.info("STOP PRUNE %s: no longer held — dropping stop record", s)
+        _record_broker_floor_fill(s, rec, account_id)
     # Option contracts carry no bot-managed stop (evaluate_option exits on EMA
     # state), so any OCC-keyed record here is debris from the pre-2026-08-05 path
     # where a contract leaked into the stock loop and got one bootstrapped. It is
@@ -2512,8 +2602,8 @@ def _log_exit_trade(action: str, symbol: str, qty, price: float, order_id,
     every exit leg ended up signal-priced. Adding it per-site would have meant
     eight chances to forget the argument on the next exit path someone writes.
 
-    `stop_attr` is supplied only by the trailing-stop path — it names which floor
-    was holding the stop. The other seven exits leave it None and the keys are
+    `stop_attr` is supplied only by the trailing-stop path and the broker-floor
+    fill path — it names which floor was holding the stop. The other seven exits leave it None and the keys are
     written null, so the schema stays uniform without those paths pretending to
     know something about a stop they never consulted.
     """

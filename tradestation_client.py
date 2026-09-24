@@ -766,8 +766,8 @@ def get_order_outcome(account_id: str, order_id: str,
     a cancel was requested. A status-based guess would also swallow a cancel the
     BROKER initiated, which nobody asked for and which needs to be seen.
 
-    Returns {"state", "fill_price", "reason", "status"} where `state` is exactly
-    one of — and these are NOT interchangeable:
+    Returns {"state", "fill_price", "filled_qty", "reason", "status"} where
+    `state` is exactly one of — and these are NOT interchangeable:
 
       "filled"  — executed; fill_price is a real average execution price
       "working" — still live at the broker, no fill yet; may still fill
@@ -796,13 +796,13 @@ def get_order_outcome(account_id: str, order_id: str,
             data = _get(f"brokerage/accounts/{account_id}/orders/{order_id}")
         except Exception as exc:
             logger.warning("get_order_outcome failed for %s: %s", order_id, exc)
-            return {"state": "unknown", "fill_price": None,
+            return {"state": "unknown", "fill_price": None, "filled_qty": None,
                     "reason": str(exc), "status": None}
         orders = data.get("Orders", [])
         if not orders:
             logger.warning("get_order_outcome returned no order for %s: %s",
                            order_id, data.get("Errors") or data)
-            return {"state": "unknown", "fill_price": None,
+            return {"state": "unknown", "fill_price": None, "filled_qty": None,
                     "reason": "no order in response", "status": None}
         o = orders[0]
         status = o.get("StatusDescription") or o.get("Status")
@@ -817,7 +817,14 @@ def get_order_outcome(account_id: str, order_id: str,
             if str(o.get("StatusDescription", "")).lower() == "partial fill":
                 logger.warning("Order %s only PARTIALLY filled — using partial "
                                "average fill %.4f", order_id, price)
+            # Shares actually executed. The partial-fill case above is why this
+            # is read rather than assumed: a caller that needs the size (the
+            # broker-floor-fill path in strategy.reconcile_stops has no other
+            # record of it) must not book the ordered quantity.
+            legs = o.get("Legs") or []
+            filled_qty = _f(legs[0].get("ExecQuantity")) if legs else None
             return {"state": "filled", "fill_price": price,
+                    "filled_qty": filled_qty,
                     "reason": None, "status": status}
         # Terminal with nothing executed. Checked BEFORE the retry: waiting
         # cannot resurrect a rejected order, and the old code's second poll was
@@ -833,7 +840,7 @@ def get_order_outcome(account_id: str, order_id: str,
             else:
                 logger.error("Order %s DEAD (status=%s) — executed NOTHING%s",
                              order_id, status, f": {reason}" if reason else "")
-            return {"state": "dead", "fill_price": None,
+            return {"state": "dead", "fill_price": None, "filled_qty": None,
                     "reason": reason, "status": status}
         # Genuinely still working (Received/Sent, no price yet) — the ONE case
         # where waiting can change the answer. Back off and re-ask.
@@ -850,7 +857,7 @@ def get_order_outcome(account_id: str, order_id: str,
                            "which falls back to the signal bar.",
                            order_id, len(_ORDER_POLL_BACKOFF) + 1,
                            sum(_ORDER_POLL_BACKOFF), status)
-    return {"state": "working", "fill_price": None,
+    return {"state": "working", "fill_price": None, "filled_qty": None,
             "reason": None, "status": status}
 
 
