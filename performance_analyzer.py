@@ -239,7 +239,7 @@ def _reconcile_open_entries(ledger: dict, open_entries: list, positions: list[di
         entries.sort(key=lambda e: _parse_ts(e["timestamp"]))    # FIFO: oldest first
         held = broker.get(key, 0)
         symbol, direction = key
-        ledger_qty = sum(abs(e.get("quantity") or 0) for e in entries)
+        ledger_qty = sum(abs(_open_qty(e) or 0) for e in entries)
         excess = ledger_qty - held
 
         # Retire from the OLDEST end. An entry is only unpaired because its exit
@@ -248,8 +248,21 @@ def _reconcile_open_entries(ledger: dict, open_entries: list, positions: list[di
         # Trimming the newest instead would retire a position we still hold and
         # leave the already-closed one on the books.
         for entry in entries:
-            qty = abs(entry.get("quantity") or 0)
+            qty = abs(_open_qty(entry) or 0)
             if excess <= 0:
+                kept.append(entry)
+                continue
+            if "open_qty" in entry:
+                # Partly closed already. The mark retires an entry WHOLESALE:
+                # _partition_stale drops it before pairing, which would delete
+                # the trips its logged exits already booked. Leave it open and
+                # loud. Broker-floor fills are logged now (strategy.
+                # _record_broker_floor_fill), so the missing exit should arrive.
+                logger.warning(
+                    "RECONCILE: %s %s — %s share(s) of a partly closed entry (%s) "
+                    "are not at the broker; leaving open, an exit is unlogged",
+                    symbol, direction, qty, entry.get("timestamp"))
+                excess -= min(qty, excess)
                 kept.append(entry)
                 continue
             if qty > excess:
@@ -454,6 +467,61 @@ def _inject_bootstrap_entries(ledger: dict, stops: dict, open_keys: set) -> int:
     return injected
 
 
+def _drop_shadowed_bootstraps(events: list) -> list:
+    """Drop bootstrap entries that a REAL logged entry already covers.
+
+    A bootstrap stands in for an adopted position with no logged entry. One
+    dated the same day as a real entry of the same symbol and direction is not
+    that. It is debris from the pre-lot-splitting pairing, which made a
+    partially sold position look unentered (AMD and ARM, 2026-09-21). Its 00:00
+    timestamp sorts ahead of the real fill, so left in the pool it steals the
+    first exit. Filtered on every run rather than deleted from the ledger, so
+    the rule stays re-derived from current logic."""
+    real = {(e["symbol"], e["direction"], e["timestamp"][:10]) for e in events
+            if e.get("role") == "entry" and not e.get("estimated_entry")}
+    return [e for e in events
+            if not (e.get("estimated_entry") and e.get("order_type") == "bootstrap"
+                    and (e["symbol"], e["direction"], e["timestamp"][:10]) in real)]
+
+
+def _revive_reconciled_for_orphans(ledger: dict, orphans: list) -> int:
+    """Clear `reconciled` marks that a later-arriving exit proves premature.
+
+    The reconcile retires an entry whose exit was never logged. If that exit
+    turns up afterwards (ARM 2026-09-24: the broker-floor fill, backfilled into
+    trades.log after the reconcile had run), it lands as an orphan and the
+    entry it belongs to stays retired. Both halves of one trip, neither booked.
+    For each orphan, un-retire the oldest reconciled entries of the same
+    symbol+direction opened before it, until they cover its size. Returns the
+    number revived. Only acts when there are orphans, so history without one is
+    untouched."""
+    revived = 0
+    events = ledger.get("events", {}).values()
+    cutoff = _stale_cutoff()
+    for o in orphans:
+        need = abs(o.get("quantity") or 0)
+        # Pre-cutoff entries never pair (_partition_stale), so reviving one
+        # books nothing and only erases a mark that was right (AAPL 06-17).
+        cands = sorted((e for e in events
+                        if e.get("reconciled") and e.get("role") == "entry"
+                        and _parse_ts(e["timestamp"]) >= cutoff
+                        and e["symbol"] == o["symbol"]
+                        and e["direction"] == o["direction"]
+                        and _parse_ts(e["timestamp"]) < _parse_ts(o["timestamp"])),
+                       key=lambda e: _parse_ts(e["timestamp"]))
+        for e in cands:
+            if need <= 0:
+                break
+            mark = e.pop("reconciled")
+            revived += 1
+            need -= abs(e.get("quantity") or 0)
+            logger.info("RECONCILE: revived %s %s x%s @ %s (reconciled %s) — its "
+                        "exit is now logged (%s @ %s)", e["symbol"], e["direction"],
+                        e.get("quantity"), e["timestamp"], mark.get("at"),
+                        o.get("action"), o["timestamp"])
+    return revived
+
+
 # ── Round-trip pairing + P&L ──────────────────────────────────────────────────
 
 def _pnl(direction: str, entry_price: float, exit_price: float, qty: float,
@@ -510,7 +578,9 @@ def _exit_reason(notes: str) -> str:
       option_target  — an option's +50% premium target.
       option_expiry  — an option force-closed on days-to-expiry.
       friday_short_close — a profitable short flattened ahead of the weekend gap.
-      signal         — the strategy's own exit logic.
+      broker_gtc_floor — the broker's resting GTC floor filled before the bot's
+                         stop fired.
+      signal        — the strategy's own exit logic.
 
     WHY THE OPTION BUCKETS EXIST: all three premium rules used to land in
     "signal", because the note was built from the UNDERLYING's rationale and read
@@ -539,6 +609,11 @@ def _exit_reason(notes: str) -> str:
         return "correction"
     if "trailing stop" in n:
         return "stop"
+    # strategy._record_broker_floor_fill writes "broker GTC floor filled @ X".
+    # Not "stop": the bot's stop did NOT fire, the broker's backstop did (ARM
+    # 2026-09-24), and folding it in would credit the trail with its fills.
+    if "broker gtc floor" in n:
+        return "broker_gtc_floor"
     # Keyed off the "option <reason>" prefix that strategy._close_option writes.
     # Order matches _option_exit_reason's own worst-news-first precedence.
     if "option stop loss" in n:
@@ -587,19 +662,45 @@ def _pair_round_trips(events: list, point_value_fn=None):
     from collections import defaultdict
     open_q = defaultdict(list)              # (symbol, direction) -> [entry events]
     closed, orphans = [], []
+    # LOT SPLITTING. An exit consumes only ITS OWN quantity. Until 2026-09-24 it
+    # popped the whole oldest entry, so a profit take (AMD SELL 45 of 91) closed
+    # all 91 shares on paper. Worse, the name then looked held-but-unentered, so
+    # a bootstrap got injected at 00:00. That sorted ahead of the real entry,
+    # absorbed the partial, and left the real 91 open for the FINAL exit (46) to
+    # close at full size: AMD booked +$6,831.37 on a leg worth +$3,453.22.
+    #
+    # `open_qty` is what remains of a partially consumed entry. It is a recomputed
+    # view like closed_trips: cleared here on every entry, set only on the ones
+    # still partly open, so a stored value can never outlive the pairing that
+    # produced it.
+    left = {}                               # id(entry) -> shares still open
+    for ev in events:
+        ev.pop("open_qty", None)
     for ev in sorted(events, key=lambda e: _parse_ts(e["timestamp"])):
         key = (ev["symbol"], ev["direction"])
         if ev["role"] == "entry":
             open_q[key].append(ev)
-        else:                               # exit
-            if not open_q[key]:
-                orphans.append(ev)
-                continue
-            entry = open_q[key].pop(0)
-            direction = ev["direction"]
-            # qty: the entry's, or the exit's when the entry is a synthetic
-            # bootstrap (quantity unknown at injection).
-            qty = entry.get("quantity") or ev.get("quantity")
+            left[id(ev)] = ev.get("quantity")   # None = bootstrap, sized by its exit
+            continue
+        direction = ev["direction"]
+        remaining = ev.get("quantity")      # None = legacy row: consume one whole entry
+        if not open_q[key]:
+            orphans.append(ev)
+            continue
+        while open_q[key] and (remaining is None or remaining > 0):
+            entry = open_q[key][0]
+            avail = left[id(entry)]
+            if remaining is None:
+                qty = avail
+            elif avail is None:
+                qty = remaining             # bootstrap: the exit sizes it
+            else:
+                qty = min(avail, remaining)
+            if avail is None or remaining is None or qty >= avail:
+                open_q[key].pop(0)
+            else:
+                left[id(entry)] = avail - qty
+            remaining = None if remaining is None else remaining - qty
             entry_price, entry_src = _leg_price(entry)
             exit_price,  exit_src  = _leg_price(ev)
             # A trip counts as fill-priced only when BOTH legs are real fills;
@@ -637,8 +738,26 @@ def _pair_round_trips(events: list, point_value_fn=None):
             if pv is not None:
                 trip["point_value"] = pv
             closed.append(trip)
+            if remaining is None:
+                break                       # legacy row: one entry, as before
+        if remaining:
+            # More shares sold than any open entry holds. Surfaced like any
+            # other orphan rather than silently shrunk to fit.
+            logger.warning("PAIRING: %s %s exit at %s has %s share(s) with no open "
+                           "entry left to close", ev["symbol"], ev["direction"],
+                           ev["timestamp"], remaining)
+            orphans.append(ev)
     open_entries = [e for q in open_q.values() for e in q]
+    for e in open_entries:
+        if left[id(e)] is not None and left[id(e)] != e.get("quantity"):
+            e["open_qty"] = left[id(e)]
     return closed, orphans, open_entries
+
+
+def _open_qty(entry: dict):
+    """Shares of an open entry still unclosed: its remainder after partial exits
+    (set by _pair_round_trips), else its full quantity."""
+    return entry.get("open_qty", entry.get("quantity"))
 
 
 # ── Aggregation ───────────────────────────────────────────────────────────────
@@ -845,13 +964,13 @@ def _mark_open_entries(open_entries: list) -> dict:
         if price is None:
             unpriced.append(symbol)
             continue
-        pnl = _pnl(e["direction"], e.get("price"), price, e.get("quantity"))
+        pnl = _pnl(e["direction"], e.get("price"), price, _open_qty(e))
         total += pnl
         priced += 1
         rows.append({
             "symbol":    symbol,
             "direction": e["direction"],
-            "qty":       e.get("quantity"),
+            "qty":       _open_qty(e),
             "entry":     e.get("price"),
             "mark":      price,
             "pnl":       round(pnl, 2),
@@ -930,12 +1049,24 @@ def build_report(ledger: dict, stops: dict, data_quality: dict,
 
     # Pair once to see which held positions lack an OPEN entry, inject synthetic
     # bootstrap entries for those, then re-pair so their exits can match.
+    def _pool():
+        ev, st = _partition_stale(list(ledger["events"].values()), cutoff)
+        return _drop_shadowed_bootstraps(ev), st
+
+    events = _drop_shadowed_bootstraps(events)
     _c0, _o0, open0 = _pair_round_trips(events)
     open_keys = {(e["symbol"], e["direction"]) for e in open0}
     injected = _inject_bootstrap_entries(ledger, stops, open_keys)
     if injected:
-        events, stale_entries = _partition_stale(list(ledger["events"].values()), cutoff)
+        events, stale_entries = _pool()
     closed, orphans, open_entries = _pair_round_trips(events)
+    # An orphan exit may belong to an entry a previous run retired too early.
+    # Revive and re-pair once. The revived entries are exactly those an orphan
+    # now explains, so a second pass cannot cascade.
+    revived = _revive_reconciled_for_orphans(ledger, orphans) if orphans else 0
+    if revived:
+        events, stale_entries = _pool()
+        closed, orphans, open_entries = _pair_round_trips(events)
 
     # Settle what is left open against the broker BEFORE the open-side numbers are
     # reported, so "open entries" means "positions we actually hold". Closed trips
@@ -946,6 +1077,7 @@ def build_report(ledger: dict, stops: dict, data_quality: dict,
 
     data_quality = dict(data_quality)
     data_quality["bootstrap_injected"] = injected
+    data_quality["reconciled_revived"] = revived
     data_quality["reconciled_entries"] = reconciled
     data_quality["stale_pre_analyzer_entries"] = len(stale_entries)
     agg = _aggregate(closed)

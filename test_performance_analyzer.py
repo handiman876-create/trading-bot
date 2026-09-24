@@ -438,6 +438,141 @@ def test_spy_close_on_or_before():
 
 # ── runner ────────────────────────────────────────────────────────────────────
 
+# ── Lot splitting / partial exits (AMD + ARM 2026-09-24) ──────────────────────
+
+def test_pair_partial_exits_split_the_lot():
+    """AMD: profit take 45 of 91, then the floor exit of the last 46. Before lot
+    splitting the second leg was booked at 91 shares (+$6,831.37)."""
+    events = [
+        _ev("2026-09-09 10:00:26 EDT", "BUY",  "AMD", 91, 524.37, "EMA cross up", order_id="e"),
+        _ev("2026-09-21 09:32:26 EDT", "SELL", "AMD", 45, 588.24, "profit take (+12.2%)"),
+        _ev("2026-09-24 09:30:08 EDT", "SELL", "AMD", 46, 599.44, "trailing stop hit @ 606.88"),
+    ]
+    closed, orphans, opens = pa._pair_round_trips(events)
+    assert [t["qty"] for t in closed] == [45, 46]
+    assert [t["pnl"] for t in closed] == [2874.15, 3453.22]
+    assert not orphans and not opens
+    assert all(t["entry_order_id"] == "e" for t in closed)
+
+
+def test_pair_partial_exit_leaves_remainder_open():
+    events = [
+        _ev("2026-09-09 10:00:26 EDT", "BUY",  "AMD", 91, 524.37, "EMA cross up"),
+        _ev("2026-09-21 09:32:26 EDT", "SELL", "AMD", 45, 588.24, "profit take"),
+    ]
+    closed, _o, opens = pa._pair_round_trips(events)
+    assert len(closed) == 1 and closed[0]["qty"] == 45
+    assert len(opens) == 1 and pa._open_qty(opens[0]) == 46
+    assert opens[0] is events[0], "the ledger's own dict, so reconcile marks persist"
+
+
+def test_open_qty_is_recomputed_not_stored():
+    """A remainder from an earlier run must not survive the exit that closes it."""
+    entry = _ev("2026-09-09 10:00:26 EDT", "BUY", "AMD", 91, 524.37, "EMA cross up")
+    pa._pair_round_trips([entry, _ev("2026-09-21 09:32:26 EDT", "SELL", "AMD", 45,
+                                     588.24, "profit take")])
+    assert entry["open_qty"] == 46
+    pa._pair_round_trips([entry,
+                          _ev("2026-09-21 09:32:26 EDT", "SELL", "AMD", 45, 588.24, "pt"),
+                          _ev("2026-09-24 09:30:08 EDT", "SELL", "AMD", 46, 599.44, "x")])
+    assert "open_qty" not in entry
+
+
+def test_pair_one_exit_closes_two_entries():
+    """AAPL 07-06: two BUY 3 fills, one SELL 6. Both entries close."""
+    events = [
+        _ev("2026-07-06 09:30:00 EDT", "BUY",  "AAPL", 3, 307.15, "EMA cross up", order_id="a"),
+        _ev("2026-07-06 09:30:00 EDT", "BUY",  "AAPL", 3, 307.15, "EMA cross up", order_id="b"),
+        _ev("2026-07-31 09:30:04 EDT", "SELL", "AAPL", 6, 305.86, "trailing stop hit @ 324.89"),
+    ]
+    closed, orphans, opens = pa._pair_round_trips(events)
+    assert [t["qty"] for t in closed] == [3, 3] and not orphans and not opens
+
+
+def test_pair_exit_larger_than_open_is_orphaned():
+    events = [_ev("2026-07-10 09:30:00 EDT", "BUY",  "X", 2, 10.0, "EMA cross up"),
+              _ev("2026-07-11 09:30:00 EDT", "SELL", "X", 3, 11.0, "EMA cross down")]
+    closed, orphans, _p = pa._pair_round_trips(events)
+    assert closed[0]["qty"] == 2, "books what exists, never inflates"
+    assert len(orphans) == 1, "the unexplained share is surfaced"
+
+
+def test_pair_exit_without_qty_keeps_legacy_one_entry():
+    events = [_ev("2026-07-10 09:30:00 EDT", "BUY",  "X", 5, 10.0, "EMA cross up"),
+              _ev("2026-07-10 09:31:00 EDT", "BUY",  "X", 5, 10.0, "EMA cross up"),
+              _ev("2026-07-11 09:30:00 EDT", "SELL", "X", None, 11.0, "EMA cross down")]
+    closed, _o, opens = pa._pair_round_trips(events)
+    assert [t["qty"] for t in closed] == [5] and len(opens) == 1
+
+
+def test_shadowed_bootstrap_is_dropped():
+    real = _ev("2026-09-18 10:08:56 EDT", "BUY", "ARM", 180, 266.73, "EMA cross up")
+    boot = _ev("2026-09-18 00:00:00 EDT", "BUY", "ARM", None, 266.73,
+               "estimated entry", estimated=True)
+    boot["order_type"] = "bootstrap"
+    other = _ev("2026-09-17 00:00:00 EDT", "BUY", "ARM", None, 266.73,
+                "estimated entry", estimated=True)
+    other["order_type"] = "bootstrap"
+    kept = pa._drop_shadowed_bootstraps([boot, real, other])
+    assert boot not in kept, "same-day real entry shadows it"
+    assert real in kept and other in kept, "a genuinely unlogged adoption stays"
+
+
+def test_revive_reconciled_entry_when_its_exit_arrives():
+    """ARM: the entry was reconciled as 'not at the broker' before the broker
+    floor fill was written to trades.log. The fill then lands as an orphan."""
+    entry = _ev("2026-09-18 10:08:56 EDT", "BUY", "ARM", 180, 266.73, "EMA cross up")
+    entry["reconciled"] = {"at": "2026-09-24 17:51:24 EDT", "reason": "x", "broker_qty": 0}
+    pt = _ev("2026-09-21 09:31:19 EDT", "SELL", "ARM", 90, 300.74, "profit take")
+    gtc = _ev("2026-09-24 09:30:01 EDT", "SELL", "ARM", 90, 318.74,
+              "broker GTC floor filled @ 318.74")
+    ledger = {"events": {"e": entry, "p": pt, "g": gtc}}
+    live = [e for e in ledger["events"].values() if not e.get("reconciled")]
+    _c, orphans, _p = pa._pair_round_trips(live)
+    assert len(orphans) == 2
+    assert pa._revive_reconciled_for_orphans(ledger, orphans) == 1
+    assert "reconciled" not in entry
+    closed, orphans, opens = pa._pair_round_trips(list(ledger["events"].values()))
+    assert [t["pnl"] for t in closed] == [3060.9, 4680.9]
+    assert closed[1]["exit_reason"] == "broker_gtc_floor"
+    assert not orphans and not opens
+
+
+def test_revive_ignores_entries_opened_after_the_orphan():
+    later = _ev("2026-09-25 10:00:00 EDT", "BUY", "ARM", 90, 300.0, "EMA cross up")
+    later["reconciled"] = {"at": "x"}
+    orphan = _ev("2026-09-24 09:30:01 EDT", "SELL", "ARM", 90, 318.74, "x")
+    assert pa._revive_reconciled_for_orphans({"events": {"l": later}}, [orphan]) == 0
+    assert "reconciled" in later
+
+
+def test_revive_ignores_pre_cutoff_entries():
+    """Pre-cutoff entries never pair, so un-marking one books nothing and only
+    erases a correct mark (AAPL 06-17 on the first 2026-09-24 rebuild)."""
+    old = _ev("2026-06-17 09:57:57 EDT", "BUY", "AAPL", 3, 300.0, "EMA cross up")
+    old["reconciled"] = {"at": "2026-07-26 20:12:17 EDT"}
+    orphan = _ev("2026-07-31 09:30:04 EDT", "SELL", "AAPL", 6, 305.86, "x")
+    assert pa._revive_reconciled_for_orphans({"events": {"o": old}}, [orphan]) == 0
+    assert "reconciled" in old
+
+
+def test_reconcile_never_marks_a_partly_closed_entry():
+    """The mark drops an entry wholesale, which would delete trips it already
+    booked. A vanished remainder is left open and warned about instead."""
+    entry = _ev("2026-09-09 10:00:26 EDT", "BUY", "AMD", 91, 524.37, "EMA cross up")
+    _c, _o, opens = pa._pair_round_trips(
+        [entry, _ev("2026-09-21 09:32:26 EDT", "SELL", "AMD", 45, 588.24, "pt")])
+    ledger = {"events": {"e": entry}}
+    kept, rec = pa._reconcile_open_entries(ledger, opens, positions=[])
+    assert kept == [entry] and rec == []
+    assert "reconciled" not in entry
+
+
+def test_exit_reason_broker_gtc_floor():
+    assert pa._exit_reason("broker GTC floor filled @ 318.74 (floor 319.53, "
+                           "bot stop 323.56)") == "broker_gtc_floor"
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items())
              if k.startswith("test_") and callable(v)]
