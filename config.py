@@ -225,7 +225,10 @@ CROSS_SUSTAIN_MINUTES = 30
 # watchlist.effective_stock_watchlist() as:  CORE_WATCHLIST ∪ momentum slot ∪
 # currently-held symbols. Edit the two core buckets here; the momentum slot is
 # generated weekly into data/momentum_watchlist.json, not hand-edited.
-CORE_MEGA = ["SPY", "QQQ", "AAPL", "MSFT", "GOOGL",
+# SPY is deliberately NOT here (removed 2026-09-24): it duplicates the index
+# exposure already held via ES futures. It stays in OPTIONS_WATCHLIST, and a held
+# SPY stock position is still managed to exit via the held-symbol fold-in.
+CORE_MEGA = ["QQQ", "AAPL", "MSFT", "GOOGL",
              "META", "NVDA", "AMZN", "TSLA", "AMD"]
 CORE_GROWTH = ["AVGO", "ARM", "CRWV", "JPM", "PLTR"]
 CORE_WATCHLIST = CORE_MEGA + CORE_GROWTH
