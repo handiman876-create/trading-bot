@@ -19,6 +19,8 @@ install -m 0644 screen-ab-tracker.service    /etc/systemd/system/screen-ab-track
 install -m 0644 screen-ab-tracker.timer      /etc/systemd/system/screen-ab-tracker.timer
 install -m 0644 sp500-refresh.service        /etc/systemd/system/sp500-refresh.service
 install -m 0644 sp500-refresh.timer          /etc/systemd/system/sp500-refresh.timer
+install -m 0644 memory-backup.service        /etc/systemd/system/memory-backup.service
+install -m 0644 memory-backup.timer          /etc/systemd/system/memory-backup.timer
 
 echo "Installing logrotate config..."
 install -m 0644 logrotate-trading-bot /etc/logrotate.d/trading-bot
@@ -53,3 +55,9 @@ echo "(data/sp500.json). It runs monthly, 1st at 05:30 ET — 30 min BEFORE"
 echo "momentum-rotation, so that rotation screens the current index."
 echo "  systemctl enable --now sp500-refresh.timer                # schedule monthly 1st 05:30 ET"
 echo "  systemctl start sp500-refresh.service                     # run once now (optional)"
+echo
+echo "Memory backup commits + pushes the Claude memory repo to GitHub nightly at"
+echo "02:17 ET (clear of autodiscover's 03:00). A failed push writes CRITICAL to"
+echo "critical_alerts.log and flushes it to Discord at once."
+echo "  systemctl enable --now memory-backup.timer                # schedule nightly 02:17 ET"
+echo "  systemctl start memory-backup.service                     # run once now (optional)"

@@ -29,6 +29,7 @@ data/options_positions.json
 # flock (that sharing is what prevents double-posts).
 data/alert_watermarks.json
 screen_ab.lock
+memory-backup.lock
 .venv/
 bot.log.*
 bot.futures.log.*

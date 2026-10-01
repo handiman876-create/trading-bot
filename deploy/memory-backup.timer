@@ -1,0 +1,15 @@
+[Unit]
+Description=Back up the Claude memory repo nightly at 02:17 America/New_York
+
+[Timer]
+# 02:17 Eastern — 43 min clear of strategy-discovery's 03:00 (+/-2 min jitter),
+# and the :17 minute keeps it off the top-of-hour pile-up. The America/New_York
+# suffix tracks EST/EDT.
+OnCalendar=*-*-* 02:17:00 America/New_York
+# If the machine was off at the scheduled time, run once at next boot instead of
+# skipping the night.
+Persistent=true
+RandomizedDelaySec=60
+
+[Install]
+WantedBy=timers.target

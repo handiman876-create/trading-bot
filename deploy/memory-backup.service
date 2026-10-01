@@ -1,0 +1,20 @@
+[Unit]
+Description=Nightly backup of the Claude memory repo to GitHub (handiman876-create/claude-memory)
+Documentation=file:/root/trading-bot/deploy/run-memory-backup.sh
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# oneshot: run to completion, then exit (the .timer schedules it; not a daemon).
+Type=oneshot
+User=root
+WorkingDirectory=/root/trading-bot
+ExecStart=/root/trading-bot/deploy/run-memory-backup.sh
+# A git add/commit/push of a few hundred KB — seconds normally; the cap only
+# stops a hung push from holding the lock forever.
+TimeoutStartSec=300
+StandardOutput=append:/root/trading-bot/logs/memory-backup.log
+StandardError=append:/root/trading-bot/logs/memory-backup.log
+
+# No [Install] section: a timer-activated oneshot is pulled in by its .timer,
+# not enabled directly.
