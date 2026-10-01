@@ -267,10 +267,15 @@ for pat in ("logs/bot.log*", "logs/futures_bot.log*"):
 # are one line per cross that died young, so lines ARE the unit there.
 out.append(f"--- Blocks: gap {len(gap)} symbol(s){' (' + ', '.join(sorted(gap)) + ')' if gap else ''}"
            f" | sustain {sum(sus.values())}{' (' + ', '.join(f'{k}x{v}' if v > 1 else k for k, v in sorted(sus.items())) + ')' if sus else ''}")
-crit = [l.strip() for pat in config.CRITICAL_ALERT_SINKS for l in lines_of(pat) if "[CRITICAL]" in l and in_window(l)]
-out.append(f"--- CRITICAL {when}: {len(crit) or 'none'}")
+# Labelled test pages ("TEST — ...", sent through lib-critical-alert.sh to
+# prove the Discord path) are counted apart so they never inflate the real
+# total. Real lines print untruncated; only the newest 6 to bound the report.
+crit_all = [l.strip() for pat in config.CRITICAL_ALERT_SINKS for l in lines_of(pat) if "[CRITICAL]" in l and in_window(l)]
+crit = [l for l in crit_all if "TEST —" not in l]
+n_test = len(crit_all) - len(crit)
+out.append(f"--- CRITICAL {when}: {len(crit) or 'none'}{f'  (tests: {n_test})' if n_test else ''}")
 for l in crit[-6:]:
-    out.append("  " + l[11:19] + " UTC " + l.split("] ", 1)[-1][:110])
+    out.append("  " + l[11:19] + " UTC " + l.split("] ", 1)[-1])
 if len(crit) > 6:
     out.append(f"  (+{len(crit) - 6} earlier — see critical_alerts.log)")
 
