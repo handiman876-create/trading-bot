@@ -56,13 +56,13 @@
     "BAX",
     "BBY",
     "BDX",
+    "BE",
     "BEN",
     "BF.B",
     "BG",
     "BIIB",
     "BKNG",
     "BKR",
-    "BLDR",
     "BLK",
     "BMY",
     "BNY",
@@ -243,6 +243,7 @@
     "IDXX",
     "IEX",
     "IFF",
+    "ILMN",
     "INCY",
     "INTC",
     "INTU",
@@ -353,6 +354,7 @@
     "ORLY",
     "OTIS",
     "OXY",
+    "P",
     "PANW",
     "PAYX",
     "PCAR",
@@ -426,7 +428,6 @@
     "SYK",
     "SYY",
     "T",
-    "TAP",
     "TDG",
     "TDY",
     "TECH",
@@ -448,7 +449,6 @@
     "TSLA",
     "TSN",
     "TT",
-    "TTD",
     "TTWO",
     "TXN",
     "TXT",
@@ -729,6 +729,10 @@
       "sector": "Health Care",
       "sub_industry": "Health Care Equipment"
     },
+    "BE": {
+      "sector": "Industrials",
+      "sub_industry": "Electrical Components & Equipment"
+    },
     "BEN": {
       "sector": "Financials",
       "sub_industry": "Asset Management & Custody Banks"
@@ -752,10 +756,6 @@
     "BKR": {
       "sector": "Energy",
       "sub_industry": "Oil & Gas Equipment & Services"
-    },
-    "BLDR": {
-      "sector": "Industrials",
-      "sub_industry": "Building Products"
     },
     "BLK": {
       "sector": "Financials",
@@ -1243,7 +1243,7 @@
     },
     "FERG": {
       "sector": "Industrials",
-      "sub_industry": "Building Products"
+      "sub_industry": "Trading Companies & Distributors"
     },
     "FFIV": {
       "sector": "Information Technology",
@@ -1476,6 +1476,10 @@
     "IFF": {
       "sector": "Materials",
       "sub_industry": "Specialty Chemicals"
+    },
+    "ILMN": {
+      "sector": "Health Care",
+      "sub_industry": "Life Sciences Tools & Services"
     },
     "INCY": {
       "sector": "Health Care",
@@ -1917,6 +1921,10 @@
       "sector": "Energy",
       "sub_industry": "Oil & Gas Exploration & Production"
     },
+    "P": {
+      "sector": "Information Technology",
+      "sub_industry": "Technology Hardware, Storage & Peripherals"
+    },
     "PANW": {
       "sector": "Information Technology",
       "sub_industry": "Systems Software"
@@ -2209,10 +2217,6 @@
       "sector": "Communication Services",
       "sub_industry": "Integrated Telecommunication Services"
     },
-    "TAP": {
-      "sector": "Consumer Staples",
-      "sub_industry": "Brewers"
-    },
     "TDG": {
       "sector": "Industrials",
       "sub_industry": "Aerospace & Defense"
@@ -2296,10 +2300,6 @@
     "TT": {
       "sector": "Industrials",
       "sub_industry": "Building Products"
-    },
-    "TTD": {
-      "sector": "Communication Services",
-      "sub_industry": "Advertising"
     },
     "TTWO": {
       "sector": "Communication Services",
@@ -2521,6 +2521,6 @@
   "count": 503,
   "source": "github.com/datasets/s-and-p-500-companies (constituents.csv)",
   "sectors_source": "github.com/datasets/s-and-p-500-companies (constituents.csv)",
-  "as_of": "2026-09-03",
+  "as_of": "2026-10-01",
   "note": "S&P 500 membership + GICS sector/sub-industry snapshot; refresh quarterly with refresh_sp500.py. Universe + sector filter source for momentum_screen.py."
 }
