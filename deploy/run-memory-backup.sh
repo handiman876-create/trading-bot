@@ -8,21 +8,19 @@
 #     setting rejects pushes carrying the real one.
 #   - git push origin main, every night, so a commit left behind by a failed
 #     night is retried even when nothing new changed.
-#   - Any failure appends a CRITICAL line to critical_alerts.log AND flushes it
-#     to Discord immediately, then exits non-zero. The flush matters: the bots
-#     only push alerts from inside their market-hours poll loops, so without it
-#     a 02:17 failure on a Saturday would sit unread until Sunday 18:00 ET.
-#     The flush goes through discord_alerts' shared, flock'd watermark, so the
-#     next bot cycle cannot re-send it.
+#   - Any failure pages via lib-critical-alert.sh (CRITICAL line + immediate
+#     Discord flush — see that file for why the flush matters), then exits
+#     non-zero.
 #
 # Overrides (for testing the failure path without paging anyone):
 #   MEMORY_DIR, ALERT_FILE, SKIP_DISCORD=1
 #
 set -uo pipefail
 
+. "$(dirname "$0")/lib-critical-alert.sh"
+
 REPO="/root/trading-bot"
 MEMORY_DIR="${MEMORY_DIR:-/root/.claude/projects/-root/memory}"
-ALERT_FILE="${ALERT_FILE:-$REPO/critical_alerts.log}"
 GIT_EMAIL="236492174+handiman876-create@users.noreply.github.com"
 GIT_NAME="handiman876-create"
 LOCK="$REPO/memory-backup.lock"
@@ -30,18 +28,7 @@ LOCK="$REPO/memory-backup.lock"
 log() { echo "$(date -Is) memory-backup: $*"; }
 
 fail() {
-    local msg="MEMORY BACKUP FAILED — $1. Memory repo $MEMORY_DIR is NOT backed up to GitHub; see logs/memory-backup.log"
-    log "CRITICAL: $msg"
-    # Same shape as the bots' CRITICAL lines: "<asctime> [CRITICAL] <name>: <msg>"
-    echo "$(date '+%Y-%m-%d %H:%M:%S,000') [CRITICAL] memory-backup: $msg" >> "$ALERT_FILE"
-    if [[ "${SKIP_DISCORD:-0}" != "1" ]]; then
-        if (cd "$REPO" && "$REPO/.venv/bin/python" -c \
-                "import discord_alerts; discord_alerts.check_critical_alerts()"); then
-            log "CRITICAL flushed to Discord (or no webhook configured)"
-        else
-            log "Discord flush errored — alert stays in $ALERT_FILE for the next bot cycle"
-        fi
-    fi
+    page_critical memory-backup "MEMORY BACKUP FAILED — $1. Memory repo $MEMORY_DIR is NOT backed up to GitHub; see logs/memory-backup.log"
     log "END (exit=1)"
     exit 1
 }
@@ -73,6 +60,7 @@ echo "$push_out"
 # Quote git's first fatal/error line — the last line is boilerplate advice
 # ("...and the repository exists.") that says nothing in a page.
 push_err=$(echo "$push_out" | grep -m1 -E '^(fatal|error|remote): ' || echo "$push_out" | tail -1)
+push_err="${push_err%"${push_err##*[![:space:]]}"}"   # strip trailing padding git adds to remote: lines
 [[ $rc -eq 0 ]] || fail "git push origin main exited $rc ($push_err)"
 
 local_head=$(git rev-parse HEAD)
