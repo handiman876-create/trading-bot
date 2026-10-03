@@ -1,12 +1,30 @@
 # What .venv runs (2026-10-03 venv migration). Install with
 #   .venv/bin/python -m pip install -r requirements.txt
 # The venv uses --system-site-packages; the pins below are the packages
-# installed IN the venv.
+# installed IN the venv, so a rebuild (e.g. on 26.04) reproduces them exactly.
+
+# Direct dependencies
 pandas==3.0.2
 numpy==2.4.4
 python-dotenv==1.2.2
 anthropic==0.117.0
 pytest==9.1.1
+
+# Transitive, venv-installed (anthropic → pydantic/httpx stack; pytest)
+annotated-types==0.7.0
+anyio==4.14.2
+docstring_parser==0.18.0
+h11==0.16.0
+httpcore==1.0.9
+httpx==0.28.1
+iniconfig==2.3.0
+jiter==0.16.0
+pluggy==1.6.0
+pydantic==2.13.4
+pydantic_core==2.46.4
+sniffio==1.3.1
+typing_extensions==4.16.0
+typing-inspection==0.4.2
 
 # apt-provided (python3-* debs via system-site-packages) — deliberately NOT
 # pinned. Ubuntu's certifi returns the system CA bundle; a pip copy would ship
@@ -16,3 +34,10 @@ pytest==9.1.1
 #   certifi==2023.11.17
 #   chardet==5.2.0
 #   pytz==2024.1
+# ...and transitive deps of the pins above that apt also satisfies:
+#   idna==3.6               (httpx, anyio, requests)
+#   distro==1.9.0           (anthropic)
+#   packaging==24.0         (pytest)
+#   Pygments==2.17.2        (pytest)
+#   python-dateutil==2.8.2  (pandas)
+#   six==1.16.0             (python-dateutil)
