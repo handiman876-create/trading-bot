@@ -3,7 +3,7 @@
 # Sentiment-analysis wrapper (invoked by sentiment-analysis.service, weekdays 08:00 ET).
 #
 #   - flock so a scheduled run can never overlap a manual one.
-#   - Runs on the .venv python (system-site-packages) because the Anthropic SDK is
+#   - Runs on the .venv python (system-site-packages), like every bot and wrapper; the Anthropic SDK is
 #     installed there, not in system python3 — the repo rule is a --system-site-packages
 #     venv, never --break-system-packages. The venv still sees requests/dotenv.
 #   - Exports ANTHROPIC_API_KEY from the sibling strategy-discovery/.env (no secret

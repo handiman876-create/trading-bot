@@ -22,7 +22,7 @@ if ! flock -n 9; then
 fi
 
 echo "===== $(date -Is) momentum-screen START ====="
-/usr/bin/python3 momentum_screen.py
+"$REPO/.venv/bin/python" momentum_screen.py
 rc=$?
 echo "===== $(date -Is) momentum-screen END (exit=$rc) ====="
 exit "$rc"

@@ -25,7 +25,7 @@ set -uo pipefail
 REPO="/root/trading-bot"
 cd "$REPO" || exit 1
 
-exec /usr/bin/python3 - "${1:-}" <<'PY'
+exec "$REPO/.venv/bin/python" - "${1:-}" <<'PY'
 import glob, gzip, json, os, re, subprocess, sys
 from collections import Counter, defaultdict
 from datetime import date, datetime, timedelta, timezone

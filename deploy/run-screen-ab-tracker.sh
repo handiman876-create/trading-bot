@@ -23,7 +23,7 @@ if ! flock -n 9; then
 fi
 
 echo "===== $(date -Is) screen-ab-tracker START ====="
-/usr/bin/python3 screen_ab_tracker.py
+"$REPO/.venv/bin/python" screen_ab_tracker.py
 rc=$?
 echo "===== $(date -Is) screen-ab-tracker END (exit=$rc) ====="
 exit "$rc"

@@ -1,5 +1,18 @@
-requests>=2.31.0
-pandas>=2.0.0
-numpy>=1.26.0
-pytz>=2024.1
-python-dotenv>=1.0.0
+# What .venv runs (2026-10-03 venv migration). Install with
+#   .venv/bin/python -m pip install -r requirements.txt
+# The venv uses --system-site-packages; the pins below are the packages
+# installed IN the venv.
+pandas==3.0.2
+numpy==2.4.4
+python-dotenv==1.2.2
+anthropic==0.117.0
+pytest==9.1.1
+
+# apt-provided (python3-* debs via system-site-packages) — deliberately NOT
+# pinned. Ubuntu's certifi returns the system CA bundle; a pip copy would ship
+# its own. Versions as of 2026-10-03 on 24.04, for reference only:
+#   requests==2.31.0
+#   urllib3==2.0.7
+#   certifi==2023.11.17
+#   chardet==5.2.0
+#   pytz==2024.1

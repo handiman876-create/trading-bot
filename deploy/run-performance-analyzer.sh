@@ -21,7 +21,7 @@ if ! flock -n 9; then
 fi
 
 echo "===== $(date -Is) performance-analyzer START ====="
-/usr/bin/python3 performance_analyzer.py
+"$REPO/.venv/bin/python" performance_analyzer.py
 rc=$?
 echo "===== $(date -Is) performance-analyzer END (exit=$rc) ====="
 exit "$rc"

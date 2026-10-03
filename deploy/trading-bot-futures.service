@@ -12,7 +12,7 @@ Type=simple
 User=root
 WorkingDirectory=/root/trading-bot
 # main.py runs in the foreground; config.py's load_dotenv() reads .env from WorkingDirectory.
-ExecStart=/usr/bin/python3 /root/trading-bot/main.py --mode futures
+ExecStart=/root/trading-bot/.venv/bin/python /root/trading-bot/main.py --mode futures
 # Bot handles SIGTERM for a clean shutdown; give it time before SIGKILL.
 KillSignal=SIGTERM
 TimeoutStopSec=20

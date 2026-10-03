@@ -58,7 +58,7 @@ if ! flock -n 9; then
 fi
 
 echo "===== $(date -Is) sp500-refresh START ====="
-/usr/bin/python3 refresh_sp500.py
+"$REPO/.venv/bin/python" refresh_sp500.py
 rc=$?
 if [[ $rc -ne 0 ]]; then
     echo "===== $(date -Is) sp500-refresh END (exit=$rc) ====="
@@ -77,7 +77,7 @@ fi
 
 # Subject + body built from the committed vs refreshed file, in the 09-03 style:
 #   "S&P 500 universe refresh YYYY-MM-DD: +A +B / -C -D"
-msg=$(git show "HEAD:$UNIVERSE" 2>/dev/null | /usr/bin/python3 -c '
+msg=$(git show "HEAD:$UNIVERSE" 2>/dev/null | "$REPO/.venv/bin/python" -c '
 import json, sys
 try:
     old = json.load(sys.stdin)
