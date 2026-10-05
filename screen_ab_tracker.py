@@ -99,8 +99,43 @@ def _sector_breakdown(picks: list[dict], sectors: dict) -> dict:
     return out
 
 
+class _IVLookup:
+    """One run's ATM-IV fetches, shared by Screen A and B.
+
+    Fetches once per unique symbol (the screens overlap on profitable names).
+    After the first PolygonNotEntitled the key is known to lack options data, so
+    every remaining pick is recorded as iv=None without a call — each would
+    otherwise spend a slot on the shared 5/min key and log its own warning.
+    `skipped` counts those unfetched picks for the single summary line; it is
+    the counter that shows the short-circuit still fires (0 with an entitled key).
+    """
+
+    def __init__(self) -> None:
+        self.cache: dict[str, float | None] = {}
+        self.entitled = True
+        self.skipped = 0
+
+    def get(self, sym: str, underlying_price: float | None) -> float | None:
+        if sym in self.cache:
+            return self.cache[sym]
+        if not self.entitled:
+            self.skipped += 1
+            iv = None
+        else:
+            try:
+                iv = pc.get_atm_option_iv(sym, underlying_price=underlying_price)
+            except pc.PolygonNotEntitled:
+                self.entitled = False
+                iv = None
+            else:
+                if iv is None:
+                    logger.warning("%s picked, IV=None (fetch failed)", sym)
+        self.cache[sym] = iv
+        return iv
+
+
 def _build_screen_record(picks: list[dict], by_date: dict, dates_asc: list[str],
-                         sectors: dict, *, iv_cache: dict) -> dict:
+                         sectors: dict, *, ivs: _IVLookup) -> dict:
     """Turn a screen's picks into a recordable block: per-pick entry close / IV /
     realized vol, plus screen-level averages and a sector breakdown."""
     latest = dates_asc[-1] if dates_asc else None
@@ -115,12 +150,7 @@ def _build_screen_record(picks: list[dict], by_date: dict, dates_asc: list[str],
             bar = by_date.get(latest, {}).get(sym) if latest else None
             entry_close = round(bar["close"], 4) if bar and bar.get("close") else None
             rv = None
-        # IV once per unique symbol (Screen A and B overlap on profitable names).
-        if sym not in iv_cache:
-            iv_cache[sym] = pc.get_atm_option_iv(sym, underlying_price=entry_close)
-        iv = iv_cache[sym]
-        if iv is None:
-            logger.warning("%s picked, IV=None (fetch failed / tier not entitled)", sym)
+        iv = ivs.get(sym, entry_close)
         detail.append({
             "symbol":     sym,
             "return_20d": p.get("return_20d"),
@@ -268,7 +298,7 @@ def run(dry_run: bool = False) -> int:
                     prev["rotation_date"], a_ret.get("avg"), b_ret.get("avg"), winner)
 
     # ── 2. Record this rotation's picks ───────────────────────────────────────
-    iv_cache: dict = {}
+    ivs = _IVLookup()
     a_picks = ranked[: config.MOMENTUM_SLOT_SIZE]
     b_cache = fundamentals._load_cache()
     b_picks = ms.run_screen_b(ranked, cache=b_cache)
@@ -279,11 +309,14 @@ def run(dry_run: bool = False) -> int:
     record = {
         "rotation_date": today,
         "screen_a": _build_screen_record(a_picks, by_date, dates_asc, sectors,
-                                         iv_cache=iv_cache),
+                                         ivs=ivs),
         "screen_b": _build_screen_record(b_picks, by_date, dates_asc, sectors,
-                                         iv_cache=iv_cache),
+                                         ivs=ivs),
         "two_week_results": None,
     }
+    if not ivs.entitled:
+        logger.info("options IV unavailable on this Polygon key — skipped %d picks",
+                    ivs.skipped)
     doc["rotations"].append(record)
     doc["updated"] = datetime.now(ZoneInfo(config.MARKET_TZ)).isoformat()
 

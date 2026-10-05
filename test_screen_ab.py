@@ -271,6 +271,90 @@ def test_tracker_records_iv_none_without_dropping_pick(monkeypatch):
     assert all(d["iv"] is None for d in r["screen_a"]["detail"])   # None, but still present
 
 
+def test_tracker_stops_iv_fetches_after_not_entitled(monkeypatch, caplog):
+    """First NOT_AUTHORIZED ends IV fetching for the run: one Polygon call, one
+    INFO line naming the skip count, no per-pick warnings, and the record format
+    unchanged (iv/avg_iv still present as None)."""
+    ranked = _ranked(10)
+    syms = [r["symbol"] for r in ranked]
+    dates = ["2026-10-02", "2026-10-05"]
+    closes = {ds: {s: 50.0 + i for i, s in enumerate(syms)} for ds in dates}
+    # A = S0..S4, B = S1 S3 S6 S8 S9 → 8 unique symbols, 10 picks.
+    _wire_tracker(monkeypatch, ranked, _by_date(syms, dates, closes), dates,
+                  profitable={"S1", "S3", "S6", "S8", "S9"})
+    calls = []
+
+    def not_entitled(sym, underlying_price=None):
+        calls.append(sym)
+        raise pc.PolygonNotEntitled("v3/snapshot/options -> HTTP 403: NOT_AUTHORIZED")
+
+    monkeypatch.setattr(pc, "get_atm_option_iv", not_entitled)
+    monkeypatch.setattr(tracker, "_today_et", lambda: "2026-10-05")
+    caplog.set_level("INFO", logger="screen_ab_tracker")
+    assert tracker.run(dry_run=False) == 0
+
+    assert calls == ["S0"]                                   # stopped after the first
+    r = json.load(open(config.SCREEN_AB_TRACKING_FILE))["rotations"][0]
+    for screen in ("screen_a", "screen_b"):
+        assert r[screen]["avg_iv"] is None
+        assert all("iv" in d and d["iv"] is None for d in r[screen]["detail"])
+    assert len(r["screen_b"]["picks"]) == 5
+    msgs = [rec for rec in caplog.records if "options IV unavailable" in rec.getMessage()]
+    assert len(msgs) == 1 and msgs[0].levelname == "INFO"
+    assert msgs[0].getMessage() == ("options IV unavailable on this Polygon key "
+                                    "— skipped 7 picks")         # 8 unique − the 1 fetched
+    assert not [rec for rec in caplog.records
+                if rec.levelname == "WARNING" and "IV=None" in rec.getMessage()]
+
+
+def test_tracker_keeps_fetching_after_per_symbol_iv_failure(monkeypatch, caplog):
+    """An ordinary per-symbol failure (None) must NOT trip the short-circuit —
+    only NOT_AUTHORIZED is a property of the key."""
+    ranked = _ranked(10)
+    syms = [r["symbol"] for r in ranked]
+    dates = ["2026-10-02", "2026-10-05"]
+    closes = {ds: {s: 50.0 + i for i, s in enumerate(syms)} for ds in dates}
+    _wire_tracker(monkeypatch, ranked, _by_date(syms, dates, closes), dates,
+                  profitable={"S1", "S3", "S6", "S8", "S9"})
+    calls = []
+    monkeypatch.setattr(pc, "get_atm_option_iv",
+                        lambda sym, underlying_price=None: calls.append(sym) or
+                        (None if sym == "S0" else 40.0))
+    monkeypatch.setattr(tracker, "_today_et", lambda: "2026-10-05")
+    caplog.set_level("INFO", logger="screen_ab_tracker")
+    tracker.run(dry_run=False)
+
+    assert len(calls) == 8                                   # every unique symbol, once
+    r = json.load(open(config.SCREEN_AB_TRACKING_FILE))["rotations"][0]
+    assert r["screen_a"]["detail"][0]["iv"] is None and r["screen_a"]["avg_iv"] == 40.0
+    assert not any("options IV unavailable" in rec.getMessage() for rec in caplog.records)
+
+
+def test_get_maps_403_not_authorized_to_not_entitled(monkeypatch):
+    class Resp:
+        def __init__(self, code, text):
+            self.status_code, self.text = code, text
+
+    monkeypatch.setattr(config, "POLYGON_API_KEY", "k")
+    monkeypatch.setattr(pc, "_throttle", lambda: None)
+    monkeypatch.setattr(pc.requests, "get", lambda *a, **k: Resp(
+        403, '{"status":"NOT_AUTHORIZED","message":"You are not entitled"}'))
+    try:
+        pc._get("v3/snapshot/options/AAA")
+        assert False, "expected PolygonNotEntitled"
+    except pc.PolygonNotEntitled:
+        pass
+    # A 403 for any other reason stays a plain PolygonError.
+    monkeypatch.setattr(pc.requests, "get", lambda *a, **k: Resp(403, "forbidden"))
+    try:
+        pc._get("v3/snapshot/options/AAA")
+        assert False, "expected PolygonError"
+    except pc.PolygonNotEntitled:
+        assert False, "plain 403 must not read as not-entitled"
+    except pc.PolygonError:
+        pass
+
+
 # ── performance-report section ────────────────────────────────────────────────
 
 def _completed_rotation(date, a_rets, b_rets, winner):

@@ -24,6 +24,12 @@ class PolygonError(RuntimeError):
     """A Polygon API failure the screen should treat as fatal for this run."""
 
 
+class PolygonNotEntitled(PolygonError):
+    """The key's plan doesn't cover this endpoint (HTTP 403 / NOT_AUTHORIZED).
+    A property of the key, not of the request: every further call to the same
+    endpoint family fails the same way, so callers can stop asking."""
+
+
 # ── Rate limiting (free tier: 5 calls/min) ────────────────────────────────────
 _MIN_INTERVAL = 60.0 / max(1, config.POLYGON_MAX_CALLS_PER_MIN)
 _last_call_at = 0.0
@@ -52,6 +58,8 @@ def _get(path: str, params: Optional[dict] = None) -> dict:
     if resp.status_code == 429:
         raise PolygonError(
             "Polygon rate limit hit (429) — lower POLYGON_MAX_CALLS_PER_MIN")
+    if resp.status_code == 403 and "NOT_AUTHORIZED" in resp.text:
+        raise PolygonNotEntitled(f"{path} -> HTTP 403: {resp.text[:200]}")
     if resp.status_code != 200:
         raise PolygonError(f"{path} -> HTTP {resp.status_code}: {resp.text[:200]}")
     return resp.json()
@@ -126,19 +134,22 @@ def get_atm_option_iv(symbol: str, underlying_price: float | None = None) -> flo
     returns that contract's implied_volatility as a percentage (Polygon reports it
     as a decimal, e.g. 0.652 -> 65.2).
 
-    IV is SUPPLEMENTARY, never a gate: any failure — most notably a tier that is
-    not entitled to options data (Polygon returns NOT_AUTHORIZED) — returns None
-    so the caller records the pick with iv=None and moves on. Confirmed
-    2026-07-19: the free/shared stock key is NOT entitled, so this returns None
-    until an options-entitled key is configured; the code then works unchanged."""
+    IV is SUPPLEMENTARY, never a gate: a per-symbol failure returns None so the
+    caller records the pick with iv=None and moves on. The one exception is a
+    key that is not entitled to options data (Polygon NOT_AUTHORIZED): that
+    raises PolygonNotEntitled, because it holds for every symbol and the caller
+    should stop spending calls on it. Confirmed 2026-07-19: the free/shared stock
+    key is NOT entitled, so this raises until an options-entitled key is
+    configured; the code then works unchanged."""
     try:
         data = _get(f"v3/snapshot/options/{symbol.upper()}", {"limit": 250})
+    except PolygonNotEntitled:
+        raise
     except PolygonError as exc:
         logger.warning("IV fetch for %s failed: %s", symbol, exc)
         return None
     if data.get("status") == "NOT_AUTHORIZED":
-        logger.warning("IV fetch for %s: NOT_AUTHORIZED (tier lacks options data)", symbol)
-        return None
+        raise PolygonNotEntitled(f"options snapshot for {symbol}: NOT_AUTHORIZED")
     results = data.get("results") or []
     if not results:
         return None
