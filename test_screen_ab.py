@@ -302,7 +302,7 @@ def test_tracker_stops_iv_fetches_after_not_entitled(monkeypatch, caplog):
     msgs = [rec for rec in caplog.records if "options IV unavailable" in rec.getMessage()]
     assert len(msgs) == 1 and msgs[0].levelname == "INFO"
     assert msgs[0].getMessage() == ("options IV unavailable on this Polygon key "
-                                    "— skipped 7 picks")         # 8 unique − the 1 fetched
+                                    "— skipped 8 picks")   # all 8 unique, incl. the one that 403'd
     assert not [rec for rec in caplog.records
                 if rec.levelname == "WARNING" and "IV=None" in rec.getMessage()]
 

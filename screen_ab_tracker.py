@@ -106,8 +106,10 @@ class _IVLookup:
     After the first PolygonNotEntitled the key is known to lack options data, so
     every remaining pick is recorded as iv=None without a call — each would
     otherwise spend a slot on the shared 5/min key and log its own warning.
-    `skipped` counts those unfetched picks for the single summary line; it is
-    the counter that shows the short-circuit still fires (0 with an entitled key).
+    `skipped` counts every unique pick left without IV because of the key — the
+    one that hit NOT_AUTHORIZED plus every unfetched one after it — for the
+    single summary line; it is the counter that shows the short-circuit still
+    fires (0 with an entitled key).
     """
 
     def __init__(self) -> None:
@@ -126,6 +128,7 @@ class _IVLookup:
                 iv = pc.get_atm_option_iv(sym, underlying_price=underlying_price)
             except pc.PolygonNotEntitled:
                 self.entitled = False
+                self.skipped += 1
                 iv = None
             else:
                 if iv is None:
