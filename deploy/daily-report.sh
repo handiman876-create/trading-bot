@@ -122,7 +122,9 @@ for name, short in (("trading-bot-equities", "equities"), ("trading-bot-futures"
 # systemd keeps no exit timestamp for a manually started oneshot, so the time
 # comes from the script's own log line.
 mb = unit("memory-backup.service", "Result", "ExecMainStatus")
-last_mb = [l.strip() for l in lines_of("logs/memory-backup.log") if "memory-backup:" in l and re.search(r"pushed|CRITICAL|nothing to commit", l)]
+# Glob the rotations: logrotate empties the live file at midnight, before the
+# 02:17 ET run, so the live file alone reads "no run logged" every night.
+last_mb = [l.strip() for l in lines_of("logs/memory-backup.log*") if "memory-backup:" in l and re.search(r"pushed|CRITICAL:|nothing to commit", l)]
 if last_mb:
     t = datetime.fromisoformat(last_mb[-1].split(" ", 1)[0]).astimezone(ET)
     out.append(f"mem-backup: result={mb.get('Result')} exit={mb.get('ExecMainStatus')} | {t:%m-%d %H:%M} ET {last_mb[-1].split('memory-backup: ', 1)[1][:58]}")
