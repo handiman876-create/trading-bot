@@ -15,9 +15,14 @@
 #     (~/.claude/projects/<slug>/memory). Any that isn't MEMORY_DIR or a symlink
 #     to it is invisible to this backup, so each one pages (with its path). The
 #     backup still runs, but the job then exits 1 so the timer goes red.
+#   - GitHub PAT expiry: pages every night from PAT_WARN_DAYS before
+#     GITHUB_PAT_EXPIRES (YYYY-MM-DD in .env). On 2026-10-08 the token died with
+#     no warning, and git's store helper erased the rejected token. A missing
+#     or invalid date pages too, or the check would switch itself off without
+#     anyone noticing. Same as strays: the backup still runs, then exit 1.
 #
 # Overrides (for testing the failure path without paging anyone):
-#   MEMORY_DIR, PROJECTS_DIR, ALERT_FILE, SKIP_DISCORD=1
+#   MEMORY_DIR, PROJECTS_DIR, ALERT_FILE, SKIP_DISCORD=1, ENV_FILE, TODAY
 #
 set -uo pipefail
 
@@ -29,6 +34,9 @@ PROJECTS_DIR="${PROJECTS_DIR:-/root/.claude/projects}"
 GIT_EMAIL="236492174+handiman876-create@users.noreply.github.com"
 GIT_NAME="handiman876-create"
 LOCK="$REPO/memory-backup.lock"
+ENV_FILE="${ENV_FILE:-$REPO/.env}"
+TODAY="${TODAY:-$(date -u +%F)}"
+PAT_WARN_DAYS=7
 
 log() { echo "$(date -Is) memory-backup: $*"; }
 
@@ -56,6 +64,28 @@ for d in "$PROJECTS_DIR"/*/memory; do
     page_critical memory-backup "STRAY MEMORY DIR — $d is not $MEMORY_DIR or a symlink to it; memories written there are NOT backed up to GitHub. Merge its files into the repo, then replace it with a symlink"
 done
 log "stray memory dirs: $strays"
+
+# Also before the push: an expired token makes the push fail(), and the
+# expiry page then says why. Only the date is read from .env, never a secret.
+pat_paged=0
+pat_exp=$(grep -m1 -E '^GITHUB_PAT_EXPIRES=' "$ENV_FILE" 2>/dev/null | cut -d= -f2- | tr -d "\"' \r")
+# GNU date rejects impossible dates (2026-02-30); the round-trip catches anything it normalises.
+if [[ ! "$pat_exp" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] \
+        || ! exp_s=$(date -u -d "$pat_exp" +%s 2>/dev/null) \
+        || [[ "$(date -u -d "$pat_exp" +%F)" != "$pat_exp" ]]; then
+    pat_paged=1
+    page_critical memory-backup "GITHUB TOKEN EXPIRY UNKNOWN — GITHUB_PAT_EXPIRES in $ENV_FILE is ${pat_exp:-missing} (want YYYY-MM-DD). The expiry warning is OFF until it is set"
+else
+    days_left=$(( (exp_s - $(date -u -d "$TODAY" +%s)) / 86400 ))
+    if (( days_left < 0 )); then
+        pat_paged=1
+        page_critical memory-backup "GITHUB TOKEN EXPIRED $(( -days_left )) day(s) ago ($pat_exp). Pushes from every repo will fail. Create a new PAT, store it, and update GITHUB_PAT_EXPIRES in $ENV_FILE"
+    elif (( days_left <= PAT_WARN_DAYS )); then
+        pat_paged=1
+        page_critical memory-backup "GITHUB TOKEN EXPIRES in $days_left day(s) on $pat_exp. Create a new PAT, store it, and update GITHUB_PAT_EXPIRES in $ENV_FILE"
+    fi
+    log "github token expires $pat_exp ($days_left day(s) left, pages at <= $PAT_WARN_DAYS)"
+fi
 
 cd "$MEMORY_DIR" || fail "cannot cd to $MEMORY_DIR"
 
@@ -86,8 +116,8 @@ remote_head=$(git ls-remote origin refs/heads/main | cut -f1)
     || fail "push reported success but origin/main is ${remote_head:-unreadable}, local is $local_head"
 
 log "pushed — origin/main == local HEAD ${local_head:0:7}"
-if (( strays > 0 )); then
-    log "END (exit=1) — backup OK but $strays stray memory dir(s) paged"
+if (( strays > 0 || pat_paged )); then
+    log "END (exit=1) — backup OK but paged: $strays stray memory dir(s), github token check=$pat_paged"
     exit 1
 fi
 log "END (exit=0)"
